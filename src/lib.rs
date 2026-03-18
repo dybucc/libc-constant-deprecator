@@ -2,8 +2,9 @@
 
 use std::{
   borrow::Borrow,
+  collections::HashMap,
   env,
-  fmt::Display,
+  fmt::{self, Display, Formatter},
   fs,
   io,
   iter,
@@ -14,7 +15,7 @@ use std::{
 
 use cargo_metadata::MetadataCommand;
 use gix::progress::Discard;
-use regex::bytes::Regex;
+use regex::bytes::{Regex, RegexBuilder};
 use syn::{
   File,
   Ident,
@@ -39,10 +40,10 @@ pub enum ScanFilesError {
     reason = "The whole point is to make this opaque."
   )]
   #[error("failed to set pwd: {0}")]
-  PwdSetting(PathErrorRepr),
+  PwdSetting(PwdSettingRepr),
   #[error(
-    "directory `{0}` doesn't exist; both cloning and sourcing an existing copy \
-    of `libc` require a preexisting directory"
+    "directory `{0}` doesn't exist; both cloning and sourcing an existing \
+     copy of `libc` require a preexisting directory"
   )]
   MissingDirectoryAccess(PathBuf),
   #[error("error while cloning git repo to path {0}")]
@@ -61,7 +62,7 @@ pub enum ScanFilesError {
 
 #[derive(Debug, Error)]
 #[error(transparent)]
-pub(crate) struct PathErrorRepr(#[from] io::Error);
+pub(crate) struct PwdSettingRepr(#[from] io::Error);
 
 #[derive(Debug)]
 pub struct SourceFile {
@@ -119,7 +120,7 @@ pub fn scan_files<T: AsRef<Path>>(
       Ok(())
     })?;
   env::set_current_dir(libc_path.as_ref())
-    .map_err(|e| ScanFilesError::PwdSetting(PathErrorRepr(e)))?;
+    .map_err(|e| ScanFilesError::PwdSetting(PwdSettingRepr(e)))?;
   let files = fetch_details().map_err(|e| match e {
     | FetchDetailsError::CargoMetadata =>
       ScanFilesError::WorkspaceScanning(libc_path.as_ref().to_owned()),
@@ -330,74 +331,153 @@ pub enum SaveError {
     reason = "The inner error is meant to be opaque."
   )]
   #[error("failed to save file with constants to disk: {0}")]
-  IoBound(SaveErrorIo),
+  IoBound(IoBoundRepr),
 }
 
 #[derive(Debug)]
-pub(crate) struct SaveErrorIo(io::Error);
+pub(crate) struct IoBoundRepr(io::Error);
 
-impl Display for SaveErrorIo {
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    self.0.fmt(f)
-  }
+impl Display for IoBoundRepr {
+  fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result { self.0.fmt(f) }
 }
 
-impl From<io::Error> for SaveErrorIo {
+impl From<io::Error> for IoBoundRepr {
   fn from(value: io::Error) -> Self { Self(value) }
 }
 
 #[derive(Debug, Error)]
 pub enum FilterError {
   #[error("regex compilation failed for needle: `{input_str}`")]
-  RegexCompilation { input_str: String, inner: regex::Error },
+  RegexCompilation { input_str: String },
 }
 
-pub(crate) trait Sealed {}
-
-#[expect(private_bounds, reason = "It's an intentional decision.")]
-pub trait ConstVecExt: Sealed {
-  fn save_to_disk(&self, path: impl AsRef<Path>) -> Result<(), SaveError>;
-
-  fn filter(&self, re: impl AsRef<str>) -> Result<(), FilterError>;
+#[derive(Debug)]
+pub struct ConstContainer {
+  inner:    Vec<Const>,
+  re_cache: HashMap<String, Regex>,
 }
 
-impl Sealed for Vec<Const> {}
-
-impl ConstVecExt for Vec<Const> {
-  fn save_to_disk(&self, path: impl AsRef<Path>) -> Result<(), SaveError> {
-    let contents = allocate_contents(self);
+impl ConstContainer {
+  pub fn save_to_disk(&self, path: impl AsRef<Path>) -> Result<(), SaveError> {
+    let contents = FullAllocator::coarse_allocate(&self.inner);
 
     fs::write(path, &contents).map_err(|e| SaveError::IoBound(e.into()))
   }
 
-  fn filter(&self, re: impl AsRef<str>) -> Result<(), FilterError> {
-    let contents = allocate_contents(self);
-    let re =
-      Regex::new(re.as_ref()).map_err(|e| FilterError::RegexCompilation {
-        input_str: re.as_ref().to_string(),
-        inner:     e,
-      })?;
+  pub fn filter(
+    &mut self,
+    re: impl AsRef<str>,
+  ) -> Result<Vec<&Const>, FilterError> {
+    let Self { inner, re_cache } = self;
+    let re = match re_cache.get(re.as_ref()) {
+      | Some(re) => re,
+      | None => {
+        re_cache.insert(
+          re.as_ref().to_string(),
+          build_re(&re).map_err(|_| FilterError::RegexCompilation {
+            input_str: re.as_ref().to_string(),
+          })?,
+        );
 
-    Ok(())
+        re_cache.get(re.as_ref()).unwrap()
+      },
+    };
+
+    Ok(
+      ContentAllocator::fine_allocate(inner)
+        .iter()
+        .enumerate()
+        .filter_map(|(i, constant)| {
+          re.is_match(constant).then_some(&self.inner[i])
+        })
+        .collect(),
+    )
   }
 }
 
-pub(crate) fn allocate_contents(
-  input: impl IntoIterator<Item: Borrow<Const>>,
-) -> Vec<u8> {
-  input
-    .into_iter()
-    .flat_map(|constant| {
-      constant
-        .borrow()
-        .ident
-        .to_string()
-        .bytes()
-        .chain(iter::once(b'\n'))
-        .chain(constant.borrow().source.to_string_lossy().into_owned().bytes())
-        .chain(iter::once(b'\n'))
-        .chain(iter::once(b'\n'))
-        .collect::<Vec<_>>()
-    })
-    .collect()
+pub(crate) trait ConstAllocator {
+  fn coarse_allocate(input: impl IntoIterator<Item: Borrow<Const>>) -> Vec<u8>;
+
+  fn fine_allocate(
+    input: impl IntoIterator<Item: Borrow<Const>>,
+  ) -> Vec<Vec<u8>>;
+}
+
+#[derive(Debug)]
+pub(crate) struct ContentAllocator;
+
+impl ConstAllocator for ContentAllocator {
+  fn coarse_allocate(input: impl IntoIterator<Item: Borrow<Const>>) -> Vec<u8> {
+    input
+      .into_iter()
+      .flat_map(|constant| {
+        constant
+          .borrow()
+          .ident
+          .to_string()
+          .into_bytes()
+          .into_iter()
+          .chain(iter::once(b'\n'))
+      })
+      .collect()
+  }
+
+  fn fine_allocate(
+    input: impl IntoIterator<Item: Borrow<Const>>,
+  ) -> Vec<Vec<u8>> {
+    input
+      .into_iter()
+      .map(|constant| constant.borrow().ident.to_string().into_bytes())
+      .collect()
+  }
+}
+
+#[derive(Debug)]
+pub(crate) struct FullAllocator;
+
+impl ConstAllocator for FullAllocator {
+  fn coarse_allocate(input: impl IntoIterator<Item: Borrow<Const>>) -> Vec<u8> {
+    input
+      .into_iter()
+      .flat_map(|constant| {
+        constant
+          .borrow()
+          .ident
+          .to_string()
+          .into_bytes()
+          .into_iter()
+          .chain(iter::once(b'\n'))
+          .chain(
+            constant
+              .borrow()
+              .source
+              .to_string_lossy()
+              .into_owned()
+              .into_bytes(),
+          )
+          .chain(iter::once(b'\n'))
+      })
+      .collect()
+  }
+
+  fn fine_allocate(
+    input: impl IntoIterator<Item: Borrow<Const>>,
+  ) -> Vec<Vec<u8>> {
+    input
+      .into_iter()
+      .map(|constant| {
+        let mut out = constant.borrow().ident.to_string().into_bytes();
+        out.extend(
+          iter::once(b'\n')
+            .chain(constant.borrow().source.to_string_lossy().bytes()),
+        );
+
+        out
+      })
+      .collect()
+  }
+}
+
+pub(crate) fn build_re(re: impl AsRef<str>) -> Result<Regex, regex::Error> {
+  RegexBuilder::new(re.as_ref()).size_limit(512).case_insensitive(true).build()
 }
