@@ -3,10 +3,18 @@ name = "libc-constant-deprecator"
 version = "0.1.0"
 edition = "2024"
 
+[lints.clippy]
+pedantic = "warn"
+
 [dependencies]
 cargo_metadata = "0.23.1"
-gix = { version = "0.80.0", features = ["blocking-network-client", "blocking-http-transport-reqwest", "blocking-http-transport-reqwest-rust-tls"] }
+gix = { version = "0.80.0", features = [
+  "blocking-network-client",
+  "blocking-http-transport-reqwest",
+  "blocking-http-transport-reqwest-rust-tls",
+] }
 itertools = "0.14.0"
+proc-macro2 = "1.0.106"
 regex = "1.12.3"
 syn = { version = "2.0.117", features = ["full", "extra-traits"] }
 thiserror = "2.0.18"

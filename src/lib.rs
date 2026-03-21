@@ -1,20 +1,26 @@
-#![feature(bool_to_result, exit_status_error, string_from_utf8_lossy_owned)]
+#![feature(
+  bool_to_result, exit_status_error, string_from_utf8_lossy_owned,
+  iter_next_chunk
+)]
 
 use std::{
-  borrow::Borrow,
+  borrow::{Borrow, Cow},
   collections::HashMap,
   env,
   fmt::{self, Display, Formatter},
   fs,
-  io,
+  io::{self, BufRead},
   iter,
   path::{Path, PathBuf},
   process::Command,
-  sync::atomic::AtomicBool,
+  str::FromStr,
+  sync::{LazyLock, atomic::AtomicBool},
 };
 
 use cargo_metadata::MetadataCommand;
 use gix::progress::Discard;
+use itertools::Itertools;
+use proc_macro2::Span;
 use regex::bytes::{Regex, RegexBuilder};
 use syn::{
   File,
@@ -30,6 +36,9 @@ use syn::{
 };
 use thiserror::Error;
 use walkdir::WalkDir;
+
+// TODO: implement functionality to both check and embed information on the
+// location of a vector of constants inside the `Cargo.toml` of the `libc` repo.
 
 const LIBC_REPO: &str = "https://github.com/rust-lang/libc.git";
 
@@ -280,9 +289,10 @@ pub(crate) fn process_trait_block(
 
 #[derive(Debug)]
 pub struct Const {
-  repr:   ConstRepr,
-  ident:  Ident,
-  source: PathBuf,
+  repr:       ConstRepr,
+  ident:      Ident,
+  source:     PathBuf,
+  deprecated: bool,
 }
 
 #[derive(Debug)]
@@ -290,6 +300,7 @@ pub(crate) enum ConstRepr {
   Item(ItemConst),
   Trait(TraitItemConst),
   Impl(ImplItemConst),
+  File,
 }
 
 impl Const {
@@ -300,6 +311,7 @@ impl Const {
       repr: ConstRepr::Item(item.clone()),
       ident,
       source: source.as_ref().to_owned(),
+      deprecated: false,
     }
   }
 
@@ -310,6 +322,7 @@ impl Const {
       repr: ConstRepr::Trait(item.clone()),
       ident,
       source: source.as_ref().to_owned(),
+      deprecated: false,
     }
   }
 
@@ -320,29 +333,31 @@ impl Const {
       repr: ConstRepr::Impl(item.clone()),
       ident,
       source: source.as_ref().to_owned(),
+      deprecated: false,
     }
   }
 }
 
 #[derive(Debug, Error)]
-pub enum SaveError {
-  #[expect(
-    private_interfaces,
-    reason = "The inner error is meant to be opaque."
-  )]
-  #[error("failed to save file with constants to disk: {0}")]
-  IoBound(IoBoundRepr),
+#[error("failed to {ty} file with constants: {inner}")]
+pub struct FsError {
+  inner: io::Error,
+  ty:    FsErrorKind,
 }
 
 #[derive(Debug)]
-pub(crate) struct IoBoundRepr(io::Error);
-
-impl Display for IoBoundRepr {
-  fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result { self.0.fmt(f) }
+pub enum FsErrorKind {
+  SaveOp,
+  FetchOp,
 }
 
-impl From<io::Error> for IoBoundRepr {
-  fn from(value: io::Error) -> Self { Self(value) }
+impl Display for FsErrorKind {
+  fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    match self {
+      | Self::SaveOp => write!(f, "save"),
+      | Self::FetchOp => write!(f, "fetch"),
+    }
+  }
 }
 
 #[derive(Debug, Error)]
@@ -358,10 +373,20 @@ pub struct ConstContainer {
 }
 
 impl ConstContainer {
-  pub fn save_to_disk(&self, path: impl AsRef<Path>) -> Result<(), SaveError> {
+  // Example grammar for document holding information on constants:
+  // (<ident>( <deprecated>)?\n<path-to-ident-decl>\n)*
+  pub fn fetch_from_disk(path: impl AsRef<Path>) -> Result<Self, FsError> {
+    let file = fs::read_to_string(path)
+      .map_err(|inner| FsError { inner, ty: FsErrorKind::FetchOp })?;
+
+    todo!()
+  }
+
+  pub fn save_to_disk(&self, path: impl AsRef<Path>) -> Result<(), FsError> {
     let contents = FullAllocator::coarse_allocate(&self.inner);
 
-    fs::write(path, &contents).map_err(|e| SaveError::IoBound(e.into()))
+    fs::write(path, &contents)
+      .map_err(|inner| FsError { inner, ty: FsErrorKind::SaveOp })
   }
 
   pub fn filter(
@@ -395,7 +420,74 @@ impl ConstContainer {
   }
 }
 
+#[derive(Debug, Error)]
+pub(crate) enum FormatCreationError {
+  #[error("failed to read (0-indexed) `0` line from start of input")]
+  LineReading(usize),
+}
+
+static CONSTANT_READER: LazyLock<Regex> = LazyLock::new(|| {
+  Regex::new(r"^[[:alnum:][:punct:]]+(\s\[deprecated\])?$").unwrap()
+});
+
+static PATH_READER: LazyLock<Regex> =
+  LazyLock::new(|| Regex::new(r"^(/[[:ascii:]]*)+$").unwrap());
+
+#[derive(Debug)]
+pub(crate) struct ConstFormat;
+
+impl ConstFormat {
+  pub(crate) fn parse_file(
+    input: impl AsRef<[u8]>,
+  ) -> Result<ConstContainer, FormatCreationError> {
+    let (mut buf, mut line_counter, mut constant_buf, mut inner) =
+      (String::with_capacity(input.as_ref().len()), 0, None, Vec::new());
+    while let Ok(n) = input.as_ref().read_line(&mut buf)
+      && n != 0
+    {
+      line_counter += 1;
+      if CONSTANT_READER.is_match(buf.as_bytes())
+        && let (components, check) = {
+          let components: Vec<String> =
+            buf.split_ascii_whitespace().map_into().collect();
+          buf.clear();
+          input
+            .as_ref()
+            .read_line(&mut buf)
+            .map_err(|_| FormatCreationError::LineReading(line_counter))?;
+          line_counter += 1;
+
+          (components, PATH_READER.is_match(buf.as_bytes()))
+        }
+        && check
+      {
+        constant_buf = Some(Const {
+          repr:       ConstRepr::File,
+          ident:      Ident::new(
+            components.first().expect(
+              "if the regex matched, then there should be at least one token",
+            ),
+            Span::call_site(),
+          ),
+          source:     PathBuf::from(buf.trim()),
+          deprecated: components.last().is_some(),
+        });
+      } else {
+        constant_buf = None;
+      }
+      if let Some(constant) = constant_buf {
+        inner.push(constant);
+      }
+      buf.clear();
+    }
+
+    Ok(ConstContainer { inner, re_cache: HashMap::new() })
+  }
+}
+
 pub(crate) trait ConstAllocator {
+  const DEPRECATED_ATTR: &str = "[deprecated]";
+
   fn coarse_allocate(input: impl IntoIterator<Item: Borrow<Const>>) -> Vec<u8>;
 
   fn fine_allocate(
@@ -446,14 +538,17 @@ impl ConstAllocator for FullAllocator {
           .to_string()
           .into_bytes()
           .into_iter()
+          .chain(
+            if constant.borrow().deprecated {
+              <Self as ConstAllocator>::DEPRECATED_ATTR
+            } else {
+              ""
+            }
+            .bytes(),
+          )
           .chain(iter::once(b'\n'))
           .chain(
-            constant
-              .borrow()
-              .source
-              .to_string_lossy()
-              .into_owned()
-              .into_bytes(),
+            constant.borrow().source.as_os_str().as_encoded_bytes().to_owned(),
           )
           .chain(iter::once(b'\n'))
       })
@@ -468,8 +563,22 @@ impl ConstAllocator for FullAllocator {
       .map(|constant| {
         let mut out = constant.borrow().ident.to_string().into_bytes();
         out.extend(
-          iter::once(b'\n')
-            .chain(constant.borrow().source.to_string_lossy().bytes()),
+          if constant.borrow().deprecated {
+            <Self as ConstAllocator>::DEPRECATED_ATTR
+          } else {
+            ""
+          }
+          .bytes()
+          .chain(iter::once(b'\n'))
+          .chain(
+            constant
+              .borrow()
+              .source
+              .as_os_str()
+              .as_encoded_bytes()
+              .iter()
+              .copied(),
+          ),
         );
 
         out

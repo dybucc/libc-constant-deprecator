@@ -1880,6 +1880,7 @@ dependencies = [
  "cargo_metadata",
  "gix",
  "itertools",
+ "proc-macro2",
  "regex",
  "syn",
  "thiserror 2.0.18",
