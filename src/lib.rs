@@ -1,7 +1,4 @@
-#![feature(
-  bool_to_result, exit_status_error, string_from_utf8_lossy_owned,
-  iter_next_chunk
-)]
+#![feature(bool_to_result, exit_status_error, string_from_utf8_lossy_owned)]
 
 use std::{
   borrow::{Borrow, Cow},
@@ -13,7 +10,6 @@ use std::{
   iter,
   path::{Path, PathBuf},
   process::Command,
-  str::FromStr,
   sync::{LazyLock, atomic::AtomicBool},
 };
 
@@ -84,12 +80,28 @@ impl SourceFile {
     Self { contents: contents.into(), source: path.as_ref().to_owned() }
   }
 
+  #[expect(
+    clippy::must_use_candidate,
+    reason = "It's not a bug not to use this function."
+  )]
   pub fn contents(&self) -> &File { &self.contents }
 
+  #[expect(
+    clippy::must_use_candidate,
+    reason = "It's not a bug not to use this function."
+  )]
   pub fn into_contents(self) -> File { self.contents }
 
+  #[expect(
+    clippy::must_use_candidate,
+    reason = "It's not a bug not to use this function."
+  )]
   pub fn path(&self) -> &Path { &self.source }
 
+  #[expect(
+    clippy::must_use_candidate,
+    reason = "It's not a bug not to use this function."
+  )]
   pub fn into_path(self) -> PathBuf { self.source }
 }
 
@@ -107,11 +119,10 @@ pub fn scan_files<T: AsRef<Path>>(
   libc_path
     .as_ref()
     .read_dir()
-    .map(|libc_path| libc_path.count() == 0)
-    .unwrap_or(false)
+    .is_ok_and(|libc_path| libc_path.count() == 0)
     .then_some(())
     .iter()
-    .try_for_each(|_| {
+    .try_for_each(|()| {
       gix::prepare_clone(LIBC_REPO, libc_path.as_ref())
         .map_err(|_| {
           ScanFilesError::RepoCloningError(libc_path.as_ref().to_owned())
@@ -166,9 +177,9 @@ pub(crate) fn fetch_details() -> Result<Vec<PathBuf>, FetchDetailsError> {
     .filter_map(|entry| {
       let entry = entry.ok()?;
 
-      (entry.file_type().is_file()).then(|| entry.into_path()).filter(|inner| {
-        inner.extension().map(|ext| ext == "rs").unwrap_or(false)
-      })
+      (entry.file_type().is_file())
+        .then(|| entry.into_path())
+        .filter(|inner| inner.extension().is_some_and(|ext| ext == "rs"))
     })
     .collect();
 
@@ -218,7 +229,11 @@ pub(crate) fn expand_macros(file: File) -> Result<File, ExpansionError> {
   todo!()
 }
 
-pub fn parse_constants(files: Vec<SourceFile>) -> Vec<Const> {
+#[expect(
+  clippy::must_use_candidate,
+  reason = "It's not a bug not to use the result of this routine."
+)]
+pub fn parse_constants(files: &[SourceFile]) -> Vec<Const> {
   files.iter().fold(
     Vec::with_capacity(files.len()),
     |mut parsed_files, SourceFile { contents, source }| {
@@ -287,7 +302,7 @@ pub(crate) fn process_trait_block(
     })
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Const {
   repr:       ConstRepr,
   ident:      Ident,
@@ -295,7 +310,7 @@ pub struct Const {
   deprecated: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum ConstRepr {
   Item(ItemConst),
   Trait(TraitItemConst),
@@ -304,7 +319,7 @@ pub(crate) enum ConstRepr {
 }
 
 impl Const {
-  fn from_item(item: &ItemConst, source: impl AsRef<Path>) -> Self {
+  pub(crate) fn from_item(item: &ItemConst, source: impl AsRef<Path>) -> Self {
     let ident = item.ident.clone();
 
     Self {
@@ -315,7 +330,10 @@ impl Const {
     }
   }
 
-  fn from_trait(item: &TraitItemConst, source: impl AsRef<Path>) -> Self {
+  pub(crate) fn from_trait(
+    item: &TraitItemConst,
+    source: impl AsRef<Path>,
+  ) -> Self {
     let ident = item.ident.clone();
 
     Self {
@@ -326,7 +344,10 @@ impl Const {
     }
   }
 
-  fn from_impl(item: &ImplItemConst, source: impl AsRef<Path>) -> Self {
+  pub(crate) fn from_impl(
+    item: &ImplItemConst,
+    source: impl AsRef<Path>,
+  ) -> Self {
     let ident = item.ident.clone();
 
     Self {
@@ -336,29 +357,32 @@ impl Const {
       deprecated: false,
     }
   }
-}
 
-#[derive(Debug, Error)]
-#[error("failed to {ty} file with constants: {inner}")]
-pub struct FsError {
-  inner: io::Error,
-  ty:    FsErrorKind,
-}
-
-#[derive(Debug)]
-pub enum FsErrorKind {
-  SaveOp,
-  FetchOp,
-}
-
-impl Display for FsErrorKind {
-  fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-    match self {
-      | Self::SaveOp => write!(f, "save"),
-      | Self::FetchOp => write!(f, "fetch"),
+  pub(crate) fn from_file(
+    ident: Ident,
+    source: impl AsRef<Path>,
+    deprecated: bool,
+  ) -> Self {
+    Self {
+      repr: ConstRepr::File,
+      ident,
+      source: source.as_ref().to_owned(),
+      deprecated,
     }
   }
 }
+
+#[derive(Debug, Error)]
+#[error("")]
+pub struct FetchError(FetchErrorRepr);
+
+pub(crate) enum FetchErrorRepr {
+  IoBound{inner: io::Error, line_num: }
+}
+
+#[derive(Debug, Error)]
+#[error("failed to save constants to file: `{0}`")]
+pub struct SaveError(io::Error);
 
 #[derive(Debug, Error)]
 pub enum FilterError {
@@ -373,20 +397,31 @@ pub struct ConstContainer {
 }
 
 impl ConstContainer {
+  pub(crate) fn new(constants: Vec<Const>) -> Self {
+    Self { inner: constants, re_cache: HashMap::new() }
+  }
+
   // Example grammar for document holding information on constants:
   // (<ident>( <deprecated>)?\n<path-to-ident-decl>\n)*
   pub fn fetch_from_disk(path: impl AsRef<Path>) -> Result<Self, FsError> {
     let file = fs::read_to_string(path)
       .map_err(|inner| FsError { inner, ty: FsErrorKind::FetchOp })?;
 
-    todo!()
+    ConstFormat::parse_file(file).map_err(|e| match e {
+      FormatCreationError::LineReading { line_num, inner } =>
+    })
   }
 
   pub fn save_to_disk(&self, path: impl AsRef<Path>) -> Result<(), FsError> {
     let contents = FullAllocator::coarse_allocate(&self.inner);
 
-    fs::write(path, &contents)
-      .map_err(|inner| FsError { inner, ty: FsErrorKind::SaveOp })
+    fs::write(path, &contents).map_err(|inner| FsError {
+      inner,
+      ty: FsErrorKind::SaveOp {
+        line_error:       None,
+        extraneous_input: None,
+      },
+    })
   }
 
   pub fn filter(
@@ -423,7 +458,9 @@ impl ConstContainer {
 #[derive(Debug, Error)]
 pub(crate) enum FormatCreationError {
   #[error("failed to read (0-indexed) `0` line from start of input")]
-  LineReading(usize),
+  LineReading { line_num: usize, inner: io::Error },
+  #[error("found extraneous input at line `{line}` in input bytes: `input`")]
+  ExtraneousInput { input: Cow<'static, str>, line: usize },
 }
 
 static CONSTANT_READER: LazyLock<Regex> = LazyLock::new(|| {
@@ -440,48 +477,54 @@ impl ConstFormat {
   pub(crate) fn parse_file(
     input: impl AsRef<[u8]>,
   ) -> Result<ConstContainer, FormatCreationError> {
-    let (mut buf, mut line_counter, mut constant_buf, mut inner) =
-      (String::with_capacity(input.as_ref().len()), 0, None, Vec::new());
-    while let Ok(n) = input.as_ref().read_line(&mut buf)
-      && n != 0
+    let (mut buf, mut line_counter, mut inner) =
+      (String::with_capacity(input.as_ref().len()), 0, Vec::new());
+    while input.as_ref().read_line(&mut buf).map_err(|inner| {
+      FormatCreationError::LineReading { line_num: line_counter, inner }
+    })?
+      != 0
     {
       line_counter += 1;
-      if CONSTANT_READER.is_match(buf.as_bytes())
+      if CONSTANT_READER
+        .is_match(buf.as_bytes())
+        .ok_or_else(|| FormatCreationError::ExtraneousInput {
+          input: Cow::from(buf.clone()),
+          line:  line_counter,
+        })
+        .map(|()| true)?
         && let (components, check) = {
           let components: Vec<String> =
             buf.split_ascii_whitespace().map_into().collect();
           buf.clear();
-          input
-            .as_ref()
-            .read_line(&mut buf)
-            .map_err(|_| FormatCreationError::LineReading(line_counter))?;
+          input.as_ref().read_line(&mut buf).map_err(|inner| {
+            FormatCreationError::LineReading { line_num: line_counter, inner }
+          })?;
           line_counter += 1;
 
           (components, PATH_READER.is_match(buf.as_bytes()))
         }
         && check
+          .ok_or_else(|| FormatCreationError::ExtraneousInput {
+            input: Cow::from(buf.clone()),
+            line:  line_counter,
+          })
+          .map(|()| true)?
       {
-        constant_buf = Some(Const {
-          repr:       ConstRepr::File,
-          ident:      Ident::new(
+        inner.push(Const::from_file(
+          Ident::new(
             components.first().expect(
-              "if the regex matched, then there should be at least one token",
+              "there should be at least one token if `PATH_READER` matched",
             ),
             Span::call_site(),
           ),
-          source:     PathBuf::from(buf.trim()),
-          deprecated: components.last().is_some(),
-        });
-      } else {
-        constant_buf = None;
-      }
-      if let Some(constant) = constant_buf {
-        inner.push(constant);
+          PathBuf::from(buf.trim()),
+          components.len() > 1,
+        ));
       }
       buf.clear();
     }
 
-    Ok(ConstContainer { inner, re_cache: HashMap::new() })
+    Ok(ConstContainer::new(inner))
   }
 }
 
