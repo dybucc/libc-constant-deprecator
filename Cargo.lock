@@ -1881,6 +1881,7 @@ dependencies = [
  "gix",
  "itertools",
  "proc-macro2",
+ "quote",
  "regex",
  "syn",
  "thiserror 2.0.18",

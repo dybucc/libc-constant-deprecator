@@ -4,7 +4,6 @@ use std::{
   borrow::{Borrow, Cow},
   collections::HashMap,
   env,
-  fmt::{self, Display, Formatter},
   fs,
   io::{self, BufRead},
   iter,
@@ -17,6 +16,7 @@ use cargo_metadata::MetadataCommand;
 use gix::progress::Discard;
 use itertools::Itertools;
 use proc_macro2::Span;
+use quote::ToTokens;
 use regex::bytes::{Regex, RegexBuilder};
 use syn::{
   File,
@@ -29,12 +29,14 @@ use syn::{
   ItemTrait,
   TraitItem,
   TraitItemConst,
+  parse_quote,
 };
 use thiserror::Error;
 use walkdir::WalkDir;
 
 // TODO: implement functionality to both check and embed information on the
-// location of a vector of constants inside the `Cargo.toml` of the `libc` repo.
+// location of a file with the constants formatted inside the `Cargo.toml` of
+// the `libc` repo.
 
 const LIBC_REPO: &str = "https://github.com/rust-lang/libc.git";
 
@@ -140,7 +142,8 @@ pub fn scan_files<T: AsRef<Path>>(
       Ok(())
     })?;
   env::set_current_dir(libc_path.as_ref())
-    .map_err(|e| ScanFilesError::PwdSetting(PwdSettingRepr(e)))?;
+    .map_err(PwdSettingRepr)
+    .map_err(ScanFilesError::PwdSetting)?;
   let files = fetch_details().map_err(|e| match e {
     | FetchDetailsError::CargoMetadata =>
       ScanFilesError::WorkspaceScanning(libc_path.as_ref().to_owned()),
@@ -193,9 +196,9 @@ pub(crate) fn parse_files(
   files: Vec<PathBuf>,
 ) -> Result<Vec<SourceFile>, ParseFilesError> {
   // TODO: see how viable it is to expand macros for all of the files, as it's
-  // highly unlikely that we would be able to perform another roundtrip from
-  // the expanded output's span to the original source code's span when
-  // modifying constants.
+  // highly unlikely that we would be able to perform another roundtrip from the
+  // expanded output's span to the original source code's span when modifying
+  // constants.
 
   files.into_iter().try_fold(Vec::new(), |mut files, file| {
     files.push(SourceFile::new(
@@ -234,6 +237,9 @@ pub(crate) fn expand_macros(file: File) -> Result<File, ExpansionError> {
   reason = "It's not a bug not to use the result of this routine."
 )]
 pub fn parse_constants(files: &[SourceFile]) -> Vec<Const> {
+  // TODO: handle inline modules (those that `syn` has parsed as having a
+  // `Some(_)` in their `content` field) by checking recursively for all items
+  // within them.
   files.iter().fold(
     Vec::with_capacity(files.len()),
     |mut parsed_files, SourceFile { contents, source }| {
@@ -373,11 +379,47 @@ impl Const {
 }
 
 #[derive(Debug, Error)]
-#[error("")]
+#[error("{}", match .0 {
+  FetchErrorRepr::IoBound(repr) => match repr {
+    IoBoundErrorKind::StdType(inner) =>
+      format!("failed while reading in input file: {inner}"),
+    IoBoundErrorKind::Parsing { inner, line_num } =>
+      format!("io bound error on line `{line_num}` while parsing: {inner}"),
+  },
+  FetchErrorRepr::ParseError { source, line_num, non_matching } =>
+    format!(
+      "failed parsing; bad {} at line {line_num}: `{non_matching}`",
+      match source {
+        ParseErrorSrc::Constant => "constant",
+        ParseErrorSrc::Path => "path"
+      }
+    ),
+})]
 pub struct FetchError(FetchErrorRepr);
 
+#[derive(Debug)]
 pub(crate) enum FetchErrorRepr {
-  IoBound{inner: io::Error, line_num: }
+  IoBound(IoBoundErrorKind),
+  ParseError {
+    source:       ParseErrorSrc,
+    line_num:     usize,
+    non_matching: Cow<'static, str>,
+  },
+}
+
+#[derive(Debug)]
+pub(crate) enum IoBoundErrorKind {
+  // This serves as an error type for unknown, I/O-bound errors that happen
+  // prior to starting the parsing process.
+  StdType(io::Error),
+  // This corresponds with error types that take place during parsing.
+  Parsing { inner: io::Error, line_num: usize },
+}
+
+#[derive(Debug)]
+pub(crate) enum ParseErrorSrc {
+  Constant,
+  Path,
 }
 
 #[derive(Debug, Error)]
@@ -390,40 +432,85 @@ pub enum FilterError {
   RegexCompilation { input_str: String },
 }
 
+#[derive(Debug, Error)]
+pub enum MakeChangesError {
+  #[error("io error while {}: `{inner}`", match .origin {
+    ChangesSrc::FetchOp(erred_path) =>
+      format!("fetching file {}", erred_path.display()),
+    ChangesSrc::SaveOp(erred_path) =>
+      format!("saving file {}", erred_path.display())
+  })]
+  IoBound { origin: ChangesSrc, inner: io::Error },
+}
+
+#[derive(Debug)]
+pub(crate) enum ChangesSrc {
+  FetchOp(PathBuf),
+  SaveOp(PathBuf),
+}
+
 #[derive(Debug)]
 pub struct ConstContainer {
   inner:    Vec<Const>,
   re_cache: HashMap<String, Regex>,
 }
 
+macro_rules! deprecate {
+  ($msg:expr) => {{
+    let msg = $msg;
+    parse_quote! { #[deprecated(since = "1.0.0", note = #msg)] }
+  }};
+}
+
 impl ConstContainer {
+  pub(crate) const DEPRECATION_NOTICE: &str =
+    "This constant, among others often used in C for the purposes of denoting \
+     the latest value or limit in a set of constants, has been deprecated. \
+     See #3131 for details and discussion.";
+
   pub(crate) fn new(constants: Vec<Const>) -> Self {
     Self { inner: constants, re_cache: HashMap::new() }
   }
 
-  // Example grammar for document holding information on constants:
-  // (<ident>( <deprecated>)?\n<path-to-ident-decl>\n)*
-  pub fn fetch_from_disk(path: impl AsRef<Path>) -> Result<Self, FsError> {
-    let file = fs::read_to_string(path)
-      .map_err(|inner| FsError { inner, ty: FsErrorKind::FetchOp })?;
+  pub fn fetch_from_disk(path: impl AsRef<Path>) -> Result<Self, FetchError> {
+    let file = fs::read_to_string(path).map_err(|inner| {
+      FetchError(FetchErrorRepr::IoBound(IoBoundErrorKind::StdType(inner)))
+    })?;
 
-    ConstFormat::parse_file(file).map_err(|e| match e {
-      FormatCreationError::LineReading { line_num, inner } =>
+    ConstFormat::parse_file(file).map_err(|inner| {
+      FetchError({
+        match inner {
+          | ParseError::LineReading { line_num, inner } =>
+            FetchErrorRepr::IoBound(IoBoundErrorKind::Parsing {
+              inner,
+              line_num,
+            }),
+          | ParseError::ExtraneousInput { input, expected, line_num } =>
+            FetchErrorRepr::ParseError {
+              source: match expected {
+                | ConstFormatToken::Constant => ParseErrorSrc::Constant,
+                | ConstFormatToken::Path => ParseErrorSrc::Path,
+              },
+              line_num,
+              non_matching: input,
+            },
+        }
+      })
     })
   }
 
-  pub fn save_to_disk(&self, path: impl AsRef<Path>) -> Result<(), FsError> {
+  pub fn save_to_disk(&self, path: impl AsRef<Path>) -> Result<(), SaveError> {
     let contents = FullAllocator::coarse_allocate(&self.inner);
 
-    fs::write(path, &contents).map_err(|inner| FsError {
-      inner,
-      ty: FsErrorKind::SaveOp {
-        line_error:       None,
-        extraneous_input: None,
-      },
-    })
+    fs::write(path, &contents).map_err(SaveError)
   }
 
+  #[expect(
+    clippy::missing_panics_doc,
+    reason = "The only source of panics is devoid of meaning because it \
+              performs a bounds-access computation right after making sure \
+              there's at least one element in the container at hand."
+  )]
   pub fn filter(
     &mut self,
     re: impl AsRef<str>,
@@ -453,14 +540,95 @@ impl ConstContainer {
         .collect(),
     )
   }
+
+  pub fn effect_changes(&self) -> Result<(), MakeChangesError> {
+    // TODO: expand macros prior to parsing contents with `syn`.
+    self.inner.iter().try_for_each(|constant @ Const { source, .. }| {
+      let mut file =
+        syn::parse_file(&fs::read_to_string(source).map_err(|inner| {
+          MakeChangesError::IoBound {
+            origin: ChangesSrc::FetchOp(source.clone()),
+            inner,
+          }
+        })?)
+        .map_err(|_| todo!())?;
+      file.items.iter_mut().for_each(|item| {
+        change_constant_in(item, constant);
+      });
+      fs::write(source, file.into_token_stream().to_string()).map_err(
+        |inner| MakeChangesError::IoBound {
+          origin: ChangesSrc::SaveOp(source.clone()),
+          inner,
+        },
+      )?;
+
+      Ok(())
+    })
+  }
 }
 
-#[derive(Debug, Error)]
-pub(crate) enum FormatCreationError {
-  #[error("failed to read (0-indexed) `0` line from start of input")]
-  LineReading { line_num: usize, inner: io::Error },
-  #[error("found extraneous input at line `{line}` in input bytes: `input`")]
-  ExtraneousInput { input: Cow<'static, str>, line: usize },
+pub(crate) fn change_constant_in(
+  item: &mut Item,
+  constant @ Const { ident: ref_ident, deprecated, .. }: &Const,
+) {
+  let msg = ConstContainer::DEPRECATION_NOTICE;
+  match item {
+    | Item::Const(ItemConst { attrs, ident, .. })
+      if ident == ref_ident && *deprecated =>
+      attrs.push(deprecate!(msg)),
+    | Item::Impl(ItemImpl { items, .. }) => items
+      .iter_mut()
+      .filter_map(|item| {
+        if let ImplItem::Const(constant) = item
+          && let ImplItemConst { ident, .. } = constant
+          && ident == ref_ident
+          && *deprecated
+        {
+          Some(constant)
+        } else {
+          None
+        }
+      })
+      .for_each(|ImplItemConst { attrs, .. }| attrs.push(deprecate!(msg))),
+    | Item::Trait(ItemTrait { items, .. }) => items
+      .iter_mut()
+      .filter_map(|item| {
+        if let TraitItem::Const(constant) = item
+          && let TraitItemConst { ident, .. } = constant
+          && ident == ref_ident
+          && *deprecated
+        {
+          Some(constant)
+        } else {
+          None
+        }
+      })
+      .for_each(|TraitItemConst { attrs, .. }| attrs.push(deprecate!(msg))),
+    | Item::Mod(syn::ItemMod { content: Some((_, content)), .. }) =>
+      for item in content.iter_mut() {
+        change_constant_in(item, constant);
+      },
+    | _ => (),
+  }
+}
+
+#[derive(Debug)]
+pub(crate) enum ParseError {
+  LineReading {
+    line_num: usize,
+    inner:    io::Error,
+  },
+  ExtraneousInput {
+    input:    Cow<'static, str>,
+    expected: ConstFormatToken,
+    line_num: usize,
+  },
+}
+
+#[derive(Debug)]
+pub(crate) enum ConstFormatToken {
+  Constant,
+  Path,
 }
 
 static CONSTANT_READER: LazyLock<Regex> = LazyLock::new(|| {
@@ -470,26 +638,29 @@ static CONSTANT_READER: LazyLock<Regex> = LazyLock::new(|| {
 static PATH_READER: LazyLock<Regex> =
   LazyLock::new(|| Regex::new(r"^(/[[:ascii:]]*)+$").unwrap());
 
+// Example grammar for document holding information on constants:
+// (<ident>( <deprecated>)?\n<path-to-ident-decl>\n)*
 #[derive(Debug)]
 pub(crate) struct ConstFormat;
 
 impl ConstFormat {
   pub(crate) fn parse_file(
     input: impl AsRef<[u8]>,
-  ) -> Result<ConstContainer, FormatCreationError> {
+  ) -> Result<ConstContainer, ParseError> {
     let (mut buf, mut line_counter, mut inner) =
       (String::with_capacity(input.as_ref().len()), 0, Vec::new());
     while input.as_ref().read_line(&mut buf).map_err(|inner| {
-      FormatCreationError::LineReading { line_num: line_counter, inner }
+      ParseError::LineReading { line_num: line_counter + 1, inner }
     })?
       != 0
     {
       line_counter += 1;
       if CONSTANT_READER
         .is_match(buf.as_bytes())
-        .ok_or_else(|| FormatCreationError::ExtraneousInput {
-          input: Cow::from(buf.clone()),
-          line:  line_counter,
+        .ok_or_else(|| ParseError::ExtraneousInput {
+          input:    Cow::from(buf.clone()),
+          expected: ConstFormatToken::Constant,
+          line_num: line_counter + 1,
         })
         .map(|()| true)?
         && let (components, check) = {
@@ -497,16 +668,17 @@ impl ConstFormat {
             buf.split_ascii_whitespace().map_into().collect();
           buf.clear();
           input.as_ref().read_line(&mut buf).map_err(|inner| {
-            FormatCreationError::LineReading { line_num: line_counter, inner }
+            ParseError::LineReading { line_num: line_counter + 1, inner }
           })?;
           line_counter += 1;
 
           (components, PATH_READER.is_match(buf.as_bytes()))
         }
         && check
-          .ok_or_else(|| FormatCreationError::ExtraneousInput {
-            input: Cow::from(buf.clone()),
-            line:  line_counter,
+          .ok_or_else(|| ParseError::ExtraneousInput {
+            input:    Cow::from(buf.clone()),
+            expected: ConstFormatToken::Path,
+            line_num: line_counter + 1,
           })
           .map(|()| true)?
       {
