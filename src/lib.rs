@@ -1,9 +1,10 @@
 #![feature(bool_to_result, exit_status_error, string_from_utf8_lossy_owned)]
 
 use std::{
-  borrow::{Borrow, Cow},
+  borrow::Cow,
   collections::HashMap,
   env,
+  fmt::{Display, Formatter},
   fs,
   io::{self, BufRead},
   iter,
@@ -42,12 +43,8 @@ const LIBC_REPO: &str = "https://github.com/rust-lang/libc.git";
 
 #[derive(Debug, Error)]
 pub enum ScanFilesError {
-  #[expect(
-    private_interfaces,
-    reason = "The whole point is to make this opaque."
-  )]
   #[error("failed to set pwd: {0}")]
-  PwdSetting(PwdSettingRepr),
+  PwdSetting(io::Error),
   #[error(
     "directory `{0}` doesn't exist; both cloning and sourcing an existing \
      copy of `libc` require a preexisting directory"
@@ -66,10 +63,6 @@ pub enum ScanFilesError {
   #[error("failed parsing rust source file `{0}`")]
   ParseError(PathBuf),
 }
-
-#[derive(Debug, Error)]
-#[error(transparent)]
-pub(crate) struct PwdSettingRepr(#[from] io::Error);
 
 #[derive(Debug)]
 pub struct SourceFile {
@@ -142,7 +135,6 @@ pub fn scan_files<T: AsRef<Path>>(
       Ok(())
     })?;
   env::set_current_dir(libc_path.as_ref())
-    .map_err(PwdSettingRepr)
     .map_err(ScanFilesError::PwdSetting)?;
   let files = fetch_details().map_err(|e| match e {
     | FetchDetailsError::CargoMetadata =>
@@ -364,24 +356,22 @@ impl Const {
     }
   }
 
-  pub(crate) fn from_file(
-    ident: Ident,
-    source: impl AsRef<Path>,
-    deprecated: bool,
-  ) -> Self {
+  pub(crate) fn from_file(ident: Ident, source: impl AsRef<Path>) -> Self {
     Self {
       repr: ConstRepr::File,
       ident,
       source: source.as_ref().to_owned(),
-      deprecated,
+      deprecated: false,
     }
   }
+
+  pub(crate) fn deprecated(&mut self, yes: bool) { self.deprecated = yes }
 }
 
 #[derive(Debug, Error)]
 #[error("{}", match .0 {
   FetchErrorRepr::IoBound(repr) => match repr {
-    IoBoundErrorKind::StdType(inner) =>
+    IoBoundErrorKind::Fs(inner) =>
       format!("failed while reading in input file: {inner}"),
     IoBoundErrorKind::Parsing { inner, line_num } =>
       format!("io bound error on line `{line_num}` while parsing: {inner}"),
@@ -411,7 +401,7 @@ pub(crate) enum FetchErrorRepr {
 pub(crate) enum IoBoundErrorKind {
   // This serves as an error type for unknown, I/O-bound errors that happen
   // prior to starting the parsing process.
-  StdType(io::Error),
+  Fs(io::Error),
   // This corresponds with error types that take place during parsing.
   Parsing { inner: io::Error, line_num: usize },
 }
@@ -441,10 +431,12 @@ pub enum MakeChangesError {
       format!("saving file {}", erred_path.display())
   })]
   IoBound { origin: ChangesSrc, inner: io::Error },
+  #[error("failed to parse file: {0}")]
+  Parse(Cow<'static, Path>),
 }
 
 #[derive(Debug)]
-pub(crate) enum ChangesSrc {
+pub enum ChangesSrc {
   FetchOp(PathBuf),
   SaveOp(PathBuf),
 }
@@ -458,6 +450,7 @@ pub struct ConstContainer {
 macro_rules! deprecate {
   ($msg:expr) => {{
     let msg = $msg;
+
     parse_quote! { #[deprecated(since = "1.0.0", note = #msg)] }
   }};
 }
@@ -474,10 +467,10 @@ impl ConstContainer {
 
   pub fn fetch_from_disk(path: impl AsRef<Path>) -> Result<Self, FetchError> {
     let file = fs::read_to_string(path).map_err(|inner| {
-      FetchError(FetchErrorRepr::IoBound(IoBoundErrorKind::StdType(inner)))
+      FetchError(FetchErrorRepr::IoBound(IoBoundErrorKind::Fs(inner)))
     })?;
 
-    ConstFormat::parse_file(file).map_err(|inner| {
+    parse_file(file).map_err(|inner| {
       FetchError({
         match inner {
           | ParseError::LineReading { line_num, inner } =>
@@ -485,24 +478,40 @@ impl ConstContainer {
               inner,
               line_num,
             }),
-          | ParseError::ExtraneousInput { input, expected, line_num } =>
-            FetchErrorRepr::ParseError {
-              source: match expected {
-                | ConstFormatToken::Constant => ParseErrorSrc::Constant,
-                | ConstFormatToken::Path => ParseErrorSrc::Path,
-              },
-              line_num,
-              non_matching: input,
+          | ParseError::ExtraneousInput {
+            bad_seq: input,
+            expected,
+            line_num,
+          } => FetchErrorRepr::ParseError {
+            source: match expected {
+              | ConstFormatToken::Constant => ParseErrorSrc::Constant,
+              | ConstFormatToken::Path => ParseErrorSrc::Path,
             },
+            line_num,
+            non_matching: input,
+          },
         }
       })
     })
   }
 
   pub fn save_to_disk(&self, path: impl AsRef<Path>) -> Result<(), SaveError> {
-    let contents = FullAllocator::coarse_allocate(&self.inner);
-
-    fs::write(path, &contents).map_err(SaveError)
+    fs::write(
+      path,
+      self
+        .inner
+        .iter()
+        .flat_map(|constant| {
+          constant
+            .ident
+            .to_string()
+            .into_bytes()
+            .into_iter()
+            .chain(iter::once(b' '))
+        })
+        .collect::<Vec<_>>(),
+    )
+    .map_err(SaveError)
   }
 
   #[expect(
@@ -531,12 +540,9 @@ impl ConstContainer {
     };
 
     Ok(
-      ContentAllocator::fine_allocate(inner)
+      inner
         .iter()
-        .enumerate()
-        .filter_map(|(i, constant)| {
-          re.is_match(constant).then_some(&self.inner[i])
-        })
+        .filter(|Const { ident, .. }| re.is_match(ident.to_string().as_bytes()))
         .collect(),
     )
   }
@@ -551,10 +557,8 @@ impl ConstContainer {
             inner,
           }
         })?)
-        .map_err(|_| todo!())?;
-      file.items.iter_mut().for_each(|item| {
-        change_constant_in(item, constant);
-      });
+        .map_err(|_| MakeChangesError::Parse(Cow::from(source.clone())))?;
+      file.items.iter_mut().for_each(|item| change_constant_in(item, constant));
       fs::write(source, file.into_token_stream().to_string()).map_err(
         |inner| MakeChangesError::IoBound {
           origin: ChangesSrc::SaveOp(source.clone()),
@@ -571,11 +575,10 @@ pub(crate) fn change_constant_in(
   item: &mut Item,
   constant @ Const { ident: ref_ident, deprecated, .. }: &Const,
 ) {
-  let msg = ConstContainer::DEPRECATION_NOTICE;
   match item {
     | Item::Const(ItemConst { attrs, ident, .. })
       if ident == ref_ident && *deprecated =>
-      attrs.push(deprecate!(msg)),
+      attrs.push(deprecate!(ConstContainer::DEPRECATION_NOTICE)),
     | Item::Impl(ItemImpl { items, .. }) => items
       .iter_mut()
       .filter_map(|item| {
@@ -589,7 +592,9 @@ pub(crate) fn change_constant_in(
           None
         }
       })
-      .for_each(|ImplItemConst { attrs, .. }| attrs.push(deprecate!(msg))),
+      .for_each(|ImplItemConst { attrs, .. }| {
+        attrs.push(deprecate!(ConstContainer::DEPRECATION_NOTICE));
+      }),
     | Item::Trait(ItemTrait { items, .. }) => items
       .iter_mut()
       .filter_map(|item| {
@@ -603,7 +608,9 @@ pub(crate) fn change_constant_in(
           None
         }
       })
-      .for_each(|TraitItemConst { attrs, .. }| attrs.push(deprecate!(msg))),
+      .for_each(|TraitItemConst { attrs, .. }| {
+        attrs.push(deprecate!(ConstContainer::DEPRECATION_NOTICE));
+      }),
     | Item::Mod(syn::ItemMod { content: Some((_, content)), .. }) =>
       for item in content.iter_mut() {
         change_constant_in(item, constant);
@@ -612,14 +619,16 @@ pub(crate) fn change_constant_in(
   }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub(crate) enum ParseError {
-  LineReading {
-    line_num: usize,
-    inner:    io::Error,
-  },
+  #[error("failed reading from bytes at line {line_num}: {inner}")]
+  LineReading { line_num: usize, inner: io::Error },
+  #[error(
+    "bad input while parsing at line {line_num}; expected {expected}, found \
+     `{bad_seq}`"
+  )]
   ExtraneousInput {
-    input:    Cow<'static, str>,
+    bad_seq:  Cow<'static, str>,
     expected: ConstFormatToken,
     line_num: usize,
   },
@@ -631,6 +640,15 @@ pub(crate) enum ConstFormatToken {
   Path,
 }
 
+impl Display for ConstFormatToken {
+  fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    write!(f, "{}", match self {
+      | Self::Constant => "constant",
+      | Self::Path => "path",
+    })
+  }
+}
+
 static CONSTANT_READER: LazyLock<Regex> = LazyLock::new(|| {
   Regex::new(r"^[[:alnum:][:punct:]]+(\s\[deprecated\])?$").unwrap()
 });
@@ -638,51 +656,45 @@ static CONSTANT_READER: LazyLock<Regex> = LazyLock::new(|| {
 static PATH_READER: LazyLock<Regex> =
   LazyLock::new(|| Regex::new(r"^(/[[:ascii:]]*)+$").unwrap());
 
-// Example grammar for document holding information on constants:
-// (<ident>( <deprecated>)?\n<path-to-ident-decl>\n)*
-#[derive(Debug)]
-pub(crate) struct ConstFormat;
+pub(crate) fn parse_file(
+  input: impl AsRef<[u8]>,
+) -> Result<ConstContainer, ParseError> {
+  let (mut buf, mut line_counter, mut inner) =
+    (String::with_capacity(input.as_ref().len()), 0, Vec::new());
+  while input.as_ref().read_line(&mut buf).map_err(|inner| {
+    ParseError::LineReading { line_num: line_counter + 1, inner }
+  })?
+    != 0
+  {
+    if CONSTANT_READER
+      .is_match(buf.as_bytes().trim_ascii())
+      .ok_or_else(|| ParseError::ExtraneousInput {
+        bad_seq:  Cow::from(buf.clone()),
+        expected: ConstFormatToken::Constant,
+        line_num: line_counter + 1,
+      })
+      .map(|()| true)?
+      && let (components, check) = {
+        let components: Vec<String> =
+          buf.split_ascii_whitespace().map_into().collect();
+        buf.clear();
+        line_counter += 1;
+        input.as_ref().read_line(&mut buf).map_err(|inner| {
+          ParseError::LineReading { line_num: line_counter + 1, inner }
+        })?;
 
-impl ConstFormat {
-  pub(crate) fn parse_file(
-    input: impl AsRef<[u8]>,
-  ) -> Result<ConstContainer, ParseError> {
-    let (mut buf, mut line_counter, mut inner) =
-      (String::with_capacity(input.as_ref().len()), 0, Vec::new());
-    while input.as_ref().read_line(&mut buf).map_err(|inner| {
-      ParseError::LineReading { line_num: line_counter + 1, inner }
-    })?
-      != 0
-    {
-      line_counter += 1;
-      if CONSTANT_READER
-        .is_match(buf.as_bytes())
+        (components, PATH_READER.is_match(buf.as_bytes().trim_ascii()))
+      }
+      && check
         .ok_or_else(|| ParseError::ExtraneousInput {
-          input:    Cow::from(buf.clone()),
-          expected: ConstFormatToken::Constant,
+          bad_seq:  Cow::from(buf.clone()),
+          expected: ConstFormatToken::Path,
           line_num: line_counter + 1,
         })
         .map(|()| true)?
-        && let (components, check) = {
-          let components: Vec<String> =
-            buf.split_ascii_whitespace().map_into().collect();
-          buf.clear();
-          input.as_ref().read_line(&mut buf).map_err(|inner| {
-            ParseError::LineReading { line_num: line_counter + 1, inner }
-          })?;
-          line_counter += 1;
-
-          (components, PATH_READER.is_match(buf.as_bytes()))
-        }
-        && check
-          .ok_or_else(|| ParseError::ExtraneousInput {
-            input:    Cow::from(buf.clone()),
-            expected: ConstFormatToken::Path,
-            line_num: line_counter + 1,
-          })
-          .map(|()| true)?
-      {
-        inner.push(Const::from_file(
+    {
+      inner.push({
+        let mut out = Const::from_file(
           Ident::new(
             components.first().expect(
               "there should be at least one token if `PATH_READER` matched",
@@ -690,116 +702,17 @@ impl ConstFormat {
             Span::call_site(),
           ),
           PathBuf::from(buf.trim()),
-          components.len() > 1,
-        ));
-      }
-      buf.clear();
-    }
-
-    Ok(ConstContainer::new(inner))
-  }
-}
-
-pub(crate) trait ConstAllocator {
-  const DEPRECATED_ATTR: &str = "[deprecated]";
-
-  fn coarse_allocate(input: impl IntoIterator<Item: Borrow<Const>>) -> Vec<u8>;
-
-  fn fine_allocate(
-    input: impl IntoIterator<Item: Borrow<Const>>,
-  ) -> Vec<Vec<u8>>;
-}
-
-#[derive(Debug)]
-pub(crate) struct ContentAllocator;
-
-impl ConstAllocator for ContentAllocator {
-  fn coarse_allocate(input: impl IntoIterator<Item: Borrow<Const>>) -> Vec<u8> {
-    input
-      .into_iter()
-      .flat_map(|constant| {
-        constant
-          .borrow()
-          .ident
-          .to_string()
-          .into_bytes()
-          .into_iter()
-          .chain(iter::once(b'\n'))
-      })
-      .collect()
-  }
-
-  fn fine_allocate(
-    input: impl IntoIterator<Item: Borrow<Const>>,
-  ) -> Vec<Vec<u8>> {
-    input
-      .into_iter()
-      .map(|constant| constant.borrow().ident.to_string().into_bytes())
-      .collect()
-  }
-}
-
-#[derive(Debug)]
-pub(crate) struct FullAllocator;
-
-impl ConstAllocator for FullAllocator {
-  fn coarse_allocate(input: impl IntoIterator<Item: Borrow<Const>>) -> Vec<u8> {
-    input
-      .into_iter()
-      .flat_map(|constant| {
-        constant
-          .borrow()
-          .ident
-          .to_string()
-          .into_bytes()
-          .into_iter()
-          .chain(
-            if constant.borrow().deprecated {
-              <Self as ConstAllocator>::DEPRECATED_ATTR
-            } else {
-              ""
-            }
-            .bytes(),
-          )
-          .chain(iter::once(b'\n'))
-          .chain(
-            constant.borrow().source.as_os_str().as_encoded_bytes().to_owned(),
-          )
-          .chain(iter::once(b'\n'))
-      })
-      .collect()
-  }
-
-  fn fine_allocate(
-    input: impl IntoIterator<Item: Borrow<Const>>,
-  ) -> Vec<Vec<u8>> {
-    input
-      .into_iter()
-      .map(|constant| {
-        let mut out = constant.borrow().ident.to_string().into_bytes();
-        out.extend(
-          if constant.borrow().deprecated {
-            <Self as ConstAllocator>::DEPRECATED_ATTR
-          } else {
-            ""
-          }
-          .bytes()
-          .chain(iter::once(b'\n'))
-          .chain(
-            constant
-              .borrow()
-              .source
-              .as_os_str()
-              .as_encoded_bytes()
-              .iter()
-              .copied(),
-          ),
         );
+        out.deprecated(components.len() > 1);
 
         out
-      })
-      .collect()
+      });
+    }
+    line_counter += 1;
+    buf.clear();
   }
+
+  Ok(ConstContainer::new(inner))
 }
 
 pub(crate) fn build_re(re: impl AsRef<str>) -> Result<Regex, regex::Error> {
