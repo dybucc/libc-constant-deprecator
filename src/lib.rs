@@ -79,13 +79,13 @@ impl SourceFile {
     clippy::must_use_candidate,
     reason = "It's not a bug not to use this function."
   )]
-  pub fn contents(&self) -> &File { &self.contents }
+  pub fn syntax_tree(&self) -> &File { &self.contents }
 
   #[expect(
     clippy::must_use_candidate,
     reason = "It's not a bug not to use this function."
   )]
-  pub fn into_contents(self) -> File { self.contents }
+  pub fn into_syntax_tree(self) -> File { self.contents }
 
   #[expect(
     clippy::must_use_candidate,
@@ -104,9 +104,9 @@ pub fn scan_files<T: AsRef<Path>>(
   libc_path: &T,
 ) -> Result<Vec<SourceFile>, ScanFilesError> {
   // TODO: instead of only interacting with git to clone the repo, use it to
-  // both verify that it's, indeed, the `libc` repo, and to extract the
-  // current worktree's commit sha-1 to embed into the file that will persist
-  // the current changes to constants in memory.
+  // both verify that it's, indeed, the `libc` repo, and to extract the current
+  // worktree's commit sha-1 to embed into the file that will persist the
+  // current changes to constants in memory.
 
   (!libc_path.as_ref().try_exists().is_ok_and(|inner| inner)).ok_or_else(
     || ScanFilesError::MissingDirectoryAccess(libc_path.as_ref().to_owned()),
@@ -136,15 +136,14 @@ pub fn scan_files<T: AsRef<Path>>(
     })?;
   env::set_current_dir(libc_path.as_ref())
     .map_err(ScanFilesError::PwdSetting)?;
-  let files = fetch_details().map_err(|e| match e {
+
+  parse_files(fetch_details().map_err(|e| match e {
     | FetchDetailsError::CargoMetadata =>
       ScanFilesError::WorkspaceScanning(libc_path.as_ref().to_owned()),
     | FetchDetailsError::NoLibc =>
       ScanFilesError::NoLibc(libc_path.as_ref().to_owned()),
-  })?;
-
-  parse_files(files)
-    .map_err(|ParseFilesError(path)| ScanFilesError::ParseError(path))
+  })?)
+  .map_err(|ParseFilesError(path)| ScanFilesError::ParseError(path))
 }
 
 #[derive(Debug)]
@@ -154,18 +153,19 @@ pub(crate) enum FetchDetailsError {
 }
 
 pub(crate) fn fetch_details() -> Result<Vec<PathBuf>, FetchDetailsError> {
-  let metadata = MetadataCommand::new()
-    .exec()
-    .map_err(|_| FetchDetailsError::CargoMetadata)?;
-  let packages = metadata.workspace_packages();
-  let libc_pkg = packages
-    .iter()
-    .find_map(|&pkg| {
-      (pkg.name == "libc")
-        .then(|| pkg.manifest_path.parent().unwrap().to_owned())
-    })
-    .ok_or(FetchDetailsError::NoLibc)?;
-  let files: Vec<_> = WalkDir::new(libc_pkg)
+  Ok(
+    WalkDir::new(
+      MetadataCommand::new()
+        .exec()
+        .map_err(|_| FetchDetailsError::CargoMetadata)?
+        .workspace_packages()
+        .iter()
+        .find_map(|&pkg| {
+          (pkg.name == "libc")
+            .then(|| pkg.manifest_path.parent().unwrap().to_owned())
+        })
+        .ok_or(FetchDetailsError::NoLibc)?,
+    )
     .sort_by_file_name()
     .contents_first(true)
     .into_iter()
@@ -176,9 +176,8 @@ pub(crate) fn fetch_details() -> Result<Vec<PathBuf>, FetchDetailsError> {
         .then(|| entry.into_path())
         .filter(|inner| inner.extension().is_some_and(|ext| ext == "rs"))
     })
-    .collect();
-
-  Ok(files)
+    .collect(),
+  )
 }
 
 #[derive(Debug)]
@@ -302,12 +301,17 @@ pub(crate) fn process_trait_block(
 
 #[derive(Debug, Clone)]
 pub struct Const {
+  #[expect(unused, reason = "It may be used in the future.")]
   repr:       ConstRepr,
   ident:      Ident,
   source:     PathBuf,
   deprecated: bool,
 }
 
+#[expect(
+  unused,
+  reason = "It may be used in the future, in the `repr` field of `Const`."
+)]
 #[derive(Debug, Clone)]
 pub(crate) enum ConstRepr {
   Item(ItemConst),
@@ -466,6 +470,7 @@ impl ConstContainer {
   }
 
   pub fn fetch_from_disk(path: impl AsRef<Path>) -> Result<Self, FetchError> {
+    // TODO: expand macros prior to getting the string with the file contents.
     let file = fs::read_to_string(path).map_err(|inner| {
       FetchError(FetchErrorRepr::IoBound(IoBoundErrorKind::Fs(inner)))
     })?;

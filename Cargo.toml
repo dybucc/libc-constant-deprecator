@@ -8,7 +8,11 @@ pedantic = "warn"
 
 [dependencies]
 cargo_metadata = "0.23.1"
-gix = { version = "0.81.0", features = ["async-network-client"] }
+gix = { version = "0.81.0", features = [
+  "blocking-network-client",
+  "blocking-http-transport-reqwest",
+  "blocking-http-transport-reqwest-rust-tls",
+] }
 itertools = "0.14.0"
 proc-macro2 = "1.0.106"
 quote = "1.0.45"
