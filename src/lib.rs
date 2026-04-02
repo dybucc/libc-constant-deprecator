@@ -1,4 +1,4 @@
-#![feature(bool_to_result, exit_status_error, string_from_utf8_lossy_owned)]
+#![feature(bool_to_result)]
 
 pub(crate) mod constant;
 pub(crate) mod constant_container;
@@ -49,5 +49,3 @@ macro_rules! deprecate {
 // the `libc` repo.
 
 pub(crate) const LIBC_REPO: &str = "https://github.com/rust-lang/libc.git";
-
-pub(crate) const EDITION: &str = "2021";

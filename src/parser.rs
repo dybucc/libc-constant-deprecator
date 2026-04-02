@@ -11,7 +11,9 @@ use crate::{Const, SourceFile};
 pub fn parse_constants(files: &[SourceFile]) -> Vec<Const> {
   // TODO: handle inline modules (those that `syn` has parsed as having a
   // `Some(_)` in their `content` field) by checking recursively for all items
-  // within them.
+  // within them. There's already a free function that does just the analogue of
+  // this in the `constant_container` module, so either abstract the differences
+  // or make another one for this specific routine.
   files.iter().fold(
     Vec::with_capacity(files.len()),
     |mut parsed_files, SourceFile { contents, source }| {

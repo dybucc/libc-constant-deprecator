@@ -2,7 +2,6 @@ use std::{
   env,
   fs,
   path::{Path, PathBuf},
-  process::Command,
   sync::atomic::AtomicBool,
 };
 
@@ -12,8 +11,6 @@ use syn::File;
 use walkdir::WalkDir;
 
 use crate::{
-  EDITION,
-  ExpansionError,
   FetchDetailsError,
   LIBC_REPO,
   ParseFilesError,
@@ -85,11 +82,11 @@ pub(crate) fn fetch_details() -> Result<Vec<PathBuf>, FetchDetailsError> {
     .contents_first(true)
     .into_iter()
     .filter_map(|entry| {
-      let entry = entry.ok()?;
-
-      (entry.file_type().is_file())
-        .then(|| entry.into_path())
-        .filter(|inner| inner.extension().is_some_and(|ext| ext == "rs"))
+      entry.ok().map(|entry| {
+        (entry.file_type().is_file())
+          .then(|| entry.into_path())
+          .filter(|inner| inner.extension().is_some_and(|ext| ext == "rs"))
+      })?
     })
     .collect(),
   )
@@ -105,11 +102,13 @@ pub(crate) fn parse_files(
 
   files.into_iter().try_fold(Vec::new(), |mut files, file| {
     files.push(SourceFile::new(
-      syn::parse_file(
-        &fs::read_to_string(&file)
-          .map_err(|_| ParseFilesError(file.clone()))?,
-      )
-      .map_err(|_| ParseFilesError(file.clone()))?,
+      process_macros(
+        syn::parse_file(
+          &fs::read_to_string(&file)
+            .map_err(|_| ParseFilesError(file.clone()))?,
+        )
+        .map_err(|_| ParseFilesError(file.clone()))?,
+      )?,
       file,
     ));
 
@@ -117,29 +116,6 @@ pub(crate) fn parse_files(
   })
 }
 
-#[expect(
-  unused,
-  clippy::needless_pass_by_value,
-  reason = "Macro expansion is not fully implemented just yet."
-)]
-pub(crate) fn expand_macros(file: File) -> Result<File, ExpansionError> {
-  let command = Command::new("rustc")
-    .env("RUSTC_BOOTSTRAP", "1")
-    .args([
-      "-Zunpretty=expanded",
-      "--edition",
-      EDITION,
-      env::current_dir()
-        .map_err(|_| todo!())?
-        .join("src/lib.rs")
-        .to_str()
-        .ok_or(todo!())?,
-    ])
-    .output()
-    .map_err(|_| ExpansionError::ExpansionCommand)?
-    .exit_ok()
-    .map_err(|_| ExpansionError::ExpansionCommand)?;
-  let out = String::from_utf8_lossy_owned(command.stdout);
-
+pub(crate) fn process_macros(input: File) -> Result<File, ParseFilesError> {
   todo!()
 }

@@ -39,12 +39,6 @@ pub(crate) enum FetchDetailsError {
 pub(crate) struct ParseFilesError(pub(crate) PathBuf);
 
 #[derive(Debug, Error)]
-pub(crate) enum ExpansionError {
-  #[error("failed to expand crate contents with macro command")]
-  ExpansionCommand,
-}
-
-#[derive(Debug, Error)]
 #[error("{}", match .0 {
   FetchErrorRepr::IoBound(repr) => match repr {
     IoBoundErrorKind::Fs(inner) =>
