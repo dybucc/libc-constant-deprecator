@@ -7,16 +7,11 @@ use std::{
 
 use cargo_metadata::MetadataCommand;
 use gix::progress::Discard;
-use syn::File;
 use walkdir::WalkDir;
 
-use crate::{
-  FetchDetailsError,
-  LIBC_REPO,
-  ParseFilesError,
-  ScanFilesError,
-  SourceFile,
-};
+use crate::{FetchDetailsError, ParseFilesError, ScanFilesError, SourceFile};
+
+pub(crate) const LIBC_REPO: &str = "https://github.com/rust-lang/libc.git";
 
 pub fn scan_files(
   libc_path: impl AsRef<Path>,
@@ -102,20 +97,14 @@ pub(crate) fn parse_files(
 
   files.into_iter().try_fold(Vec::new(), |mut files, file| {
     files.push(SourceFile::new(
-      process_macros(
-        syn::parse_file(
-          &fs::read_to_string(&file)
-            .map_err(|_| ParseFilesError(file.clone()))?,
-        )
-        .map_err(|_| ParseFilesError(file.clone()))?,
-      )?,
+      syn::parse_file(
+        &fs::read_to_string(&file)
+          .map_err(|_| ParseFilesError(file.clone()))?,
+      )
+      .map_err(|_| ParseFilesError(file.clone()))?,
       file,
     ));
 
     Ok(files)
   })
-}
-
-pub(crate) fn process_macros(input: File) -> Result<File, ParseFilesError> {
-  todo!()
 }

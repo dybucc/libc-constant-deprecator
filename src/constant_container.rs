@@ -276,8 +276,8 @@ pub(crate) fn parse_file(
         })
         .map(|()| true)?
     {
-      inner.push({
-        let mut out = Const::from_file(
+      inner.push(
+        iter::once(Const::from_file(
           Ident::new(
             components.first().expect(
               "there should be at least one token if `PATH_READER` matched",
@@ -285,11 +285,11 @@ pub(crate) fn parse_file(
             Span::call_site(),
           ),
           PathBuf::from(buf.trim()),
-        );
-        out.deprecated(components.len() > 1);
-
-        out
-      });
+        ))
+        .map(|mut out| (out.deprecated(components.len() > 1), out).1)
+        .next()
+        .unwrap(),
+      );
     }
     line_counter += 1;
     buf.clear();
