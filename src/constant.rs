@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use syn::{Ident, ImplItemConst, ItemConst, TraitItemConst};
+use syn::{Ident, ItemConst};
 
 #[derive(Debug, Clone)]
 pub struct Const {
@@ -11,24 +11,6 @@ pub struct Const {
 
 impl Const {
   pub(crate) fn from_item(item: &ItemConst, source: impl AsRef<Path>) -> Self {
-    let ident = item.ident.clone();
-
-    Self { ident, source: source.as_ref().to_owned(), deprecated: false }
-  }
-
-  pub(crate) fn from_trait(
-    item: &TraitItemConst,
-    source: impl AsRef<Path>,
-  ) -> Self {
-    let ident = item.ident.clone();
-
-    Self { ident, source: source.as_ref().to_owned(), deprecated: false }
-  }
-
-  pub(crate) fn from_impl(
-    item: &ImplItemConst,
-    source: impl AsRef<Path>,
-  ) -> Self {
     let ident = item.ident.clone();
 
     Self { ident, source: source.as_ref().to_owned(), deprecated: false }
