@@ -1,53 +1,61 @@
 use std::path::Path;
 
-use proc_macro2::TokenStream;
-use syn::{Item, ItemConst, ItemMacro, Macro};
+use proc_macro2::Span;
+use syn::{Ident, Item, ItemConst, ItemMacro, Macro};
 
 use crate::{Const, SourceFile};
 
-/// This only scans through module level items and macros, as a quick search
-/// through the `libc` codebase with `rg -C 10 -e "^(mod|trait|impl)\s+"` yields
-/// no results that would make scanning for inline modules and inherent/trait
-/// impl blocks worth it.
+pub(crate) mod macro_parser;
+
+pub(crate) use macro_parser::MacroParser;
+
+// NOTE: this only scans through top-level module items and the `cfg_if` macro
+// because there's no inner scopes (e.g. inherent impls and traits) that contain
+// constants that ought be deprecated, and because the `cfg_if` macro is the
+// only one in which constant items relevant to target platforms are declared
+// (barring the `c_enum` macro, the generated constants of which we don't
+// require deprecating.)
 #[expect(
-  clippy::must_use_candidate,
-  reason = "It's not a bug not to use the result of this routine."
+    clippy::must_use_candidate,
+    reason = "It's not a bug not to use the result of this routine."
 )]
 pub fn parse_constants(files: &[SourceFile]) -> Vec<Const> {
-  files.iter().fold(
-    Vec::with_capacity(files.len()),
-    |mut parsed_constants, SourceFile { contents, source }| {
-      (
-        parsed_constants.append(
-          &mut contents
-            .items
-            .iter()
-            .filter_map(|item| {
-              match item {
-                | Item::Const(constant) => process_constant(constant, source),
-                | Item::Macro(ItemMacro {
-                  mac: Macro { tokens, .. }, ..
-                }) => process_macro(tokens),
-                | _ => return None,
-              }
-              .into()
-            })
-            .fold(Vec::new(), |mut constants, mut item| {
-              (constants.append(&mut item), constants).1
-            }),
-        ),
-        parsed_constants,
-      )
-        .1
-    },
-  )
+    let mut parsed_constants = Vec::with_capacity(files.len());
+
+    for SourceFile(contents, ..) in files {
+        let mut file_constants = Vec::new();
+
+        for item in &contents.items {
+            if let Some(mut constants) = match item {
+                Item::Const(constant) => process_constant(constant).into(),
+                Item::Macro(ItemMacro {
+                    mac: mac @ Macro { path, .. },
+                    ..
+                }) if path.is_ident(&Ident::new("cfg_if", Span::call_site())) => {
+                    process_macro(mac).into()
+                }
+                _ => None,
+            } {
+                file_constants.append(&mut constants);
+            }
+        }
+
+        parsed_constants.append(&mut file_constants);
+    }
+
+    parsed_constants
 }
 
-pub(crate) fn process_constant(
-  constant: &ItemConst,
-  source: impl AsRef<Path>,
-) -> Vec<Const> {
-  vec![Const::from_item(constant, source)]
+#[inline]
+pub(crate) fn process_constant(constant: &ItemConst) -> Vec<Const> {
+    vec![Const::from_item(
+        constant.clone(),
+        source.as_ref().to_owned(),
+    )]
 }
 
-pub(crate) fn process_macro(tokens: &TokenStream) -> Vec<Const> { todo!() }
+pub(crate) fn process_macro(mac: &Macro) -> Vec<Const> {
+    mac.parse_body::<MacroParser>()
+        .expect("macro body couldn't be parsed correctly; time to check the implementation again")
+        .into_vec()
+}

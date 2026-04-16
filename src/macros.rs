@@ -1,12 +1,8 @@
 macro_rules! deprecate {
-  ($msg:expr) => {{
-    $crate::support::iter::once($msg)
-      .map(|msg| {
+    ($msg:expr) => {{
+        let msg = $msg;
         $crate::support::parse_quote! {
-          #[deprecated(since = "1.0.0", note = #msg)]
+            #[deprecated(since = "1.0.0", note = #msg)]
         }
-      })
-      .next()
-      .unwrap()
-  }};
+    }};
 }
