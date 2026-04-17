@@ -7,13 +7,10 @@ use std::{
     sync::LazyLock,
 };
 
-use itertools::Itertools;
-use proc_macro2::{Span, TokenStream};
+use proc_macro2::{LineColumn, Span, TokenStream};
 use quote::ToTokens;
 use regex::bytes::{Regex, RegexBuilder};
-use syn::{
-    Ident, ImplItem, ImplItemConst, Item, ItemConst, ItemImpl, ItemTrait, TraitItem, TraitItemConst,
-};
+use syn::{Ident, Item, ItemConst, spanned::Spanned};
 
 use crate::{
     ChangesSrc, Const, ConstFormatToken, FetchError, FetchErrorRepr, FilterError, IoBoundChanges,
@@ -40,7 +37,6 @@ impl ConstContainer {
     }
 
     pub fn fetch_from_disk(path: impl AsRef<Path>) -> Result<Self, FetchError> {
-        // TODO: expand macros prior to getting a string and parsing.
         let file = fs::read_to_string(path)
             .map_err(|inner| FetchError(FetchErrorRepr::IoBound(IoBoundErrorKind::Fs(inner))))?;
 
@@ -78,19 +74,21 @@ impl ConstContainer {
                          ident,
                          source,
                          deprecated,
-                         ..
+                         span: LineColumn { line, column },
                      }| {
                         ident
                             .to_string()
                             .into_bytes()
                             .into_iter()
                             .chain(iter::once(b' '))
-                            .chain(match deprecated {
-                                true => attr.to_string().into_bytes().into_iter(),
-                                false => Vec::new().into_iter(),
+                            .chain(if *deprecated {
+                                attr.to_string().into_bytes()
+                            } else {
+                                Vec::new()
                             })
                             .chain(iter::once(b'\n'))
                             .chain(source.as_os_str().as_encoded_bytes().iter().copied())
+                            .chain(format!(" line:{line} col:{column}\n").into_bytes())
                     },
                 )
                 .collect::<Vec<_>>(),
@@ -105,18 +103,18 @@ impl ConstContainer {
     )]
     pub fn filter(&mut self, re: impl AsRef<str>) -> Result<Vec<&mut Const>, FilterError> {
         let Self { inner, re_cache } = self;
-        let re = match re_cache.get(re.as_ref()) {
-            Some(re) => re,
-            None => {
-                re_cache.insert(
-                    re.as_ref().to_string(),
-                    build_re(&re).map_err(|_| FilterError::RegexCompilation {
-                        input_str: re.as_ref().to_string(),
-                    })?,
-                );
 
-                re_cache.get(re.as_ref()).unwrap()
-            }
+        let re = if let Some(re) = re_cache.get(re.as_ref()) {
+            re
+        } else {
+            re_cache.insert(
+                re.as_ref().to_string(),
+                build_re(&re).map_err(|_| FilterError::RegexCompilation {
+                    input_str: re.as_ref().to_string(),
+                })?,
+            );
+
+            re_cache.get(re.as_ref()).unwrap()
         };
 
         Ok(inner
@@ -125,111 +123,67 @@ impl ConstContainer {
             .collect())
     }
 
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "The source of panics is (at the time of writing) trivially not impossible to \
-                  panic."
-    )]
     pub fn effect_changes(&self) -> Result<(), MakeChangesError> {
-        // TODO: expand macros prior to both string reading and `syn` parsing.
-        self.inner
-            .iter()
-            .try_for_each(|constant @ Const { source, .. }| {
-                let file = syn::parse_file(&fs::read_to_string(source).map_err(|inner| {
-                    MakeChangesError::IoBound(IoBoundChanges {
-                        origin: ChangesSrc::FetchOp(source.clone()),
-                        inner,
-                    })
-                })?)
-                .map_err(|_| MakeChangesError::Parse(source.clone().into()))?;
-
-                fs::write(
-                    source,
-                    (0..file.items.len())
-                        .fold(file, |mut file, idx| {
-                            (
-                                change_constant_in(file.items.get_mut(idx).unwrap(), constant),
-                                file,
-                            )
-                                .1
-                        })
-                        .into_token_stream()
-                        .to_string(),
-                )
-                .map_err(|inner| {
-                    MakeChangesError::IoBound(IoBoundChanges {
-                        origin: ChangesSrc::SaveOp(source.clone()),
-                        inner,
-                    })
+        for Const {
+            ident: ref_ident,
+            deprecated,
+            span,
+            source,
+        } in &self.inner
+        {
+            let mut file = syn::parse_file(&fs::read_to_string(source).map_err(|inner| {
+                MakeChangesError::IoBound(IoBoundChanges {
+                    origin: ChangesSrc::FetchOp(source.clone()),
+                    inner,
                 })
-            })
-    }
-}
+            })?)
+            .map_err(|_| MakeChangesError::Parse(source.clone().into()))?;
 
-pub(crate) fn change_constant_in(
-    item: &mut Item,
-    constant @ Const {
-        ident: ref_ident,
-        deprecated,
-        ..
-    }: &Const,
-) {
-    match item {
-        Item::Const(ItemConst { attrs, ident, .. }) if ident == ref_ident && *deprecated => {
-            attrs.push(deprecate!(ConstContainer::DEPRECATION_NOTICE));
-        }
-        Item::Impl(ItemImpl { items, .. }) => items
-            .iter_mut()
-            .filter_map(|item| {
-                if let ImplItem::Const(constant) = item
-                    && let ImplItemConst { ident, .. } = constant
+            // NOTE: the check for the span comes before the destructuring pattern because
+            // otherwise borrowck complains about `item` already being exclusively borrowed
+            // with the variable bindings of that pattern.
+            for item in &mut file.items {
+                if item.span().start() == *span
+                    && let Item::Const(ItemConst { attrs, ident, .. }) = item
                     && ident == ref_ident
                     && *deprecated
                 {
-                    Some(constant)
-                } else {
-                    None
+                    attrs.push(deprecate!(ConstContainer::DEPRECATION_NOTICE));
                 }
-            })
-            .for_each(|ImplItemConst { attrs, .. }| {
-                attrs.push(deprecate!(ConstContainer::DEPRECATION_NOTICE));
-            }),
-        Item::Trait(ItemTrait { items, .. }) => items
-            .iter_mut()
-            .filter_map(|item| {
-                if let TraitItem::Const(constant) = item
-                    && let TraitItemConst { ident, .. } = constant
-                    && ident == ref_ident
-                    && *deprecated
-                {
-                    Some(constant)
-                } else {
-                    None
-                }
-            })
-            .for_each(|TraitItemConst { attrs, .. }| {
-                attrs.push(deprecate!(ConstContainer::DEPRECATION_NOTICE));
-            }),
-        Item::Mod(syn::ItemMod {
-            content: Some((_, content)),
-            ..
-        }) => {
-            for item in content.iter_mut() {
-                change_constant_in(item, constant);
             }
+
+            // TODO: I'm not entirely sure, but the token-converted string we produce here
+            // may not be in a state that we would want to add to the codebase immediately,
+            // without some form of prior formatting. If such is the case, then we'll have
+            // to look into either calling `rustfmt` on the file at the current constant's
+            // `source`, or looking up some library to format the code prior to inclusion on
+            // the codebase.
+            fs::write(source, file.into_token_stream().to_string()).map_err(|inner| {
+                MakeChangesError::IoBound(IoBoundChanges {
+                    origin: ChangesSrc::SaveOp(source.clone()),
+                    inner,
+                })
+            })?;
         }
-        _ => (),
+
+        Ok(())
     }
 }
 
 static CONSTANT_READER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[[:alnum:][:punct:]]+(\s\[deprecated\])?$").unwrap());
 
-static PATH_READER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(/[[:ascii:]]*)+$").unwrap());
+static SRC_READER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"^"(/[[:ascii:]]*)+" line:\d+ col:\d+$"#).unwrap());
 
 pub(crate) fn parse_file(input: impl AsRef<[u8]>) -> Result<ConstContainer, ParseError> {
-    let (mut buf, mut line_counter, mut inner) =
-        (String::with_capacity(input.as_ref().len()), 0, Vec::new());
+    let mut buf = String::with_capacity(input.as_ref().len());
+
+    // NOTE: this is used for error reporting purposes, not for parsing purposes.
+    let mut line_counter = 0;
+
+    let mut parsed_items = Vec::new();
+
     while input
         .as_ref()
         .read_line(&mut buf)
@@ -247,10 +201,9 @@ pub(crate) fn parse_file(input: impl AsRef<[u8]>) -> Result<ConstContainer, Pars
                 line_num: line_counter + 1,
             })
             .map(|()| true)?
-            && let (components, check) = {
-                let components: Vec<String> = buf.split_ascii_whitespace().map_into().collect();
-                buf.clear();
+            && let src_reader_check = {
                 line_counter += 1;
+
                 input
                     .as_ref()
                     .read_line(&mut buf)
@@ -259,36 +212,62 @@ pub(crate) fn parse_file(input: impl AsRef<[u8]>) -> Result<ConstContainer, Pars
                         inner,
                     })?;
 
-                (
-                    components,
-                    PATH_READER.is_match(buf.as_bytes().trim_ascii()),
-                )
+                SRC_READER
+                    .is_match(buf.as_bytes().trim_ascii())
+                    .ok_or_else(|| ParseError::ExtraneousInput {
+                        bad_seq: buf.clone().into(),
+                        expected: ConstFormatToken::Path,
+                        line_num: line_counter + 1,
+                    })
+                    .map(|()| true)?
             }
-            && check
-                .ok_or_else(|| ParseError::ExtraneousInput {
-                    bad_seq: buf.clone().into(),
-                    expected: ConstFormatToken::Path,
-                    line_num: line_counter + 1,
-                })
-                .map(|()| true)?
+            && src_reader_check
         {
-            let mut item = Const::from_file(
-                Ident::new(
-                    components
-                        .first()
-                        .expect("there should be at least one token if `PATH_READER` matched"),
-                    Span::call_site(),
-                ),
-                PathBuf::from(buf.trim()),
+            let Some((constant_line, source_line)) = buf.split_once('\n') else {
+                panic!("if both regexes matched, there should be two lines in the buffer");
+            };
+
+            let mut constant_iter = constant_line.split_ascii_whitespace();
+
+            let ident = constant_iter.next().expect(
+                "if the `CONSTANT_READER` regex matched, there should be at least 1 element in \
+                 the iterator",
             );
-            item.deprecated(components.len() > 1);
-            inner.push(item);
+            let deprecated = constant_iter.next().is_some();
+
+            let Some((path_line, col)) = source_line.rsplit_once(' ') else {
+                panic!(
+                    "if the `SRC_READER` regex matched, there should be at least a path, a line \
+                     and a column indicators"
+                );
+            };
+            let Some((path, line)) = path_line.rsplit_once(' ') else {
+                panic!(
+                    "if the `SRC_READER` regex matched, there should be at least a path, a line \
+                     and a column indicators"
+                );
+            };
+
+            // NOTE: spans have a fallback when not running inside a proc-macro, and the
+            // library doesn't ever require knowning span information beyond what is already
+            // stored inside the `Const`. Also, `Span`s can't be arbitrarily built.
+            parsed_items.push(Const::from_file(
+                Ident::new(ident, Span::call_site()),
+                deprecated,
+                PathBuf::from(path),
+                LineColumn {
+                    line: line.trim_start_matches("line:").parse().unwrap(),
+                    column: col.trim_start_matches("col:").parse().unwrap(),
+                },
+            ));
         }
+
         line_counter += 1;
+
         buf.clear();
     }
 
-    Ok(ConstContainer::new(inner))
+    Ok(ConstContainer::new(parsed_items))
 }
 
 pub(crate) fn build_re(re: impl AsRef<str>) -> Result<Regex, regex::Error> {

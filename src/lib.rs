@@ -10,6 +10,12 @@ mod scanner;
 mod source_file;
 mod support;
 
+// TODO: implement functionality to both check and embed information on the
+// location of a file with the constants formatted inside the `Cargo.toml` of
+// the `libc` repo. This is best implemented on a separate module, as most of
+// the interface around `ConstContainer` does not implement functionality for
+// storing the path of the file.
+
 #[expect(
     clippy::single_component_path_imports,
     reason = "The macro is reexported at the crate level but is not part of the public API."
@@ -35,7 +41,3 @@ pub use crate::{
     scanner::scan_files,
     source_file::SourceFile,
 };
-
-// TODO: implement functionality to both check and embed information on the
-// location of a file with the constants formatted inside the `Cargo.toml` of
-// the `libc` repo.

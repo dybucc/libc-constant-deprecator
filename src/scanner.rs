@@ -80,6 +80,7 @@ pub(crate) fn parse_files(files: Vec<PathBuf>) -> Result<Vec<SourceFile>, ParseF
         out.push(SourceFile::new(
             syn::parse_file(&fs::read_to_string(&file).map_err(|_| ParseFilesError(file.clone()))?)
                 .map_err(|_| ParseFilesError(file.clone()))?,
+            file,
         ));
     }
 

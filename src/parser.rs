@@ -22,12 +22,12 @@ pub(crate) use macro_parser::MacroParser;
 pub fn parse_constants(files: &[SourceFile]) -> Vec<Const> {
     let mut parsed_constants = Vec::with_capacity(files.len());
 
-    for SourceFile(contents, ..) in files {
+    for SourceFile { inner, source } in files {
         let mut file_constants = Vec::new();
 
-        for item in &contents.items {
+        for item in &inner.items {
             if let Some(mut constants) = match item {
-                Item::Const(constant) => process_constant(constant).into(),
+                Item::Const(constant) => process_constant(constant, source).into(),
                 Item::Macro(ItemMacro {
                     mac: mac @ Macro { path, .. },
                     ..
@@ -47,7 +47,7 @@ pub fn parse_constants(files: &[SourceFile]) -> Vec<Const> {
 }
 
 #[inline]
-pub(crate) fn process_constant(constant: &ItemConst) -> Vec<Const> {
+pub(crate) fn process_constant(constant: &ItemConst, source: impl AsRef<Path>) -> Vec<Const> {
     vec![Const::from_item(
         constant.clone(),
         source.as_ref().to_owned(),

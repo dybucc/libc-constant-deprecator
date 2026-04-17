@@ -1,0 +1,4 @@
+SOME_CONSTANT [deprecated]
+"/Users/dybucc/rust-dev/libc/src/hermit.rs" line:1 col:2
+SOME_CONSTANT
+"/Users/dybucc/rust-dev/libc/src/hermit.rs" line:2 col:5
