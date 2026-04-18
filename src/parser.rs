@@ -32,7 +32,7 @@ pub fn parse_constants(files: &[SourceFile]) -> Vec<Const> {
                     mac: mac @ Macro { path, .. },
                     ..
                 }) if path.is_ident(&Ident::new("cfg_if", Span::call_site())) => {
-                    process_macro(mac).into()
+                    process_macro(mac, source).into()
                 }
                 _ => None,
             } {
@@ -54,8 +54,8 @@ pub(crate) fn process_constant(constant: &ItemConst, source: impl AsRef<Path>) -
     )]
 }
 
-pub(crate) fn process_macro(mac: &Macro) -> Vec<Const> {
+pub(crate) fn process_macro(mac: &Macro, source: impl AsRef<Path>) -> Vec<Const> {
     mac.parse_body::<MacroParser>()
         .expect("macro body couldn't be parsed correctly; time to check the implementation again")
-        .into_vec()
+        .into_vec(source.as_ref())
 }

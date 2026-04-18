@@ -1,30 +1,50 @@
+use std::path::Path;
+
 use syn::{
-    Token,
+    Attribute, Block, Item, ItemConst, Stmt, Token,
     parse::{Parse, ParseStream},
 };
 
 use crate::Const;
 
 #[derive(Debug)]
-pub(crate) struct MacroParser(pub(crate) Vec<Const>);
+pub(crate) struct MacroParser(pub(crate) Vec<ItemConst>);
 
 impl MacroParser {
-    pub(crate) fn into_vec(self) -> Vec<Const> {
-        self.0
+    pub(crate) fn into_vec(self, source: impl AsRef<Path>) -> Vec<Const> {
+        let mut out = Vec::with_capacity(self.0.len());
+
+        for constant in self.0 {
+            out.push(Const::from_item(constant, source.as_ref().to_owned()));
+        }
+
+        out
     }
 }
 
 impl Parse for MacroParser {
     fn parse(input: ParseStream) -> syn::Result<Self> {
-        if input.peek(Token![if]) {
-            input.parse::<Token![if]>()?;
+        input.parse::<Token![if]>()?;
+        input.call(Attribute::parse_outer)?;
 
-            // TODO: the next token ought be an outer attribute, after which
-            // there should be a block with regular module-level item
-            // declarations. Outside the block, there should be an `else` token,
-            // (possibly, but not surely) an `if` token and the same block.
+        let Block { stmts, .. } = input.parse()?;
+        let mut out = Vec::new();
+
+        for stmt in stmts {
+            if let Stmt::Item(item) = stmt
+                && let Item::Const(constant) = item
+            {
+                out.push(constant);
+            }
         }
 
-        todo!()
+        if input.peek(Token![else]) {
+            input.parse::<Token![else]>()?;
+
+            // TODO: this may be wrong.
+            Self::parse(input)?;
+        }
+
+        Ok(Self(out))
     }
 }

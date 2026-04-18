@@ -8,7 +8,6 @@ use std::{
 };
 
 use proc_macro2::{LineColumn, Span, TokenStream};
-use quote::ToTokens;
 use regex::bytes::{Regex, RegexBuilder};
 use syn::{Ident, Item, ItemConst, spanned::Spanned};
 
@@ -152,13 +151,7 @@ impl ConstContainer {
                 }
             }
 
-            // TODO: I'm not entirely sure, but the token-converted string we produce here
-            // may not be in a state that we would want to add to the codebase immediately,
-            // without some form of prior formatting. If such is the case, then we'll have
-            // to look into either calling `rustfmt` on the file at the current constant's
-            // `source`, or looking up some library to format the code prior to inclusion on
-            // the codebase.
-            fs::write(source, file.into_token_stream().to_string()).map_err(|inner| {
+            fs::write(source, prettyplease::unparse(&file)).map_err(|inner| {
                 MakeChangesError::IoBound(IoBoundChanges {
                     origin: ChangesSrc::SaveOp(source.clone()),
                     inner,
