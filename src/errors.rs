@@ -45,13 +45,26 @@ pub(crate) struct ParseFilesError(pub(crate) PathBuf);
             }
         },
         FetchErrorRepr::ParseError { source, line_num, non_matching } => {
-            format!(
-                "failed parsing; bad {} at line {line_num}: `{non_matching}`",
-                match source {
-                    ParseErrorSrc::Constant => "constant",
-                    ParseErrorSrc::Path => "path"
+            match source {
+                src @ (ParseErrorSrc::Constant | ParseErrorSrc::Source) => match src {
+                    ParseErrorSrc::Constant => {
+                        format!(
+                            "failed parsing; bad constant information at line {line_num}: \
+                             `{non_matching}`"
+                        )
+                    },
+                    ParseErrorSrc::Source => {
+                        format!(
+                            "failed parsing; bad source information at line {line_num}: \
+                             `{non_matching}`"
+                        )
+                    },
+                    ParseErrorSrc::Eof => unreachable!()
                 }
-            )
+                ParseErrorSrc::Eof => {
+                    "unexpected eof; expected further input for complete parsing".to_string()
+                },
+            }
         }
     }
 )]
@@ -76,7 +89,8 @@ pub(crate) enum IoBoundErrorKind {
 #[derive(Debug)]
 pub(crate) enum ParseErrorSrc {
     Constant,
-    Path,
+    Source,
+    Eof,
 }
 
 #[derive(Debug, Error)]
@@ -132,6 +146,8 @@ pub(crate) enum ParseError {
         expected: ConstFormatToken,
         line_num: usize,
     },
+    #[error("expected further information in the stream, got EOF")]
+    UnexpectedEof { line_num: usize },
 }
 
 #[derive(Debug)]

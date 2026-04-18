@@ -52,18 +52,21 @@ impl ConstContainer {
                     source: if let ConstFormatToken::Constant = expected {
                         ParseErrorSrc::Constant
                     } else {
-                        ParseErrorSrc::Path
+                        ParseErrorSrc::Source
                     },
                     line_num,
                     non_matching: input,
+                },
+                ParseError::UnexpectedEof { line_num } => FetchErrorRepr::ParseError {
+                    source: ParseErrorSrc::Eof,
+                    line_num,
+                    non_matching: "".into(),
                 },
             })
         })
     }
 
     pub fn save_to_disk(&self, path: impl AsRef<Path>) -> Result<(), SaveError> {
-        let attr: TokenStream = deprecate!(Self::DEPRECATION_NOTICE);
-
         fs::write(
             path,
             self.inner
@@ -81,6 +84,8 @@ impl ConstContainer {
                             .into_iter()
                             .chain(iter::once(b' '))
                             .chain(if *deprecated {
+                                let attr: TokenStream = deprecate!(Self::DEPRECATION_NOTICE);
+
                                 attr.to_string().into_bytes()
                             } else {
                                 Vec::new()
@@ -97,8 +102,7 @@ impl ConstContainer {
 
     #[expect(
         clippy::missing_panics_doc,
-        reason = "The source of panics is (at the time of writing) trivially not impossible to \
-                  panic."
+        reason = "The panic code path is (at the time of writing) impossible to reach."
     )]
     pub fn filter(&mut self, re: impl AsRef<str>) -> Result<Vec<&mut Const>, FilterError> {
         let Self { inner, re_cache } = self;
@@ -106,6 +110,8 @@ impl ConstContainer {
         let re = if let Some(re) = re_cache.get(re.as_ref()) {
             re
         } else {
+            // TODO: handle regex error for compilation size, as that shouldn't be
+            // immediately fatal.
             re_cache.insert(
                 re.as_ref().to_string(),
                 build_re(&re).map_err(|_| FilterError::RegexCompilation {
@@ -163,91 +169,114 @@ impl ConstContainer {
     }
 }
 
-static CONSTANT_READER: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[[:alnum:][:punct:]]+(\s\[deprecated\])?$").unwrap());
+static CONSTANT_READER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?<ident>[[:alnum:][:punct:]]+)(?<deprecated>\s\[deprecated\])?$").unwrap()
+});
 
-static SRC_READER: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"^"(/[[:ascii:]]*)+" line:\d+ col:\d+$"#).unwrap());
+static SRC_READER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^(?<path>"(/[[:ascii:]]*)+") (?<line>line:\d+) (?<col>col:\d+)$"#).unwrap()
+});
 
 pub(crate) fn parse_file(input: impl AsRef<[u8]>) -> Result<ConstContainer, ParseError> {
     let mut buf = String::with_capacity(input.as_ref().len());
 
     // NOTE: this is used for error reporting purposes, not for parsing purposes.
-    let mut line_counter = 0;
+    let mut line_counter = 1;
 
     let mut parsed_items = Vec::new();
 
-    while input
-        .as_ref()
-        .read_line(&mut buf)
-        .map_err(|inner| ParseError::LineReading {
-            line_num: line_counter + 1,
-            inner,
-        })?
-        != 0
-    {
-        if CONSTANT_READER
-            .is_match(buf.as_bytes().trim_ascii())
+    let mut constant_reader_captures = CONSTANT_READER.capture_locations();
+    let mut src_reader_captures = SRC_READER.capture_locations();
+
+    // NOTE: parsing is performed in two steps, each corresponding to one of the two
+    // lines epxected to match with the above two regexes, to fill out the
+    // information required for the in-memory representation of a constant.
+    //
+    // Beyond regex matching, the logic is strightforward. At any point in time,
+    // whenever the first line is not EOF and matches its regex, the second line
+    // ought not be EOF and must match the regex. It is only if one of these two
+    // conditions don't hold, that we get any form of parsing error.
+    //
+    // This invariant holds because for any potential constant embedded in the file,
+    // there is always a two-element pair of (1) identifier and deprecation
+    // information, and of (2) source file and span information. Each of these is
+    // always separated by a newline byte.
+    loop {
+        // TODO: finish the below as it currently is not working, but should likely only
+        // take into consideration a single regex, including the multiline, such that
+        // the same underlying buffer is used for all capture groups, and there's no
+        // need to own the results of the captures for the buffer prior to parsing the
+        // second line.
+
+        if input
+            .as_ref()
+            .read_line(&mut buf)
+            .map_err(|inner| ParseError::LineReading {
+                line_num: line_counter,
+                inner,
+            })?
+            == 0
+        {
+            break;
+        }
+
+        CONSTANT_READER
+            .captures_read(&mut constant_reader_captures, buf.as_bytes().trim_ascii())
             .ok_or_else(|| ParseError::ExtraneousInput {
                 bad_seq: buf.clone().into(),
                 expected: ConstFormatToken::Constant,
-                line_num: line_counter + 1,
+                line_num: line_counter,
+            })?;
+
+        let ident = {
+            let (start, end) = constant_reader_captures
+                .get(0)
+                .expect("the constant identifier should always be present");
+
+            buf.get(start..end)
+        };
+        let deprecated = constant_reader_captures.get(1);
+
+        line_counter += 1;
+
+        input
+            .as_ref()
+            .read_line(&mut buf)
+            .map_err(|inner| ParseError::LineReading {
+                line_num: line_counter,
+                inner,
             })
-            .map(|()| true)?
-            && let src_reader_check = {
-                line_counter += 1;
-
-                input
-                    .as_ref()
-                    .read_line(&mut buf)
-                    .map_err(|inner| ParseError::LineReading {
-                        line_num: line_counter + 1,
-                        inner,
-                    })?;
-
-                SRC_READER
-                    .is_match(buf.as_bytes().trim_ascii())
-                    .ok_or_else(|| ParseError::ExtraneousInput {
-                        bad_seq: buf.clone().into(),
-                        expected: ConstFormatToken::Path,
-                        line_num: line_counter + 1,
+            .and_then(|maybe_eof| {
+                if maybe_eof == 0 {
+                    Err(ParseError::UnexpectedEof {
+                        line_num: line_counter,
                     })
-                    .map(|()| true)?
-            }
-            && src_reader_check
+                } else {
+                    Ok(())
+                }
+            })?;
+
+        SRC_READER.captures_read(&mut src_reader_captures, buf.as_bytes().trim_ascii());
+
+        let path = src_reader_captures
+            .get(0)
+            .expect("the source path of the item should always be present");
+        let line = src_reader_captures
+            .get(1)
+            .expect("the line information should always be present");
+        let col = src_reader_captures
+            .get(2)
+            .expect("the columns information should always be present");
+
         {
-            let Some((constant_line, source_line)) = buf.split_once('\n') else {
-                panic!("if both regexes matched, there should be two lines in the buffer");
-            };
-
-            let mut constant_iter = constant_line.split_ascii_whitespace();
-
-            let ident = constant_iter.next().expect(
-                "if the `CONSTANT_READER` regex matched, there should be at least 1 element in \
-                 the iterator",
-            );
-            let deprecated = constant_iter.next().is_some();
-
-            let Some((path_line, col)) = source_line.rsplit_once(' ') else {
-                panic!(
-                    "if the `SRC_READER` regex matched, there should be at least a path, a line \
-                     and a column indicators"
-                );
-            };
-            let Some((path, line)) = path_line.rsplit_once(' ') else {
-                panic!(
-                    "if the `SRC_READER` regex matched, there should be at least a path, a line \
-                     and a column indicators"
-                );
-            };
-
             // NOTE: spans have a fallback when not running inside a proc-macro, and the
             // library doesn't ever require knowning span information beyond what is already
-            // stored inside the `Const`. Also, `Span`s can't be arbitrarily built.
+            // stored inside the `Const`. Also, `Span`s can't be arbitrarily built so we
+            // don't store them directly in the `Const`.
             parsed_items.push(Const::from_file(
                 Ident::new(ident, Span::call_site()),
                 deprecated,
-                PathBuf::from(path),
+                PathBuf::from(path.trim_matches('"')),
                 LineColumn {
                     line: line.trim_start_matches("line:").parse().unwrap(),
                     column: col.trim_start_matches("col:").parse().unwrap(),
@@ -263,9 +292,11 @@ pub(crate) fn parse_file(input: impl AsRef<[u8]>) -> Result<ConstContainer, Pars
     Ok(ConstContainer::new(parsed_items))
 }
 
+#[inline]
 pub(crate) fn build_re(re: impl AsRef<str>) -> Result<Regex, regex::Error> {
     RegexBuilder::new(re.as_ref())
-        .size_limit(512)
+        .unicode(false)
+        .size_limit(const { 2_usize.pow(11) })
         .case_insensitive(true)
         .build()
 }
