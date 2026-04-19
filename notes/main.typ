@@ -1,16 +1,3 @@
-#import "@local/typst-template:0.40.0": *
-
-#show: template.with(
-  title: [Notes --- `libc` constant deprecator],
-  authorship: (
-    (
-      name: "Adam Martinez",
-      email: "adammartinezoussat@gmail.com",
-      affiliation: "University of Life",
-    ),
-  ),
-)
-
 = Expanding macros
 
 Expanding macros prior to parsing constants poses a few challenges. Firstly, regular expansion would

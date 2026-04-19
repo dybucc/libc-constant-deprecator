@@ -12,8 +12,8 @@ use regex::bytes::{Regex, RegexBuilder};
 use syn::{Ident, Item, ItemConst, spanned::Spanned};
 
 use crate::{
-    ChangesSrc, Const, ConstFormatToken, FetchError, FetchErrorRepr, FilterError, IoBoundChanges,
-    IoBoundErrorKind, MakeChangesError, ParseError, ParseErrorSrc, SaveError, deprecate,
+    ChangesSrc, Const, FetchError, FetchErrorRepr, FilterError, IoBoundChanges, IoBoundErrorKind,
+    MakeChangesError, ParseError, ParseErrorSrc, SaveError, deprecate,
 };
 
 #[derive(Debug)]
@@ -45,15 +45,11 @@ impl ConstContainer {
                     FetchErrorRepr::IoBound(IoBoundErrorKind::Parsing { inner, line_num })
                 }
                 ParseError::ExtraneousInput {
+                    src: source,
                     bad_seq: input,
-                    expected,
                     line_num,
                 } => FetchErrorRepr::ParseError {
-                    source: if let ConstFormatToken::Constant = expected {
-                        ParseErrorSrc::Constant
-                    } else {
-                        ParseErrorSrc::Source
-                    },
+                    source,
                     line_num,
                     non_matching: input,
                 },
@@ -169,45 +165,23 @@ impl ConstContainer {
     }
 }
 
-static CONSTANT_READER: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(?<ident>[[:alnum:][:punct:]]+)(?<deprecated>\s\[deprecated\])?$").unwrap()
-});
-
-static SRC_READER: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"^(?<path>"(/[[:ascii:]]*)+") (?<line>line:\d+) (?<col>col:\d+)$"#).unwrap()
+static MATCHER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"^([[:alnum:][:punct:]]+)( \[deprecated\])?\n("(/[[:ascii:]]*)+") (line:\d+) (col:\d+)$"#,
+    )
+    .unwrap()
 });
 
 pub(crate) fn parse_file(input: impl AsRef<[u8]>) -> Result<ConstContainer, ParseError> {
-    let mut buf = String::with_capacity(input.as_ref().len());
-
-    // NOTE: this is used for error reporting purposes, not for parsing purposes.
+    let mut buf = String::new();
     let mut line_counter = 1;
 
-    let mut parsed_items = Vec::new();
+    // NOTE: we reuse this buffer of regex captures across all matched constants.
+    let mut captures = MATCHER.capture_locations();
 
-    let mut constant_reader_captures = CONSTANT_READER.capture_locations();
-    let mut src_reader_captures = SRC_READER.capture_locations();
+    let mut out = Vec::new();
 
-    // NOTE: parsing is performed in two steps, each corresponding to one of the two
-    // lines epxected to match with the above two regexes, to fill out the
-    // information required for the in-memory representation of a constant.
-    //
-    // Beyond regex matching, the logic is strightforward. At any point in time,
-    // whenever the first line is not EOF and matches its regex, the second line
-    // ought not be EOF and must match the regex. It is only if one of these two
-    // conditions don't hold, that we get any form of parsing error.
-    //
-    // This invariant holds because for any potential constant embedded in the file,
-    // there is always a two-element pair of (1) identifier and deprecation
-    // information, and of (2) source file and span information. Each of these is
-    // always separated by a newline byte.
     loop {
-        // TODO: finish the below as it currently is not working, but should likely only
-        // take into consideration a single regex, including the multiline, such that
-        // the same underlying buffer is used for all capture groups, and there's no
-        // need to own the results of the captures for the buffer prior to parsing the
-        // second line.
-
         if input
             .as_ref()
             .read_line(&mut buf)
@@ -220,23 +194,6 @@ pub(crate) fn parse_file(input: impl AsRef<[u8]>) -> Result<ConstContainer, Pars
             break;
         }
 
-        CONSTANT_READER
-            .captures_read(&mut constant_reader_captures, buf.as_bytes().trim_ascii())
-            .ok_or_else(|| ParseError::ExtraneousInput {
-                bad_seq: buf.clone().into(),
-                expected: ConstFormatToken::Constant,
-                line_num: line_counter,
-            })?;
-
-        let ident = {
-            let (start, end) = constant_reader_captures
-                .get(0)
-                .expect("the constant identifier should always be present");
-
-            buf.get(start..end)
-        };
-        let deprecated = constant_reader_captures.get(1);
-
         line_counter += 1;
 
         input
@@ -246,8 +203,8 @@ pub(crate) fn parse_file(input: impl AsRef<[u8]>) -> Result<ConstContainer, Pars
                 line_num: line_counter,
                 inner,
             })
-            .and_then(|maybe_eof| {
-                if maybe_eof == 0 {
+            .and_then(|res| {
+                if res == 0 {
                     Err(ParseError::UnexpectedEof {
                         line_num: line_counter,
                     })
@@ -256,40 +213,70 @@ pub(crate) fn parse_file(input: impl AsRef<[u8]>) -> Result<ConstContainer, Pars
                 }
             })?;
 
-        SRC_READER.captures_read(&mut src_reader_captures, buf.as_bytes().trim_ascii());
+        MATCHER
+            .captures_read(&mut captures, buf.as_bytes())
+            .ok_or_else(|| ParseError::ExtraneousInput {
+                src: ParseErrorSrc::Token,
+                bad_seq: buf.clone().into(),
+                line_num: line_counter,
+            })?;
 
-        let path = src_reader_captures
-            .get(0)
-            .expect("the source path of the item should always be present");
-        let line = src_reader_captures
-            .get(1)
-            .expect("the line information should always be present");
-        let col = src_reader_captures
-            .get(2)
-            .expect("the columns information should always be present");
+        macro_rules! extract {
+            ($idx:expr, $msg:expr) => {{
+                let (start, end) = captures.get($idx).expect($msg);
 
-        {
-            // NOTE: spans have a fallback when not running inside a proc-macro, and the
-            // library doesn't ever require knowning span information beyond what is already
-            // stored inside the `Const`. Also, `Span`s can't be arbitrarily built so we
-            // don't store them directly in the `Const`.
-            parsed_items.push(Const::from_file(
-                Ident::new(ident, Span::call_site()),
-                deprecated,
-                PathBuf::from(path.trim_matches('"')),
-                LineColumn {
-                    line: line.trim_start_matches("line:").parse().unwrap(),
-                    column: col.trim_start_matches("col:").parse().unwrap(),
-                },
-            ));
+                buf.get(start..end).unwrap()
+            }};
         }
 
-        line_counter += 1;
+        // NOTE: the below indices into the regex capture group are 1-indexed because
+        // index 0 holds the complete match.
 
+        // NOTE: these are the contents of the first line for a single constant.
+        let ident = extract!(1, "the identifier of a constant should always be present");
+        let deprecated = captures.get(2).is_some();
+
+        // NOTE: and these are the contents of the second line for a single constant.
+        let source = extract!(
+            3,
+            "the source file path of a constant should always be present"
+        );
+        let line = extract!(
+            4,
+            "the line information of a constant should always be present"
+        );
+        let column = extract!(
+            5,
+            "the column information of a constant should always be present"
+        );
+
+        macro_rules! extract_num {
+            ($str:expr, $spec:expr) => {{
+                $str.trim_start_matches($spec)
+                    .parse()
+                    .map_err(|_| ParseError::ExtraneousInput {
+                        src: ParseErrorSrc::Token,
+                        bad_seq: buf.clone().into(),
+                        line_num: line_counter,
+                    })?
+            }};
+        }
+
+        out.push(Const::from_file(
+            Ident::new(ident, Span::call_site()),
+            deprecated,
+            PathBuf::from(source.trim_matches('"')),
+            LineColumn {
+                line: extract_num!(line, "line:"),
+                column: extract_num!(column, "col:"),
+            },
+        ));
+
+        line_counter += 1;
         buf.clear();
     }
 
-    Ok(ConstContainer::new(parsed_items))
+    Ok(ConstContainer::new(out))
 }
 
 #[inline]

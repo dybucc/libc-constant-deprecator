@@ -46,20 +46,8 @@ pub(crate) struct ParseFilesError(pub(crate) PathBuf);
         },
         FetchErrorRepr::ParseError { source, line_num, non_matching } => {
             match source {
-                src @ (ParseErrorSrc::Constant | ParseErrorSrc::Source) => match src {
-                    ParseErrorSrc::Constant => {
-                        format!(
-                            "failed parsing; bad constant information at line {line_num}: \
-                             `{non_matching}`"
-                        )
-                    },
-                    ParseErrorSrc::Source => {
-                        format!(
-                            "failed parsing; bad source information at line {line_num}: \
-                             `{non_matching}`"
-                        )
-                    },
-                    ParseErrorSrc::Eof => unreachable!()
+                ParseErrorSrc::Token => {
+                    format!("failed parsing; bad input at line {line_num}: `{non_matching}`")
                 }
                 ParseErrorSrc::Eof => {
                     "unexpected eof; expected further input for complete parsing".to_string()
@@ -88,8 +76,7 @@ pub(crate) enum IoBoundErrorKind {
 
 #[derive(Debug)]
 pub(crate) enum ParseErrorSrc {
-    Constant,
-    Source,
+    Token,
     Eof,
 }
 
@@ -135,23 +122,21 @@ pub(crate) enum ParseError {
     #[error("failed reading from bytes at line {line_num}: {inner}")]
     LineReading { line_num: usize, inner: io::Error },
     #[error(
-        "bad input while parsing at line {line_num}; expected {}, found `{bad_seq}`",
-        match .expected {
-            ConstFormatToken::Constant => "constant",
-            ConstFormatToken::Path => "path"
+        "{}",
+        match src {
+            ParseErrorSrc::Token => {
+                format!(
+                    "bad input while parsing at line {line_num}; expected token, found `{bad_seq}`"
+                )
+            },
+            ParseErrorSrc::Eof => "unexpected eof".to_string(),
         }
     )]
     ExtraneousInput {
+        src: ParseErrorSrc,
         bad_seq: Cow<'static, str>,
-        expected: ConstFormatToken,
         line_num: usize,
     },
     #[error("expected further information in the stream, got EOF")]
     UnexpectedEof { line_num: usize },
-}
-
-#[derive(Debug)]
-pub(crate) enum ConstFormatToken {
-    Constant,
-    Path,
 }
