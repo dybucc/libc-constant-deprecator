@@ -106,8 +106,6 @@ impl ConstContainer {
         let re = if let Some(re) = re_cache.get(re.as_ref()) {
             re
         } else {
-            // TODO: handle regex error for compilation size, as that shouldn't be
-            // immediately fatal.
             re_cache.insert(
                 re.as_ref().to_string(),
                 build_re(&re).map_err(|_| FilterError::RegexCompilation {
@@ -281,9 +279,19 @@ pub(crate) fn parse_file(input: impl AsRef<[u8]>) -> Result<ConstContainer, Pars
 
 #[inline]
 pub(crate) fn build_re(re: impl AsRef<str>) -> Result<Regex, regex::Error> {
-    RegexBuilder::new(re.as_ref())
-        .unicode(false)
-        .size_limit(const { 2_usize.pow(11) })
-        .case_insensitive(true)
-        .build()
+    const MAX_POWER: u8 = 20;
+
+    let mut size_power: u8 = 11;
+
+    loop {
+        match RegexBuilder::new(re.as_ref())
+            .unicode(false)
+            .size_limit(2_usize.pow(u32::from(size_power)))
+            .case_insensitive(true)
+            .build()
+        {
+            Err(regex::Error::CompiledTooBig(_)) if size_power < MAX_POWER => size_power += 1,
+            other => break other,
+        }
+    }
 }
