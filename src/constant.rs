@@ -24,7 +24,7 @@ impl Const {
     pub(crate) fn from_item(item: ItemConst, source: PathBuf) -> Self {
         Self {
             span: item.span().start(),
-            source: item.span().local_file().unwrap(),
+            source,
             ident: item.ident,
             deprecated: false,
         }
