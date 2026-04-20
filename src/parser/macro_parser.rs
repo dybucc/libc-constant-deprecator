@@ -15,14 +15,16 @@ impl MacroParser {
     // anyway however as many times as there are elements in the underlying
     // `ItemConst` buffer.
     pub(crate) fn into_vec(self, source: impl AsRef<Path>) -> Vec<Const> {
-        let Self(buffer) = self;
-        let mut out = Vec::with_capacity(buffer.len());
+        let Self(mut buffer) = self;
 
-        for constant in buffer {
-            out.push(Const::from_item(constant, source.as_ref().to_owned()));
-        }
+        (0..buffer.len()).fold(Vec::with_capacity(buffer.len()), |mut out, idx| {
+            out.push(Const::from_item(
+                buffer.swap_remove(idx),
+                source.as_ref().to_owned(),
+            ));
 
-        out
+            out
+        })
     }
 }
 
@@ -36,17 +38,27 @@ impl Parse for MacroParser {
 }
 
 pub(crate) fn parse(alloc: &mut Vec<ItemConst>, input: ParseStream) -> syn::Result<()> {
+    // NOTE: if at some point we find that a `cfg_if` macro invocation contains
+    // another `cfg_if` macro invocation nested within it, this should be fairly
+    // simple to fix. Currently, we assume that upon entering the macro invocation,
+    // no further expansions will happen, and thus only items (possibly constants)
+    // are to be found.
     macro_rules! extract_consts {
         () => {
             let Block { stmts, .. } = input.parse()?;
 
-            for stmt in stmts {
-                if let Stmt::Item(item) = stmt
-                    && let Item::Const(constant) = item
-                {
-                    alloc.push(constant);
-                }
-            }
+            stmts
+                .into_iter()
+                .filter_map(|stmt| {
+                    if let Stmt::Item(item) = stmt
+                        && let Item::Const(constant) = item
+                    {
+                        Some(constant)
+                    } else {
+                        None
+                    }
+                })
+                .for_each(|constant| alloc.push(constant));
         };
     }
 

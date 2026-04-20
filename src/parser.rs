@@ -1,7 +1,6 @@
 use std::path::Path;
 
-use proc_macro2::Span;
-use syn::{Ident, Item, ItemConst, ItemMacro, Macro};
+use syn::{Item, ItemConst, ItemMacro, Macro};
 
 use crate::{Const, SourceFile};
 
@@ -20,30 +19,31 @@ pub(crate) use macro_parser::MacroParser;
     reason = "It's not a bug not to use the result of this routine."
 )]
 pub fn parse_constants(files: &[SourceFile]) -> Vec<Const> {
-    let mut parsed_constants = Vec::with_capacity(files.len());
+    files.iter().fold(
+        Vec::with_capacity(files.len()),
+        |mut parsed_constants, SourceFile { inner, source }| {
+            parsed_constants.append(
+                &mut inner
+                    .items
+                    .iter()
+                    .filter_map(|item| match item {
+                        Item::Const(constant) => process_constant(constant, source).into(),
+                        Item::Macro(ItemMacro {
+                            mac: mac @ Macro { path, .. },
+                            ..
+                        }) if path.is_ident("cfg_if") => process_macro(mac, source).into(),
+                        _ => None,
+                    })
+                    .fold(Vec::new(), |mut file_constants, mut constants| {
+                        file_constants.append(&mut constants);
 
-    for SourceFile { inner, source } in files {
-        let mut file_constants = Vec::new();
+                        file_constants
+                    }),
+            );
 
-        for item in &inner.items {
-            if let Some(mut constants) = match item {
-                Item::Const(constant) => process_constant(constant, source).into(),
-                Item::Macro(ItemMacro {
-                    mac: mac @ Macro { path, .. },
-                    ..
-                }) if path.is_ident(&Ident::new("cfg_if", Span::call_site())) => {
-                    process_macro(mac, source).into()
-                }
-                _ => None,
-            } {
-                file_constants.append(&mut constants);
-            }
-        }
-
-        parsed_constants.append(&mut file_constants);
-    }
-
-    parsed_constants
+            parsed_constants
+        },
+    )
 }
 
 #[inline]

@@ -8,8 +8,8 @@ use syn::{Ident, ItemConst, spanned::Spanned};
 // information on, to be precise) would be impossible as a `Span` can only be
 // created from `syn`'s parsing facilities. And keeping two different types for
 // file-fetched constants and parse-sourced constants is just a hassle.
-// TODO: instead of only storing the identifier of the constant, it may be a
-// better idea to store an enumeration akin to `Cow`, where the identifier is
+// TODO(perf): instead of only storing the identifier of the constant, it may be
+// a better idea to store an enumeration akin to `Cow`, where the identifier is
 // the base type, and if at some point we require converting one of them into
 // strings, it starts storing them as strings instead.
 #[derive(Debug, Clone)]

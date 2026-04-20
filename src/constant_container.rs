@@ -35,6 +35,11 @@ impl ConstContainer {
         }
     }
 
+    // TODO: it's probably a better idea to replace the following two routines with
+    // a `serde` implementation of the corresponding serialization and
+    // deserialization traits. Then, these functions would work as mere wrappers
+    // around those impls.
+
     pub fn fetch_from_disk(path: impl AsRef<Path>) -> Result<Self, FetchError> {
         let file = fs::read_to_string(path)
             .map_err(|inner| FetchError(FetchErrorRepr::IoBound(IoBoundErrorKind::Fs(inner))))?;
@@ -126,7 +131,7 @@ impl ConstContainer {
         for Const {
             ident: ref_ident,
             deprecated,
-            span,
+            span: ref_span,
             source,
         } in &self.inner
         {
@@ -141,15 +146,20 @@ impl ConstContainer {
             // NOTE: the check for the span comes before the destructuring pattern because
             // otherwise borrowck complains about `item` already being exclusively borrowed
             // with the variable bindings of that pattern.
-            for item in &mut file.items {
-                if item.span().start() == *span
-                    && let Item::Const(ItemConst { attrs, ident, .. }) = item
-                    && ident == ref_ident
-                    && *deprecated
-                {
-                    attrs.push(deprecate!(ConstContainer::DEPRECATION_NOTICE));
-                }
-            }
+            file.items
+                .iter_mut()
+                .filter_map(|item| {
+                    if item.span().start() == *ref_span
+                        && let Item::Const(ItemConst { attrs, ident, .. }) = item
+                        && ident == ref_ident
+                        && *deprecated
+                    {
+                        Some(attrs)
+                    } else {
+                        None
+                    }
+                })
+                .for_each(|attrs| attrs.push(deprecate!(ConstContainer::DEPRECATION_NOTICE)));
 
             fs::write(source, prettyplease::unparse(&file)).map_err(|inner| {
                 MakeChangesError::IoBound(IoBoundChanges {
@@ -173,11 +183,10 @@ static MATCHER: LazyLock<Regex> = LazyLock::new(|| {
 pub(crate) fn parse_file(input: impl AsRef<[u8]>) -> Result<ConstContainer, ParseError> {
     let mut buf = String::new();
     let mut line_counter = 1;
+    let mut out = Vec::new();
 
     // NOTE: we reuse this buffer of regex captures across all matched constants.
     let mut captures = MATCHER.capture_locations();
-
-    let mut out = Vec::new();
 
     loop {
         if input
@@ -194,6 +203,10 @@ pub(crate) fn parse_file(input: impl AsRef<[u8]>) -> Result<ConstContainer, Pars
 
         line_counter += 1;
 
+        // NOTE: an invariant holds such that for any given constant, the file ought
+        // contain two lines per constant reflecting the identifier, whether it is
+        // deprecated, and the span information (the source path, and the line/column
+        // numbers.)
         input
             .as_ref()
             .read_line(&mut buf)
@@ -226,9 +239,6 @@ pub(crate) fn parse_file(input: impl AsRef<[u8]>) -> Result<ConstContainer, Pars
                 buf.get(start..end).unwrap()
             }};
         }
-
-        // NOTE: the below indices into the regex capture group are 1-indexed because
-        // index 0 holds the complete match.
 
         // NOTE: these are the contents of the first line for a single constant.
         let ident = extract!(1, "the identifier of a constant should always be present");
@@ -277,7 +287,6 @@ pub(crate) fn parse_file(input: impl AsRef<[u8]>) -> Result<ConstContainer, Pars
     Ok(ConstContainer::new(out))
 }
 
-#[inline]
 pub(crate) fn build_re(re: impl AsRef<str>) -> Result<Regex, regex::Error> {
     const MAX_POWER: u8 = 20;
 

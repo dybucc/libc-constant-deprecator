@@ -5,6 +5,7 @@ mod constant_container;
 mod errors;
 #[macro_use]
 mod macros;
+mod integration;
 mod parser;
 mod scanner;
 mod source_file;

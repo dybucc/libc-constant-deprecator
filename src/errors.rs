@@ -111,6 +111,18 @@ pub struct IoBoundChanges {
     pub(crate) inner: io::Error,
 }
 
+impl IoBoundChanges {
+    #[expect(
+        clippy::must_use_candidate,
+        reason = "It's not a bug not to use the result of this routine."
+    )]
+    pub fn source(&self) -> &Path {
+        match &self.origin {
+            ChangesSrc::FetchOp(path) | ChangesSrc::SaveOp(path) => path,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum ChangesSrc {
     FetchOp(PathBuf),

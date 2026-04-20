@@ -68,3 +68,32 @@ codebase only depends on a crate internal to the `rustc` compiler, so all of its
 under `crate::macros`. This makes it straightforward to check which of the macros could be used with
 constants within them. Inspection of that module leads me to believe the only macro that produces
 the types of constants that we are likely to modify is the `cfg_if` macro.
+
+The macro parser has been fully implemented and is only pending testing. The last part of the
+library that remains to be implemented from scratch (thus barring the refactor of the entrypoint
+routines) is the Cargo integration.
+
+This should likely consist of a single file embedded inside the `Cargo.toml` manifest to check for
+the path of the file actually containing the on-disk representation of the constants. One possible
+alternative is to reimplement all parsing functionality in terms of a TOML parser and directly embed
+in the corresponding subtable of the `metadata` subtable of `libc` the serialized contents. This may
+or may not be a good idea, considering such information would likely have to be kept upstream for
+all maintainers to peruse and possibly modify whenever some contributor decided to continue the
+constant deprecation process.
+
+The most feasible approach may go through a combination of both the current implementation and of
+the above proposed idea. This should likely go through making the file path of the configuration
+file available through the `metadata` table of the root manifest file in `libc` (the crate as it
+doesn't use workspaces,) and later accessing such a file and parsing it as TOML. This would also
+allow checking off one other `TODO` in the codebase, as the current facilities for
+serialization/deserialization are not quite Rusty.
+
+One third approach may go through using a single file and not writing to the manfiest file at all.
+This would make the `.toml` file be used as that of the `askama` or the `cbindgen` projects. There
+would be no further roadblocks compared with the above proposals, and it would make it considerably
+more hygienic to maintain, as no changes to existing assets in the codebase beyond those effected by
+the tool itself would be made.
+
+The implementation details of this last proposal would include rewriting the `ConstContainer`
+methods for serialization and deserialization, but no further additive changes would be required to
+the current codebase.
