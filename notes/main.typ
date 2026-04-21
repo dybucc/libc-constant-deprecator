@@ -95,5 +95,58 @@ more hygienic to maintain, as no changes to existing assets in the codebase beyo
 the tool itself would be made.
 
 The implementation details of this last proposal would include rewriting the `ConstContainer`
-methods for serialization and deserialization, but no further additive changes would be required to
-the current codebase.
+methods for serialization and deserialization, as well as including another function entry point for
+loading into memory the contents of some prior serialized constants. This should routine likely just
+produce a `ConstContainer`, take no arguments and look straight for the relevant project root
+directory path.
+
+One last thing that remains to be discussed is the second use of the library utilities. We speak
+here of second to refer to some use following a prior deprecation, that has likely been effected to
+the actual codebase, and after making use of some form of source control, is likely in conflict
+between the marshalled output and the current state of the codebase. This should be fairly simple to
+solve, as version control gets most things out of the way for us. In the general case where some
+library user has an unsynchronized state between the existing configuration file and the current
+codebase, the library should simply perform a read of the state of the codebase, modifying the
+in-memory deserialized representation. Even though we have so far spoken of multiple entry points
+into the crate, the only real one that would be exposed to the final user would be this one. File
+and constant parsing is not something that will be exposed to the user in the final binary.
+
+The data format, considering it is now to be implemented as a TOML file, is going to require some
+changes. The prior format used a terse specification that captured only the required information for
+the in-memory representation of constants. In TOML, it may be preferable to parse each constant as
+an individual table each. Following this approach, an example serialized file containing two
+constants, `SOME_CONSTANT` and `SOME_OTHER_CONSTANT` would look like:
+```toml
+[SOME_CONSTANT]
+deprecated = false
+source = "/Users/dybucc/rust-dev/libc/src/hermit.rs"
+line = 1
+column = 2
+
+[SOME_OTHER_CONSTANT]
+deprecated = true
+source = "/Users/dybucc/rust-dev/libc/src/hermit.rs"
+line = 10
+column = 50
+```
+
+Even though there's no type checking at the TOML table level, this should provide the application
+with enough information to fetch into memory some existing deprecation state, and either (1) update
+it with a new pass over the `libc` codebase, or (2) modify entries in it by toggling the deprecation
+notice.
+
+In the former case, updating would likely require complete reparsing, as both the in-memory
+representation and the marshalled output should keep track of all constants currently declared in
+all target environments. This, though, implies that there is no real need for a file to cache
+on-disk a form of record for each constant that has been selected for deprecation but perhaps isn't
+marked with the corresponding attribute just yet. If scanning of the codebase is always bound to
+happen to avoid inconsistencies between the file of records and the current state of the codebase,
+the only purpose of keeping such records is to allow marking deprecation without effecting those
+changes in the same "depreaction session." This, in and of itself, makes no sense as end users of
+`fzf`-like picker are likely to require immediate deprecation of the constants that they have
+selected. There is no need to keep some constants as "marked for deprecation" because there does not
+exist a relation of dependence between constants that we require deprecating concerning the issue
+that this program is trying to solve.
+
+The conclusion is that all functionality related to having constants saved on disk is useless and
+should be removed.

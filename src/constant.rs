@@ -30,21 +30,7 @@ impl Const {
         }
     }
 
-    pub(crate) fn from_file(
-        ident: Ident,
-        deprecated: bool,
-        source: PathBuf,
-        span: LineColumn,
-    ) -> Self {
-        Self {
-            ident,
-            deprecated,
-            span,
-            source,
-        }
-    }
-
-    pub fn deprecated(&mut self, yes: bool) {
+    pub(crate) fn deprecated(&mut self, yes: bool) {
         self.deprecated = yes;
     }
 }

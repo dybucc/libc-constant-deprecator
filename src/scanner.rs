@@ -1,42 +1,62 @@
 use std::{
-    env, fs,
+    env,
     path::{Path, PathBuf},
     sync::atomic::AtomicBool,
 };
 
 use cargo_metadata::MetadataCommand;
-use gix::progress::Discard;
+use gix::{
+    discover::{self, upwards},
+    progress::Discard,
+};
+use tokio::{fs, task};
 use walkdir::WalkDir;
 
-use crate::{FetchDetailsError, ParseFilesError, ScanFilesError, SourceFile};
+use crate::{FetchDetailsError, ParseFilesError, RepoErrorRepr, ScanFilesError, SourceFile};
 
 pub(crate) const LIBC_REPO: &str = "https://github.com/rust-lang/libc.git";
 
-pub fn scan_files(libc_path: impl AsRef<Path>) -> Result<Vec<SourceFile>, ScanFilesError> {
-    // TODO: instead of only interacting with git to clone the repo, use it to
-    // both verify that it's, indeed, the `libc` repo, and to extract the current
-    // worktree's commit sha-1 to embed into the file that will persist the
-    // current changes to constants in memory.
+pub async fn scan_files(libc_path: impl AsRef<Path>) -> Result<Vec<SourceFile>, ScanFilesError> {
+    let path = libc_path.as_ref().to_owned().clone();
 
-    (!libc_path.as_ref().try_exists().is_ok_and(|inner| inner))
-        .ok_or_else(|| ScanFilesError::MissingDirectoryAccess(libc_path.as_ref().to_owned()))?;
-    libc_path
-        .as_ref()
-        .read_dir()
-        .is_ok_and(|libc_path| libc_path.count() == 0)
-        .then_some(())
-        .iter()
-        .try_for_each(|()| {
-            gix::prepare_clone(LIBC_REPO, libc_path.as_ref())
-                .map_err(|_| ScanFilesError::RepoCloningError(libc_path.as_ref().to_owned()))?
-                .fetch_then_checkout(Discard, &AtomicBool::new(false))
-                .map_err(|_| ScanFilesError::RepoCloningError(libc_path.as_ref().to_owned()))?
-                .0
-                .main_worktree(Discard, &AtomicBool::new(false))
-                .map_err(|_| ScanFilesError::RepoCloningError(libc_path.as_ref().to_owned()))?;
+    // TODO: finish this up and keep working on making other I/O-bound operations
+    // async.
+    if !fs::try_exists(&libc_path)
+        .await
+        .map_err(ScanFilesError::IoBound)
+    {
+        task::spawn(async move {
+            gix::prepare_clone(LIBC_REPO, path)
+                .map_err(|_| ScanFilesError::RepoError(RepoErrorRepr::Clone(path)))
+        })
+        .await;
+    } else {
+        task::spawn(async move {
+            gix::discover(path).map_err(|err| match err {
+                discover::Error::Discover(err) => match err {
+                    upwards::Error::CurrentDir(err) => todo!(),
+                    upwards::Error::InvalidInput { directory } => todo!(),
+                    upwards::Error::InaccessibleDirectory { path } => todo!(),
+                    upwards::Error::NoGitRepository { path } => todo!(),
+                    upwards::Error::NoGitRepositoryWithinCeiling {
+                        path,
+                        ceiling_height,
+                    } => todo!(),
+                    upwards::Error::NoGitRepositoryWithinFs { path, limit } => todo!(),
+                    upwards::Error::NoMatchingCeilingDir => todo!(),
+                    upwards::Error::NoTrustedGitRepository {
+                        path,
+                        candidate,
+                        required,
+                    } => todo!(),
+                    upwards::Error::CheckTrust { path, err } => todo!(),
+                },
+                discover::Error::Open(err) => todo!(),
+            })
+        })
+        .await;
+    }
 
-            Ok(())
-        })?;
     env::set_current_dir(libc_path.as_ref()).map_err(ScanFilesError::PwdSetting)?;
 
     parse_files(fetch_details().map_err(|e| match e {
@@ -74,15 +94,13 @@ pub(crate) fn fetch_details() -> Result<Vec<PathBuf>, FetchDetailsError> {
 }
 
 pub(crate) fn parse_files(files: Vec<PathBuf>) -> Result<Vec<SourceFile>, ParseFilesError> {
-    let mut out = Vec::new();
-
-    for file in files {
+    files.into_iter().try_fold(Vec::new(), |mut out, file| {
         out.push(SourceFile::new(
             syn::parse_file(&fs::read_to_string(&file).map_err(|_| ParseFilesError(file.clone()))?)
                 .map_err(|_| ParseFilesError(file.clone()))?,
             file,
         ));
-    }
 
-    Ok(out)
+        Ok::<_, ParseFilesError>(out)
+    })
 }
