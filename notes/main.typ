@@ -138,15 +138,14 @@ notice.
 In the former case, updating would likely require complete reparsing, as both the in-memory
 representation and the marshalled output should keep track of all constants currently declared in
 all target environments. This, though, implies that there is no real need for a file to cache
-on-disk a form of record for each constant that has been selected for deprecation but perhaps isn't
-marked with the corresponding attribute just yet. If scanning of the codebase is always bound to
-happen to avoid inconsistencies between the file of records and the current state of the codebase,
-the only purpose of keeping such records is to allow marking deprecation without effecting those
-changes in the same "depreaction session." This, in and of itself, makes no sense as end users of
-`fzf`-like picker are likely to require immediate deprecation of the constants that they have
+on-disk a record for each constant that has been selected for deprecation but perhaps isn't marked
+with the corresponding attribute just yet. If scanning of the codebase is always bound to happen to
+avoid inconsistencies between the file containing the records and the current state of the codebase,
+the only purpose of keeping such records becomes to allow marking deprecation without effecting
+those changes in the same "depreaction session." This, in and of itself, makes no sense as end users
+of the `fzf`-like picker are likely to require immediate deprecation of the constants that they have
 selected. There is no need to keep some constants as "marked for deprecation" because there does not
-exist a relation of dependence between constants that we require deprecating concerning the issue
-that this program is trying to solve.
+exist a relation of dependence between constants in this particular context.
 
 The conclusion is that all functionality related to having constants saved on disk is useless and
-should be removed.
+should be removed. Efforts should focus on having all I/O bound functionality be asynchronous.

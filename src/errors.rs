@@ -1,5 +1,6 @@
 use std::{
     borrow::Cow,
+    error::Error,
     io,
     path::{Path, PathBuf},
 };
@@ -13,7 +14,48 @@ pub enum ScanFilesError {
     #[error(
         "{}",
         match .0 {
-            RepoErrorRepr::Clone(path) => format!("failed to clone repo to path {}", path.display())
+            RepoErrorRepr::Discover { path, kind } => {
+                format!(
+                    "failed to discover repo at path: {}{}",
+                    path.display(),
+                    match kind {
+                        DiscoverErrorKind::NoRepository => {
+                            "; no repo found within it or upwards".to_string()
+                        }
+                        DiscoverErrorKind::InvalidDir(source) => {
+                            if let Some(err) = source {
+                                format!("; {err}")
+                            } else {
+                                String::new()
+                            }
+                        }
+                        DiscoverErrorKind::InvalidRepoConfig => {
+                            "; git config in repo is not valid".to_string()
+                        },
+                        DiscoverErrorKind::WrongUtf8 => "; found invalid utf-8 in path".to_string(),
+                        DiscoverErrorKind::Other(err) => format!("; {err}")
+                    }
+                )
+            },
+            RepoErrorRepr::Clone { path, kind } => {
+                format!(
+                    "failed to clone repo to path: {}{}",
+                    path.display(),
+                    match kind {
+                        CloneErrorKind::LibcUrl => {
+                            "; libc repo url is wrong; report this to the maintainer".to_string()
+                        },
+                        CloneErrorKind::InvalidRepoConfig => {
+                            "; git repo config is not valid".to_string()
+                        }
+                        CloneErrorKind::DirectoryNotEmpty => "; directory not empty".to_string(),
+                        CloneErrorKind::IllegalUtf8 => "; found invalid utf-8 in path".to_string(),
+                        CloneErrorKind::IoBound(err) => format!("; {err}"),
+                        CloneErrorKind::Other(err) => format!("; {err}"),
+                    }
+                )
+            },
+            RepoErrorRepr::Other(err) => format!("{err}")
         }
     )]
     RepoError(RepoErrorRepr),
@@ -27,6 +69,21 @@ pub enum ScanFilesError {
     IoBound(io::Error),
 }
 
+// NOTE: the error variants in this enum may seem like they suffer from
+// fragmentation in that task errors can also be gathered by `RepoErrorRepr`. We
+// separate them into two different variants for the purposes of unit testing.
+#[derive(Debug)]
+pub(crate) enum DiscoverRepoError {
+    Error(RepoErrorRepr),
+    Task(Box<dyn Error + Send + Sync>),
+}
+
+#[derive(Debug)]
+pub(crate) enum CloneRepoError {
+    Error(RepoErrorRepr),
+    Task(Box<dyn Error + Send + Sync>),
+}
+
 #[derive(Debug)]
 pub(crate) enum FetchDetailsError {
     CargoMetadata,
@@ -34,8 +91,35 @@ pub(crate) enum FetchDetailsError {
 }
 
 #[derive(Debug)]
-pub(crate) enum RepoErrorRepr {
-    Clone(PathBuf),
+pub enum RepoErrorRepr {
+    Discover {
+        path: PathBuf,
+        kind: DiscoverErrorKind,
+    },
+    Clone {
+        path: PathBuf,
+        kind: CloneErrorKind,
+    },
+    Other(Box<dyn Error + Send + Sync>),
+}
+
+#[derive(Debug)]
+pub enum DiscoverErrorKind {
+    NoRepository,
+    InvalidDir(Option<io::Error>),
+    InvalidRepoConfig,
+    WrongUtf8,
+    Other(Box<dyn Error + Send + Sync>),
+}
+
+#[derive(Debug)]
+pub enum CloneErrorKind {
+    DirectoryNotEmpty,
+    InvalidRepoConfig,
+    LibcUrl,
+    IllegalUtf8,
+    IoBound(io::Error),
+    Other(Box<dyn Error + Send + Sync>),
 }
 
 #[derive(Debug)]
