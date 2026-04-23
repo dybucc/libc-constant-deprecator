@@ -1,4 +1,4 @@
-= Expanding macros
+= Implementation notes
 
 Expanding macros prior to parsing constants poses a few challenges. Firstly, regular expansion would
 force some further form of parsing prior to reading in contents all at once, as right now I know
@@ -149,3 +149,23 @@ exist a relation of dependence between constants in this particular context.
 
 The conclusion is that all functionality related to having constants saved on disk is useless and
 should be removed. Efforts should focus on having all I/O bound functionality be asynchronous.
+
+The heavy work of discovering/cloning the repo in the `scan_files()` entry point to the crate is now
+async. The directory traversal that was previously implemented in terms of the facilitites provided
+by the `walkdir` crate should likely be refactored into using manual directory traversal, as that
+library does not seem to offer an async alternative. The routine attempts to access the source
+directory of the `libc` crate, but the current implementation would also parse all other crates in
+the repo as it is currently not using Cargo workspaces but rather crates inside the same path as the
+manifest file for the main `libc` crate. This is incorrect, and likely means the path ought be
+hardcoded, which should also drop the dependency on `cargo_metadata`. Beyond that, implementing
+recursive directory traversal should be fairly straightforward with `tokio`'s stream adaptors. That
+may not be necessary as the `tokio` docs explictly mention that the operation is done on a separate
+thread to run the same function as that found in `std`. This means there's no real asynchronicity
+here beyond the separate execution the extra thread provides. That likely means we can still rely on
+`walkdir`, but drop `cargo_metadata`. Now all I/O-bound functions participating in `scan_files()`
+are async. The only thing that remains is to increase the level of parallelism, as parsing depends
+on the paths that are fetched right before, but it iterates sequentially through those paths, so
+they can be made to be transmitted through a channel between the routne that fetches the paths and
+the routine that reads the contents of the files given those paths. This should void the need for
+gathering a collection of paths from the fetching routine, as they would be streamed to the parsing
+routine as soon as they were made available.

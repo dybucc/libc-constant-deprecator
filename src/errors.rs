@@ -7,10 +7,10 @@ use std::{
 
 use thiserror::Error;
 
+// TODO: get the error printing logic refactored into a separate function.
+
 #[derive(Debug, Error)]
 pub enum ScanFilesError {
-    #[error("failed to change pwd: {0}")]
-    PwdSetting(io::Error),
     #[error(
         "{}",
         match .0 {
@@ -59,14 +59,14 @@ pub enum ScanFilesError {
         }
     )]
     RepoError(RepoErrorRepr),
-    #[error("directory `{0}` doesn't contain a cargo workspace with `libc` in it")]
-    NoLibc(PathBuf),
-    #[error("workspace querying through `cargo-metadata` failed for directory `{0}`")]
-    WorkspaceScanning(PathBuf),
+    #[error("FIXME")]
+    FetchError(),
     #[error("failed parsing rust source file `{0}`")]
     ParseError(PathBuf),
     #[error("internal io error: {0}")]
     IoBound(io::Error),
+    #[error(transparent)]
+    Other(Box<dyn Error + Send + Sync>),
 }
 
 // NOTE: the error variants in this enum may seem like they suffer from
@@ -82,12 +82,6 @@ pub(crate) enum DiscoverRepoError {
 pub(crate) enum CloneRepoError {
     Error(RepoErrorRepr),
     Task(Box<dyn Error + Send + Sync>),
-}
-
-#[derive(Debug)]
-pub(crate) enum FetchDetailsError {
-    CargoMetadata,
-    NoLibc,
 }
 
 #[derive(Debug)]
@@ -123,7 +117,11 @@ pub enum CloneErrorKind {
 }
 
 #[derive(Debug)]
-pub(crate) struct ParseFilesError(pub(crate) PathBuf);
+pub(crate) enum FetchParseError {
+    ParsingFailed,
+    IoBound(io::Error),
+    Other(Box<dyn Error + Send + Sync>),
+}
 
 #[derive(Debug, Error)]
 #[error("failed to save constants to file: `{0}`")]

@@ -1,133 +1,77 @@
 use std::{
-    env,
     path::{Path, PathBuf},
+    sync::atomic::AtomicBool,
 };
 
-use cargo_metadata::MetadataCommand;
+use futures::future;
 use gix::{
-    clone, create,
+    clone::{self, PrepareCheckout, PrepareFetch, fetch},
+    config, create,
     discover::{self, upwards},
     init, open,
     path::relative_path,
+    progress::Discard,
+    remote::{self, connect},
 };
-use tokio::{fs, task};
+use tokio::{
+    fs,
+    sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
+    task::{self, JoinSet},
+};
 use walkdir::WalkDir;
 
 use crate::{
-    CloneErrorKind, DiscoverErrorKind, DiscoverRepoError, FetchDetailsError, ParseFilesError,
+    CloneErrorKind, CloneRepoError, DiscoverErrorKind, DiscoverRepoError, FetchParseError,
     RepoErrorRepr, ScanFilesError, SourceFile,
 };
 
 pub(crate) const LIBC_REPO: &str = "https://github.com/rust-lang/libc.git";
 
+/// Scans the `libc` codebase in the provided path, cloning it from upstream if
+/// the path does not exist.
+///
+/// # Errors
+///
+/// The function may fail if it fails to discover/clone the repo on the given
+/// path and, when dealing with an existing path, its ancestors.
 pub async fn scan_files(libc_path: impl AsRef<Path>) -> Result<Vec<SourceFile>, ScanFilesError> {
+    macro_rules! handle_result {
+        (@DiscoverRepoError) => {
+            discover_repo
+        };
+        (@CloneRepoError) => {
+            clone_repo
+        };
+        ($err:tt) => {{
+            handle_result!(@$err)(libc_path.as_ref().to_owned())
+                .await
+                .map_err(|err| match err {
+                    $err::Error(err) => ScanFilesError::RepoError(err),
+                    $err::Task(err) => ScanFilesError::RepoError(RepoErrorRepr::Other(err)),
+                })?
+        }};
+    }
+
     if fs::try_exists(&libc_path)
         .await
         .map_err(ScanFilesError::IoBound)?
     {
-        discover_repo(libc_path.as_ref().to_owned())
-            .await
-            .map_err(|err| match err {
-                DiscoverRepoError::Error(err) => ScanFilesError::RepoError(err),
-                DiscoverRepoError::Task(err) => {
-                    ScanFilesError::RepoError(RepoErrorRepr::Other(err))
-                }
-            })?;
+        handle_result!(DiscoverRepoError);
     } else {
-        let path = libc_path.as_ref().to_owned();
-
-        task::spawn_blocking(|| {
-            gix::prepare_clone(LIBC_REPO, &path)
-                .map_err(|err| match err {
-                    clone::Error::Init(err) => match err {
-                        init::Error::CurrentDir(err) => RepoErrorRepr::Clone {
-                            path,
-                            kind: CloneErrorKind::IoBound(err),
-                        },
-                        init::Error::Init(err) => match err {
-                            create::Error::CurrentDir(err)
-                            | create::Error::IoOpen { source: err, .. }
-                            | create::Error::IoWrite { source: err, .. }
-                            | create::Error::CreateDirectory { source: err, .. } => {
-                                RepoErrorRepr::Clone {
-                                    path,
-                                    kind: CloneErrorKind::IoBound(err),
-                                }
-                            }
-                            create::Error::DirectoryExists { .. }
-                            | create::Error::DirectoryNotEmpty { .. } => RepoErrorRepr::Clone {
-                                path,
-                                kind: CloneErrorKind::DirectoryNotEmpty,
-                            },
-                        },
-                        init::Error::Open(err) => match err {
-                            open::Error::Config(_) => RepoErrorRepr::Clone {
-                                path,
-                                kind: CloneErrorKind::InvalidRepoConfig,
-                            },
-                            open::Error::NotARepository { source, .. } => RepoErrorRepr::Clone {
-                                path,
-                                kind: CloneErrorKind::Other(source.into()),
-                            },
-                            open::Error::Io(err) => RepoErrorRepr::Clone {
-                                path,
-                                kind: CloneErrorKind::IoBound(err),
-                            },
-                            err @ open::Error::UnsafeGitDir { .. } => RepoErrorRepr::Clone {
-                                path,
-                                kind: CloneErrorKind::Other(err.into()),
-                            },
-                            open::Error::EnvironmentAccessDenied(err) => RepoErrorRepr::Clone {
-                                path,
-                                kind: CloneErrorKind::Other(err.into()),
-                            },
-                            open::Error::PrefixNotRelative(relative_path::Error::IllegalUtf8(
-                                _,
-                            )) => RepoErrorRepr::Clone {
-                                path,
-                                kind: CloneErrorKind::IllegalUtf8,
-                            },
-                            open::Error::PrefixNotRelative(err) => RepoErrorRepr::Clone {
-                                path,
-                                kind: CloneErrorKind::Other(err.into()),
-                            },
-                        },
-                        init::Error::InvalidBranchName { .. } => RepoErrorRepr::Clone {
-                            path,
-                            kind: CloneErrorKind::LibcUrl,
-                        },
-                        init::Error::EditHeadForDefaultBranch(err) => RepoErrorRepr::Clone {
-                            path,
-                            kind: CloneErrorKind::Other(err.into()),
-                        },
-                    },
-                    clone::Error::CommitterOrFallback(_) => RepoErrorRepr::Clone {
-                        path,
-                        kind: CloneErrorKind::InvalidRepoConfig,
-                    },
-                    clone::Error::UrlParse(_) | clone::Error::CanonicalizeUrl { .. } => {
-                        RepoErrorRepr::Clone {
-                            path,
-                            kind: CloneErrorKind::LibcUrl,
-                        }
-                    }
-                })
-                .map(|_| ())
-        })
-        .await
-        .map_err(|inner| ScanFilesError::RepoError(RepoErrorRepr::Other(inner.into())))?
-        .map_err(ScanFilesError::RepoError)?;
+        handle_result!(CloneRepoError);
     }
 
-    env::set_current_dir(libc_path.as_ref()).map_err(ScanFilesError::PwdSetting)?;
+    let (tx, rx) = mpsc::unbounded_channel();
 
-    parse_files(fetch_details().map_err(|e| match e {
-        FetchDetailsError::CargoMetadata => {
-            ScanFilesError::WorkspaceScanning(libc_path.as_ref().to_owned())
-        }
-        FetchDetailsError::NoLibc => ScanFilesError::NoLibc(libc_path.as_ref().to_owned()),
-    })?)
-    .map_err(|ParseFilesError(path)| ScanFilesError::ParseError(path))
+    match future::try_join(
+        fetch_details(libc_path.as_ref().to_owned(), tx),
+        parse_files(rx),
+    )
+    .await
+    {
+        Ok(((), res)) => Ok(res),
+        Err(err) => todo!(),
+    }
 }
 
 pub(crate) async fn discover_repo(path: PathBuf) -> Result<(), DiscoverRepoError> {
@@ -194,199 +138,252 @@ pub(crate) async fn discover_repo(path: PathBuf) -> Result<(), DiscoverRepoError
     .map_err(DiscoverRepoError::Error)
 }
 
-// TODO: finish the below two routines.
-
-pub(crate) fn clone_repo(path: PathBuf) -> Result<(), CloneRepoError> {
+pub(crate) async fn clone_repo(path: PathBuf) -> Result<(), CloneRepoError> {
     task::spawn_blocking(|| {
-        gix::prepare_clone(LIBC_REPO, &path)
-            .map_err(|err| match err {
-                clone::Error::Init(err) => match err {
-                    init::Error::CurrentDir(err) => RepoErrorRepr::Clone {
+        fetch_repo(path.clone(), prepare_clone(path.clone())?)?
+            .main_worktree(Discard, &AtomicBool::new(false))
+            .map_err(|err| RepoErrorRepr::Clone {
+                path,
+                kind: CloneErrorKind::Other(err.into()),
+            })
+            .map_err(CloneRepoError::Error)
+            .map(|_| ())
+    })
+    .await
+    .map_err(Into::into)
+    .map_err(CloneRepoError::Task)?
+}
+
+pub(crate) fn prepare_clone(path: PathBuf) -> Result<PrepareFetch, CloneRepoError> {
+    gix::prepare_clone(LIBC_REPO, &path)
+        .map_err(|err| match err {
+            clone::Error::Init(err) => match err {
+                init::Error::CurrentDir(err) => RepoErrorRepr::Clone {
+                    path,
+                    kind: CloneErrorKind::IoBound(err),
+                },
+                init::Error::Init(err) => match err {
+                    create::Error::CurrentDir(err)
+                    | create::Error::IoOpen { source: err, .. }
+                    | create::Error::IoWrite { source: err, .. }
+                    | create::Error::CreateDirectory { source: err, .. } => RepoErrorRepr::Clone {
                         path,
                         kind: CloneErrorKind::IoBound(err),
                     },
-                    init::Error::Init(err) => match err {
-                        create::Error::CurrentDir(err)
-                        | create::Error::IoOpen { source: err, .. }
-                        | create::Error::IoWrite { source: err, .. }
-                        | create::Error::CreateDirectory { source: err, .. } => {
-                            RepoErrorRepr::Clone {
-                                path,
-                                kind: CloneErrorKind::IoBound(err),
-                            }
-                        }
-                        create::Error::DirectoryExists { .. }
-                        | create::Error::DirectoryNotEmpty { .. } => RepoErrorRepr::Clone {
-                            path,
-                            kind: CloneErrorKind::DirectoryNotEmpty,
-                        },
-                    },
-                    init::Error::Open(err) => match err {
-                        open::Error::Config(_) => RepoErrorRepr::Clone {
-                            path,
-                            kind: CloneErrorKind::InvalidRepoConfig,
-                        },
-                        open::Error::NotARepository { source, .. } => RepoErrorRepr::Clone {
-                            path,
-                            kind: CloneErrorKind::Other(source.into()),
-                        },
-                        open::Error::Io(err) => RepoErrorRepr::Clone {
-                            path,
-                            kind: CloneErrorKind::IoBound(err),
-                        },
-                        err @ open::Error::UnsafeGitDir { .. } => RepoErrorRepr::Clone {
-                            path,
-                            kind: CloneErrorKind::Other(err.into()),
-                        },
-                        open::Error::EnvironmentAccessDenied(err) => RepoErrorRepr::Clone {
-                            path,
-                            kind: CloneErrorKind::Other(err.into()),
-                        },
-                        open::Error::PrefixNotRelative(relative_path::Error::IllegalUtf8(_)) => {
-                            RepoErrorRepr::Clone {
-                                path,
-                                kind: CloneErrorKind::IllegalUtf8,
-                            }
-                        }
-                        open::Error::PrefixNotRelative(err) => RepoErrorRepr::Clone {
-                            path,
-                            kind: CloneErrorKind::Other(err.into()),
-                        },
-                    },
-                    init::Error::InvalidBranchName { .. } => RepoErrorRepr::Clone {
+                    create::Error::DirectoryExists { .. }
+                    | create::Error::DirectoryNotEmpty { .. } => RepoErrorRepr::Clone {
                         path,
-                        kind: CloneErrorKind::LibcUrl,
+                        kind: CloneErrorKind::DirectoryNotEmpty,
                     },
-                    init::Error::EditHeadForDefaultBranch(err) => RepoErrorRepr::Clone {
+                },
+                init::Error::Open(err) => match err {
+                    open::Error::Config(_) => RepoErrorRepr::Clone {
+                        path,
+                        kind: CloneErrorKind::InvalidRepoConfig,
+                    },
+                    open::Error::NotARepository { source, .. } => RepoErrorRepr::Clone {
+                        path,
+                        kind: CloneErrorKind::Other(source.into()),
+                    },
+                    open::Error::Io(err) => RepoErrorRepr::Clone {
+                        path,
+                        kind: CloneErrorKind::IoBound(err),
+                    },
+                    err @ open::Error::UnsafeGitDir { .. } => RepoErrorRepr::Clone {
+                        path,
+                        kind: CloneErrorKind::Other(err.into()),
+                    },
+                    open::Error::EnvironmentAccessDenied(err) => RepoErrorRepr::Clone {
+                        path,
+                        kind: CloneErrorKind::Other(err.into()),
+                    },
+                    open::Error::PrefixNotRelative(relative_path::Error::IllegalUtf8(_)) => {
+                        RepoErrorRepr::Clone {
+                            path,
+                            kind: CloneErrorKind::IllegalUtf8,
+                        }
+                    }
+                    open::Error::PrefixNotRelative(err) => RepoErrorRepr::Clone {
                         path,
                         kind: CloneErrorKind::Other(err.into()),
                     },
                 },
-                clone::Error::CommitterOrFallback(_) => RepoErrorRepr::Clone {
+                init::Error::InvalidBranchName { .. } => RepoErrorRepr::Clone {
                     path,
-                    kind: CloneErrorKind::InvalidRepoConfig,
+                    kind: CloneErrorKind::LibcUrl,
                 },
-                clone::Error::UrlParse(_) | clone::Error::CanonicalizeUrl { .. } => {
+                init::Error::EditHeadForDefaultBranch(err) => RepoErrorRepr::Clone {
+                    path,
+                    kind: CloneErrorKind::Other(err.into()),
+                },
+            },
+            clone::Error::CommitterOrFallback(_) => RepoErrorRepr::Clone {
+                path,
+                kind: CloneErrorKind::InvalidRepoConfig,
+            },
+            clone::Error::UrlParse(_) | clone::Error::CanonicalizeUrl { .. } => {
+                RepoErrorRepr::Clone {
+                    path,
+                    kind: CloneErrorKind::LibcUrl,
+                }
+            }
+        })
+        .map_err(CloneRepoError::Error)
+}
+
+pub(crate) fn fetch_repo(
+    path: PathBuf,
+    mut clone_handle: PrepareFetch,
+) -> Result<PrepareCheckout, CloneRepoError> {
+    clone_handle
+        .fetch_then_checkout(Discard, &AtomicBool::new(false))
+        .map_err(|err| match err {
+            fetch::Error::Connect(connect::Error::InvalidRemoteRepositoryPath { .. }) => {
+                RepoErrorRepr::Clone {
+                    path,
+                    kind: CloneErrorKind::LibcUrl,
+                }
+            }
+            fetch::Error::Connect(err) => RepoErrorRepr::Clone {
+                path,
+                kind: CloneErrorKind::Other(err.into()),
+            },
+            fetch::Error::PrepareFetch(err) => RepoErrorRepr::Clone {
+                path,
+                kind: CloneErrorKind::Other(err.into()),
+            },
+            fetch::Error::Fetch(err) => RepoErrorRepr::Clone {
+                path,
+                kind: CloneErrorKind::Other(err.into()),
+            },
+            fetch::Error::RemoteInit(err) => match err {
+                remote::init::Error::Url(_) | remote::init::Error::RewrittenUrlInvalid { .. } => {
                     RepoErrorRepr::Clone {
                         path,
                         kind: CloneErrorKind::LibcUrl,
                     }
                 }
-            })
-            .map(|_| ())
-    })
-    .await
-}
-
-pub(crate) fn prepare_clone(path: impl AsRef<Path>) -> Result<(), CloneRepoError> {
-    gix::prepare_clone(LIBC_REPO, &path).map_err(|err| match err {
-        clone::Error::Init(err) => match err {
-            init::Error::CurrentDir(err) => RepoErrorRepr::Clone {
-                path,
-                kind: CloneErrorKind::IoBound(err),
             },
-            init::Error::Init(err) => match err {
-                create::Error::CurrentDir(err)
-                | create::Error::IoOpen { source: err, .. }
-                | create::Error::IoWrite { source: err, .. }
-                | create::Error::CreateDirectory { source: err, .. } => RepoErrorRepr::Clone {
+            fetch::Error::RemoteConfiguration(err) | fetch::Error::RemoteConnection(err) => {
+                RepoErrorRepr::Clone {
                     path,
-                    kind: CloneErrorKind::IoBound(err),
-                },
-                create::Error::DirectoryExists { .. } | create::Error::DirectoryNotEmpty { .. } => {
-                    RepoErrorRepr::Clone {
-                        path,
-                        kind: CloneErrorKind::DirectoryNotEmpty,
-                    }
+                    kind: CloneErrorKind::Other(err),
                 }
-            },
-            init::Error::Open(err) => match err {
-                open::Error::Config(_) => RepoErrorRepr::Clone {
-                    path,
-                    kind: CloneErrorKind::InvalidRepoConfig,
-                },
-                open::Error::NotARepository { source, .. } => RepoErrorRepr::Clone {
-                    path,
-                    kind: CloneErrorKind::Other(source.into()),
-                },
-                open::Error::Io(err) => RepoErrorRepr::Clone {
-                    path,
-                    kind: CloneErrorKind::IoBound(err),
-                },
-                err @ open::Error::UnsafeGitDir { .. } => RepoErrorRepr::Clone {
-                    path,
-                    kind: CloneErrorKind::Other(err.into()),
-                },
-                open::Error::EnvironmentAccessDenied(err) => RepoErrorRepr::Clone {
-                    path,
-                    kind: CloneErrorKind::Other(err.into()),
-                },
-                open::Error::PrefixNotRelative(relative_path::Error::IllegalUtf8(_)) => {
-                    RepoErrorRepr::Clone {
-                        path,
-                        kind: CloneErrorKind::IllegalUtf8,
-                    }
-                }
-                open::Error::PrefixNotRelative(err) => RepoErrorRepr::Clone {
-                    path,
-                    kind: CloneErrorKind::Other(err.into()),
-                },
-            },
-            init::Error::InvalidBranchName { .. } => RepoErrorRepr::Clone {
+            }
+            fetch::Error::RemoteName(_)
+            | fetch::Error::ParseConfig(_)
+            | fetch::Error::ApplyConfig(_)
+            | fetch::Error::CommitterOrFallback(_) => RepoErrorRepr::Clone {
                 path,
-                kind: CloneErrorKind::LibcUrl,
+                kind: CloneErrorKind::InvalidRepoConfig,
             },
-            init::Error::EditHeadForDefaultBranch(err) => RepoErrorRepr::Clone {
+            fetch::Error::LoadConfig(config::file::init::from_paths::Error::Io {
+                source, ..
+            }) => RepoErrorRepr::Clone {
+                path,
+                kind: CloneErrorKind::IoBound(source),
+            },
+            fetch::Error::LoadConfig(err) => RepoErrorRepr::Clone {
                 path,
                 kind: CloneErrorKind::Other(err.into()),
             },
-        },
-        clone::Error::CommitterOrFallback(_) => RepoErrorRepr::Clone {
-            path,
-            kind: CloneErrorKind::InvalidRepoConfig,
-        },
-        clone::Error::UrlParse(_) | clone::Error::CanonicalizeUrl { .. } => RepoErrorRepr::Clone {
-            path,
-            kind: CloneErrorKind::LibcUrl,
-        },
-    })
+            fetch::Error::SaveConfig(err) => RepoErrorRepr::Clone {
+                path,
+                kind: CloneErrorKind::Other(err.into()),
+            },
+            fetch::Error::SaveConfigIo(err) => RepoErrorRepr::Clone {
+                path,
+                kind: CloneErrorKind::IoBound(err),
+            },
+            fetch::Error::InvalidHeadRef { source, .. } => RepoErrorRepr::Clone {
+                path,
+                kind: CloneErrorKind::Other(source.into()),
+            },
+            fetch::Error::HeadUpdate(err) => RepoErrorRepr::Clone {
+                path,
+                kind: CloneErrorKind::Other(err.into()),
+            },
+            err @ (fetch::Error::RefNameMissing { .. } | fetch::Error::RefNameAmbiguous { .. }) => {
+                RepoErrorRepr::Clone {
+                    path,
+                    kind: CloneErrorKind::Other(err.into()),
+                }
+            }
+            fetch::Error::RefMap(err) => RepoErrorRepr::Clone {
+                path,
+                kind: CloneErrorKind::Other(err.into()),
+            },
+            fetch::Error::ReferenceName(err) => RepoErrorRepr::Clone {
+                path,
+                kind: CloneErrorKind::Other(err.into()),
+            },
+        })
+        .map_err(CloneRepoError::Error)
+        .map(|(out, _)| out)
 }
 
-pub(crate) fn fetch_details() -> Result<Vec<PathBuf>, FetchDetailsError> {
-    Ok(WalkDir::new(
-        MetadataCommand::new()
-            .exec()
-            .map_err(|_| FetchDetailsError::CargoMetadata)?
-            .workspace_packages()
-            .iter()
-            .find_map(|&pkg| {
-                (pkg.name == "libc").then(|| pkg.manifest_path.parent().unwrap().to_owned())
+pub(crate) async fn fetch_details(
+    mut path: PathBuf,
+    tx: UnboundedSender<PathBuf>,
+) -> Result<(), FetchParseError> {
+    // NOTE: we don't implement manual directory traversal with something like
+    // `tokio`'s `fs` functions because those use the same `std` blocking functions
+    // only on a separate, "blocking-friendly" thread, so we may as well keep
+    // `walkdir` but run it also in a separate thread.
+    task::spawn_blocking(move || {
+        path.push("src");
+
+        WalkDir::new(path)
+            .sort_by_file_name()
+            .contents_first(true)
+            .into_iter()
+            .filter_map(|entry| {
+                entry.ok().and_then(|entry| {
+                    (entry.file_type().is_file())
+                        .then(|| entry.into_path())
+                        .filter(|inner| inner.extension().is_some_and(|ext| ext == "rs"))
+                })
             })
-            .ok_or(FetchDetailsError::NoLibc)?,
-    )
-    .sort_by_file_name()
-    .contents_first(true)
-    .into_iter()
-    .filter_map(|entry| {
-        entry.ok().map(|entry| {
-            (entry.file_type().is_file())
-                .then(|| entry.into_path())
-                .filter(|inner| inner.extension().is_some_and(|ext| ext == "rs"))
-        })?
+            .for_each(|entry| _ = tx.send(entry));
     })
-    .collect())
+    .await
+    .map_err(Into::into)
+    .map_err(FetchParseError::Other)
 }
 
-pub(crate) fn parse_files(files: Vec<PathBuf>) -> Result<Vec<SourceFile>, ParseFilesError> {
-    files.into_iter().try_fold(Vec::new(), |mut out, file| {
-        out.push(SourceFile::new(
-            syn::parse_file(
-                &std::fs::read_to_string(&file).map_err(|_| ParseFilesError(file.clone()))?,
-            )
-            .map_err(|_| ParseFilesError(file.clone()))?,
-            file,
-        ));
+pub(crate) async fn parse_files(
+    mut rx: UnboundedReceiver<PathBuf>,
+) -> Result<Vec<SourceFile>, FetchParseError> {
+    let mut task_pool = JoinSet::new();
 
-        Ok::<_, ParseFilesError>(out)
-    })
+    while let Some(path) = rx.recv().await {
+        task_pool.spawn(async move {
+            Ok((
+                fs::read_to_string(&path)
+                    .await
+                    .map_err(FetchParseError::IoBound)?,
+                path,
+            ))
+        });
+    }
+
+    let mut out = Vec::new();
+
+    // NOTE: parsing has to happen on the main thread because `syn`'s types are not
+    // thread-safe (for the most part.)
+    while let Some(res) = task_pool.join_next().await {
+        match res {
+            Ok(read_res) => {
+                let (file, path) = read_res?;
+
+                out.push(SourceFile::new(
+                    syn::parse_file(&file).map_err(|_| FetchParseError::ParsingFailed)?,
+                    path,
+                ));
+            }
+            Err(task_err) => return Err(FetchParseError::Other(task_err.into())),
+        }
+    }
+
+    Ok(out)
 }

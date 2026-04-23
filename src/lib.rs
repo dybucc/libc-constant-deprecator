@@ -1,4 +1,4 @@
-#![feature(bool_to_result, exit_status_error)]
+#![feature(exit_status_error)]
 
 mod constant;
 mod constant_container;
