@@ -28,7 +28,7 @@ pub(crate) use crate::errors::*;
 pub use crate::{
     constant::Const,
     constant_container::{ConstContainer, borrowed::BorrowedContainer},
-    errors::{FilterError, IoBoundChanges, MakeChangesError, SaveError, ScanFilesError},
+    errors::{FilterError, IoBoundChanges, MakeChangesError, ScanFilesError},
     parser::parse_constants,
     scanner::scan_files,
     source_file::SourceFile,

@@ -16,11 +16,24 @@ pub struct ConstContainer {
 }
 
 impl ConstContainer {
+    pub(crate) const MAX_RE_POWER: u8 = 20;
     pub(crate) const DEPRECATION_NOTICE: &str = "This constant, among others often used in C for \
                                                  the purposes of denoting the latest value or \
                                                  limit in a set of constants, has been \
                                                  deprecated. See #3131 for details and discussion.";
 
+    /// Filters out constants by identifier provided a regex matching against
+    /// those identifiers.
+    ///
+    /// Returns a borrowed container that can bulk deprecate the matched
+    /// constants at once, and remembers which constants have been modified to
+    /// effect those changes to disk later on.
+    ///
+    /// # Errors
+    ///
+    /// Fails if either the regex failed to compile. This may be due to a byte
+    /// size failure at the regex engine level, or due to a parsing failure
+    /// at the regex syntax level.
     #[expect(
         clippy::missing_panics_doc,
         reason = "The panic code path is (at the time of writing) impossible to reach."
@@ -33,8 +46,14 @@ impl ConstContainer {
         } else {
             re_cache.insert(
                 re.as_ref().to_string(),
-                build_re(&re).map_err(|_| FilterError::RegexCompilation {
-                    input_str: re.as_ref().to_string(),
+                build_re(&re).map_err(|err| match err {
+                    regex::Error::Syntax(_) => {
+                        FilterError::RegexSyntax(re.as_ref().to_owned().into())
+                    }
+                    regex::Error::CompiledTooBig(_) => {
+                        FilterError::RegexTooBig(re.as_ref().to_owned().into())
+                    }
+                    _ => todo!(),
                 })?,
             );
 
@@ -49,6 +68,17 @@ impl ConstContainer {
         ))
     }
 
+    /// Effects the changes registered thus far over the parsed constants to the
+    /// on-disk `libc` codebase.
+    ///
+    /// This is a no-op if no constants have been changes, as the implementation
+    /// will only write to disk the constants that have been marked deprecated.
+    ///
+    /// # Errors
+    ///
+    /// Fails if some I/O-bound operation fails while writing to disk, or if any
+    /// one of (1) parsing the existing file from the codebase, or (2)
+    /// formatting that file once the changes are made fails.
     pub fn effect_changes(&self) -> Result<(), MakeChangesError> {
         for Const {
             ident: ref_ident,
@@ -109,8 +139,6 @@ impl ConstContainer {
 }
 
 pub(crate) fn build_re(re: impl AsRef<str>) -> Result<Regex, regex::Error> {
-    const MAX_POWER: u8 = 20;
-
     let mut size_power: u8 = 11;
 
     loop {
@@ -120,7 +148,9 @@ pub(crate) fn build_re(re: impl AsRef<str>) -> Result<Regex, regex::Error> {
             .case_insensitive(true)
             .build()
         {
-            Err(regex::Error::CompiledTooBig(_)) if size_power < MAX_POWER => size_power += 1,
+            Err(regex::Error::CompiledTooBig(_)) if size_power < ConstContainer::MAX_RE_POWER => {
+                size_power += 1;
+            }
             other => break other,
         }
     }

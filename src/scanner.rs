@@ -13,6 +13,7 @@ use gix::{
     progress::Discard,
     remote::{self, connect},
 };
+use syn::File;
 use tokio::{
     fs,
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
@@ -35,6 +36,10 @@ pub(crate) const LIBC_REPO: &str = "https://github.com/rust-lang/libc.git";
 /// The function may fail if it fails to discover/clone the repo on the given
 /// path and, when dealing with an existing path, its ancestors.
 pub async fn scan_files(libc_path: impl AsRef<Path>) -> Result<Vec<SourceFile>, ScanFilesError> {
+    // NOTE: it's more intuitive to have the routine name be the token tree we
+    // accept for recursive munching, but that way the recursive macro invocation
+    // would have to replace the start of the path of enum variant, which seems to
+    // trigger errors.
     macro_rules! handle_result {
         (@DiscoverRepoError) => {
             discover_repo
@@ -47,7 +52,7 @@ pub async fn scan_files(libc_path: impl AsRef<Path>) -> Result<Vec<SourceFile>, 
                 .await
                 .map_err(|err| match err {
                     $err::Error(err) => ScanFilesError::RepoError(err),
-                    $err::Task(err) => ScanFilesError::RepoError(RepoErrorRepr::Other(err)),
+                    $err::Task(err) => ScanFilesError::Other(err),
                 })?
         }};
     }
@@ -70,7 +75,11 @@ pub async fn scan_files(libc_path: impl AsRef<Path>) -> Result<Vec<SourceFile>, 
     .await
     {
         Ok(((), res)) => Ok(res),
-        Err(err) => todo!(),
+        Err(err) => match err {
+            FetchParseError::ParsingFailed(path) => Err(ScanFilesError::ParseError(path)),
+            FetchParseError::IoBound(err) => Err(ScanFilesError::IoBound(err)),
+            FetchParseError::Other(err) => Err(ScanFilesError::Other(err)),
+        },
     }
 }
 
@@ -354,36 +363,61 @@ pub(crate) async fn fetch_details(
 pub(crate) async fn parse_files(
     mut rx: UnboundedReceiver<PathBuf>,
 ) -> Result<Vec<SourceFile>, FetchParseError> {
+    // NOTE: this is necessary to have `syn::File` be `Send`, as otherwise we can't
+    // have any degree of parallelism/concurrency.
+    #[repr(transparent)]
+    struct FileWrapper(File);
+
+    unsafe impl Send for FileWrapper {}
+
     let mut task_pool = JoinSet::new();
+    let (inner_tx, mut inner_rx) = mpsc::unbounded_channel();
+
+    let gatherer = task::spawn(async move {
+        let mut out = Vec::new();
+
+        while let Some(res) = inner_rx.recv().await {
+            out.push(res);
+        }
+
+        out
+    });
 
     while let Some(path) = rx.recv().await {
+        let inner_tx = inner_tx.clone();
         task_pool.spawn(async move {
-            Ok((
-                fs::read_to_string(&path)
-                    .await
-                    .map_err(FetchParseError::IoBound)?,
-                path,
-            ))
+            inner_tx
+                .send((
+                    FileWrapper(
+                        syn::parse_file(
+                            &fs::read_to_string(&path)
+                                .await
+                                .map_err(FetchParseError::IoBound)?,
+                        )
+                        .map_err(|_| path.clone())
+                        .map_err(FetchParseError::ParsingFailed)?,
+                    ),
+                    path,
+                ))
+                .map_err(|_| FetchParseError::Other("synchronization error".into()))?;
+            Ok::<_, FetchParseError>(())
         });
     }
 
-    let mut out = Vec::new();
+    // NOTE: we must explicitly drop the transmitter here because it's been
+    // relentlessly cloned throughout tasks and the receiver inside the gatherer
+    // task will not stop looping until the last instance of the transmitter is
+    // dropped. All cloned instances are dropped the moment they send their values
+    // to the gatherer except for the original transmitter, which we drop here.
+    drop(inner_tx);
 
-    // NOTE: parsing has to happen on the main thread because `syn`'s types are not
-    // thread-safe (for the most part.)
-    while let Some(res) = task_pool.join_next().await {
-        match res {
-            Ok(read_res) => {
-                let (file, path) = read_res?;
-
-                out.push(SourceFile::new(
-                    syn::parse_file(&file).map_err(|_| FetchParseError::ParsingFailed)?,
-                    path,
-                ));
-            }
-            Err(task_err) => return Err(FetchParseError::Other(task_err.into())),
-        }
-    }
-
-    Ok(out)
+    gatherer
+        .await
+        .map(|out| {
+            out.into_iter()
+                .map(|(FileWrapper(file), path)| SourceFile::new(file, path))
+                .collect()
+        })
+        .map_err(Into::into)
+        .map_err(FetchParseError::Other)
 }
