@@ -20,6 +20,28 @@ pub struct Const {
     pub(crate) source: PathBuf,
 }
 
+/// These are necessary for some async stuff that has collections of
+/// `Const` passed between threads. The reason why this is sound is that the
+/// backing `Ident` in the `ident` field (which is the one causing `Const:
+/// !Send` and `Const: !Sync`) is actually the `fallback::Ident` in
+/// `proc_macro2`, which itself is thread-safe. This isn't a public
+/// implementation detail, but it is the way that crate handles the `Ident` type
+/// when outside the context of a proc-macro. This crate is not a proc-macro, so
+/// we can trust the `Ident` type is _not_ the thread-unsafe variant in the
+/// `proc_macro` compiler-provided crate.
+unsafe impl Send for Const {}
+
+/// These are necessary for some async stuff that has collections of
+/// `Const` passed between threads. The reason why this is sound is that the
+/// backing `Ident` in the `ident` field (which is the one causing `Const:
+/// !Send` and `Const: !Sync`) is actually the `fallback::Ident` in
+/// `proc_macro2`, which itself is thread-safe. This isn't a public
+/// implementation detail, but it is the way that crate handles the `Ident` type
+/// when outside the context of a proc-macro. This crate is not a proc-macro, so
+/// we can trust the `Ident` type is _not_ the thread-unsafe variant in the
+/// `proc_macro` compiler-provided crate.
+unsafe impl Sync for Const {}
+
 impl Const {
     pub(crate) fn from_item(item: ItemConst, source: PathBuf) -> Self {
         Self {

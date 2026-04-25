@@ -162,10 +162,17 @@ recursive directory traversal should be fairly straightforward with `tokio`'s st
 may not be necessary as the `tokio` docs explictly mention that the operation is done on a separate
 thread to run the same function as that found in `std`. This means there's no real asynchronicity
 here beyond the separate execution the extra thread provides. That likely means we can still rely on
-`walkdir`, but drop `cargo_metadata`. Now all I/O-bound functions participating in `scan_files()`
-are async. The only thing that remains is to increase the level of parallelism, as parsing depends
-on the paths that are fetched right before, but it iterates sequentially through those paths, so
-they can be made to be transmitted through a channel between the routne that fetches the paths and
-the routine that reads the contents of the files given those paths. This should void the need for
-gathering a collection of paths from the fetching routine, as they would be streamed to the parsing
-routine as soon as they were made available.
+`walkdir`, but drop `cargo_metadata`.
+
+Now all I/O-bound functions participating in `scan_files()` are async. The only thing that remains
+is to increase the level of parallelism, as parsing depends on the paths that are fetched right
+before, but it iterates sequentially through those paths, so they can be made to be transmitted
+through a channel between the routine that fetches the paths and the routine that reads the contents
+of the files given those paths. This should void the need for gathering a collection of paths from
+the fetching routine, as they would be streamed to the parsing routine as soon as they were made
+available.
+
+The entirety of `scan_files()` is now async. The only other part of the library that performs
+I/O-bound operations is the method on `ConstContainer` that persists the changes to disk. Making
+that async and actually exploiting parallelism in `tokio` tasks is going to require having pointers
+to

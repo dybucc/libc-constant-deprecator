@@ -12,9 +12,17 @@ impl BorrowedContainer<'_> {
     pub fn deprecate(&mut self) {
         let BorrowedContainer(inner) = self;
 
-        inner
-            .iter_mut()
-            .filter_map(|(constant, modified)| if *modified { constant.into() } else { None })
-            .for_each(|constant| constant.deprecated(true));
+        for (constant, modified) in inner {
+            constant.deprecated(true);
+            *modified = true;
+        }
+    }
+
+    pub fn undeprecate(&mut self) {
+        let BorrowedContainer(inner) = self;
+        for (constant, modified) in inner {
+            constant.deprecated(false);
+            *modified = true;
+        }
     }
 }
