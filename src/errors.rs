@@ -10,12 +10,17 @@ use thiserror::Error;
 use crate::ConstContainer;
 
 #[derive(Debug, Error)]
-pub enum ScanFilesError {
+#[repr(transparent)]
+#[error(transparent)]
+pub struct ScanFilesError(#[from] pub(crate) ScanFilesErrorRepr);
+
+#[derive(Debug, Error)]
+pub(crate) enum ScanFilesErrorRepr {
     #[error("{}", .0.error())]
     RepoError(RepoErrorRepr),
     #[error("failed parsing rust source file `{0}`")]
     ParseError(PathBuf),
-    #[error("internal io error: {0}")]
+    #[error("internal io error: `{0}`")]
     IoBound(io::Error),
     #[error(transparent)]
     Other(Box<dyn Error + Send + Sync>),
@@ -37,7 +42,7 @@ pub(crate) enum CloneRepoError {
 }
 
 #[derive(Debug)]
-pub enum RepoErrorRepr {
+pub(crate) enum RepoErrorRepr {
     Discover {
         path: PathBuf,
         kind: DiscoverErrorKind,
@@ -97,7 +102,7 @@ impl RepoErrorRepr {
 }
 
 #[derive(Debug)]
-pub enum DiscoverErrorKind {
+pub(crate) enum DiscoverErrorKind {
     NoRepository,
     InvalidDir(Option<io::Error>),
     InvalidRepoConfig,
@@ -106,7 +111,7 @@ pub enum DiscoverErrorKind {
 }
 
 #[derive(Debug)]
-pub enum CloneErrorKind {
+pub(crate) enum CloneErrorKind {
     DirectoryNotEmpty,
     InvalidRepoConfig,
     LibcUrl,
@@ -123,33 +128,46 @@ pub(crate) enum FetchParseError {
 }
 
 #[derive(Debug, Error)]
-pub enum FilterError {
+#[repr(transparent)]
+#[error(transparent)]
+pub struct FilterError(#[from] pub(crate) FilterErrorRepr);
+
+impl FilterError {
+    #[expect(
+        clippy::must_use_candidate,
+        reason = "It's not a bug not to use the result of this routine."
+    )]
+    pub fn source_re(&self) -> &str {
+        self.0.source_re()
+    }
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum FilterErrorRepr {
     #[error("regex byte size exceeds 2^{} bytes", ConstContainer::MAX_RE_POWER)]
     RegexTooBig(Cow<'static, str>),
     #[error("failed to parse regex")]
     RegexSyntax(Cow<'static, str>),
 }
 
-impl FilterError {
-    #[expect(
-        clippy::must_use_candidate,
-        reason = "It's not a bug for the result of this routine not to be used."
-    )]
-    pub fn source_re(&self) -> &str {
+impl FilterErrorRepr {
+    pub(crate) fn source_re(&self) -> &str {
         match self {
             Self::RegexTooBig(out) | Self::RegexSyntax(out) => out,
         }
     }
 }
 
+// TODO: layer an opaque representation to this type, like it's already been
+// done with other public error types.
 #[derive(Debug, Error)]
 pub enum MakeChangesError {
     #[error("io error while {}: `{}`", .0.error(), .0.inner)]
     IoBound(IoBoundChanges),
     #[error("failed to parse file: {0}")]
     Parse(Cow<'static, Path>),
-    #[error("failed to format codebase while effecting changes to disk")]
-    Format,
+    #[error(transparent)]
+    Other(Box<dyn Error + Send + Sync>),
 }
 
 #[derive(Debug)]
@@ -160,9 +178,11 @@ pub struct IoBoundChanges {
 
 impl IoBoundChanges {
     pub(crate) fn error(&self) -> String {
-        match &self.origin {
-            ChangesSrc::FetchOp(erred_path) => format!("fetching file {}", erred_path.display()),
-            ChangesSrc::SaveOp(erred_path) => format!("saving file {}", erred_path.display()),
+        match self.origin {
+            ChangesSrc::FetchOp(ref erred_path) => {
+                format!("fetching file {}", erred_path.display())
+            }
+            ChangesSrc::SaveOp(ref erred_path) => format!("saving file {}", erred_path.display()),
         }
     }
 }
@@ -172,9 +192,9 @@ impl IoBoundChanges {
         clippy::must_use_candidate,
         reason = "It's not a bug not to use the result of this routine."
     )]
-    pub fn source(&self) -> &Path {
-        match &self.origin {
-            ChangesSrc::FetchOp(path) | ChangesSrc::SaveOp(path) => path,
+    pub fn source_path(&self) -> &Path {
+        match self.origin {
+            ChangesSrc::FetchOp(ref path) | ChangesSrc::SaveOp(ref path) => path,
         }
     }
 }

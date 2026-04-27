@@ -23,7 +23,7 @@ use walkdir::WalkDir;
 
 use crate::{
     CloneErrorKind, CloneRepoError, DiscoverErrorKind, DiscoverRepoError, FetchParseError,
-    RepoErrorRepr, ScanFilesError, SourceFile,
+    RepoErrorRepr, ScanFilesError, ScanFilesErrorRepr, SourceFile,
 };
 
 pub(crate) const LIBC_REPO: &str = "https://github.com/rust-lang/libc.git";
@@ -38,8 +38,8 @@ pub(crate) const LIBC_REPO: &str = "https://github.com/rust-lang/libc.git";
 pub async fn scan_files(libc_path: impl AsRef<Path>) -> Result<Vec<SourceFile>, ScanFilesError> {
     // NOTE: it's more intuitive to have the routine name be the token tree we
     // accept for recursive munching, but that way the recursive macro invocation
-    // would have to replace the start of the path of enum variant, which seems to
-    // trigger errors.
+    // would have to replace the start of the path of the enum variant, which seems
+    // to trigger expansion errors.
     macro_rules! handle_result {
         (@DiscoverRepoError) => {
             discover_repo
@@ -51,15 +51,15 @@ pub async fn scan_files(libc_path: impl AsRef<Path>) -> Result<Vec<SourceFile>, 
             handle_result!(@$err)(libc_path.as_ref().to_owned())
                 .await
                 .map_err(|err| match err {
-                    $err::Error(err) => ScanFilesError::RepoError(err),
-                    $err::Task(err) => ScanFilesError::Other(err),
+                    $err::Error(err) => ScanFilesErrorRepr::RepoError(err),
+                    $err::Task(err) => ScanFilesErrorRepr::Other(err),
                 })?
         }};
     }
 
     if fs::try_exists(&libc_path)
         .await
-        .map_err(ScanFilesError::IoBound)?
+        .map_err(ScanFilesErrorRepr::IoBound)?
     {
         handle_result!(DiscoverRepoError);
     } else {
@@ -76,9 +76,11 @@ pub async fn scan_files(libc_path: impl AsRef<Path>) -> Result<Vec<SourceFile>, 
     {
         Ok(((), res)) => Ok(res),
         Err(err) => match err {
-            FetchParseError::ParsingFailed(path) => Err(ScanFilesError::ParseError(path)),
-            FetchParseError::IoBound(err) => Err(ScanFilesError::IoBound(err)),
-            FetchParseError::Other(err) => Err(ScanFilesError::Other(err)),
+            FetchParseError::ParsingFailed(path) => {
+                Err(ScanFilesErrorRepr::ParseError(path).into())
+            }
+            FetchParseError::IoBound(err) => Err(ScanFilesErrorRepr::IoBound(err).into()),
+            FetchParseError::Other(err) => Err(ScanFilesErrorRepr::Other(err).into()),
         },
     }
 }
@@ -385,6 +387,9 @@ pub(crate) async fn parse_files(
 
     while let Some(path) = rx.recv().await {
         let inner_tx = inner_tx.clone();
+
+        // TODO: get this to possibly stop using a newtype wrapper with unsafe impls,
+        // because it may just be possible.
         task_pool.spawn(async move {
             inner_tx
                 .send((

@@ -1,5 +1,3 @@
-#![feature(exit_status_error)]
-
 mod constant;
 mod constant_container;
 mod errors;
