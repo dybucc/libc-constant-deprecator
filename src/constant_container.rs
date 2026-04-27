@@ -1,11 +1,15 @@
-use std::{collections::HashMap, process::Command, sync::Arc};
+use std::{
+    collections::HashMap,
+    ops::{Deref, DerefMut},
+};
 
 use regex::bytes::{Regex, RegexBuilder};
 use syn::{Item, ItemConst, spanned::Spanned};
 use tokio::{fs, task::JoinSet};
 
 use crate::{
-    BorrowedContainer, ChangesSrc, Const, FilterError, IoBoundChanges, MakeChangesError, deprecate,
+    BorrowedContainer, ChangesSrc, Const, FilterError, FilterErrorRepr, IoBoundChanges,
+    MakeChangesError, deprecate,
 };
 
 pub(crate) mod borrowed;
@@ -28,13 +32,13 @@ impl ConstContainer {
     ///
     /// Returns a borrowed container that can bulk deprecate the matched
     /// constants at once, and remembers which constants have been modified to
-    /// effect those changes to disk later on.
+    /// only effect those changes to disk later on.
     ///
     /// # Errors
     ///
-    /// Fails if either the regex failed to compile. This may be due to a byte
-    /// size failure at the regex engine level, or due to a parsing failure
-    /// at the regex syntax level.
+    /// Fails if the regex failed to compile. This may be due to a byte size
+    /// failure at the regex engine level, or due to a parsing failure at the
+    /// regex syntax level.
     #[expect(
         clippy::missing_panics_doc,
         reason = "The panic code path is (at the time of writing) impossible to reach."
@@ -49,12 +53,12 @@ impl ConstContainer {
                 re.as_ref().to_string(),
                 build_re(&re).map_err(|err| match err {
                     regex::Error::Syntax(_) => {
-                        FilterError::RegexSyntax(re.as_ref().to_owned().into())
+                        FilterErrorRepr::RegexSyntax(re.as_ref().to_owned().into())
                     }
                     regex::Error::CompiledTooBig(_) => {
-                        FilterError::RegexTooBig(re.as_ref().to_owned().into())
+                        FilterErrorRepr::RegexTooBig(re.as_ref().to_owned().into())
                     }
-                    _ => todo!(),
+                    _ => unimplemented!(),
                 })?,
             );
 
@@ -81,20 +85,33 @@ impl ConstContainer {
     /// one of (1) parsing the existing file from the codebase, or (2)
     /// formatting that file once the changes are made fails.
     pub async fn effect_changes(&self) -> Result<(), MakeChangesError> {
-        // NOTE: the pointer here is actually meant to hold a reference into each of the
-        // fields of a given `Const`. It just so happens that `tokio`'s tasks require a
-        // `'static` lifetime on the futures they run, but references can't easily be
-        // coerced to the lifetime that rules them all. This is solved by way of raw
-        // pointers, which themselves require an unsafe impl to be accepted as
-        // thread-safe. It is sound to do this because the tasks are only accessed from
-        // the thread in which they are runnning. On the lifetime side, it is also sound
-        // for the moved newtype in the future not to be `'static` because all of the
-        // tasks spawned here are awaited before the function returns.
+        // NOTE: the pointer here is actually meant to hold a reference into a given
+        // `Const`. It just so happens that `tokio`'s tasks require a `'static` lifetime
+        // on the futures they run, but we have invariant references to `'static'`. This
+        // is solved by way of raw pointers, which themselves require an unsafe impl to
+        // be accepted as thread-safe. It is sound to do this because the tasks are only
+        // accessed from the thread in which they are runnning. On the lifetime side, it
+        // is also sound for the moved newtype in the future not to be `'static` because
+        // all of the tasks spawned here are awaited before the function returns.
         #[repr(transparent)]
         struct ThreadedPtr<T>(*const T);
 
         unsafe impl<T> Send for ThreadedPtr<T> {}
+
         unsafe impl<T> Sync for ThreadedPtr<T> {}
+
+        impl<T> Deref for ThreadedPtr<T> {
+            type Target = *const T;
+            fn deref(&self) -> &Self::Target {
+                &self.0
+            }
+        }
+
+        impl<T> DerefMut for ThreadedPtr<T> {
+            fn deref_mut(&mut self) -> &mut Self::Target {
+                &mut self.0
+            }
+        }
 
         let mut task_pool = JoinSet::new();
 
@@ -103,72 +120,62 @@ impl ConstContainer {
             .iter()
             .filter_map(|(constant, modified)| if *modified { Some(constant) } else { None })
         {
-            let threaded_constant = Arc::new(ThreadedPtr(&raw const *constant));
+            let threaded_constant = ThreadedPtr(&raw const *constant);
 
             task_pool.spawn(async move {
-                let Const {
-                    ident: ref_ident,
-                    deprecated,
-                    span: ref_span,
-                    source,
-                } = unsafe { threaded_constant.0.as_ref_unchecked() };
+                let source = unsafe { &threaded_constant.as_ref_unchecked().source };
 
-                let mut file =
-                    syn::parse_file(&fs::read_to_string(source).await.map_err(|inner| {
-                        MakeChangesError::IoBound(IoBoundChanges {
-                            origin: ChangesSrc::FetchOp(source.clone()),
-                            inner,
-                        })
-                    })?)
-                    .map_err(|_| MakeChangesError::Parse(source.clone().into()))?;
-
-                // NOTE: the check for the span comes before the destructuring pattern because
-                // otherwise borrowck complains about `item` already being exclusively borrowed
-                // with the variable bindings of that pattern.
-                file.items
-                    .iter_mut()
-                    .filter_map(|item| {
-                        if item.span().start() == *ref_span
-                            && let Item::Const(ItemConst { attrs, ident, .. }) = item
-                            && ident == ref_ident
-                            && *deprecated
-                        {
-                            Some(attrs)
-                        } else {
-                            None
-                        }
+                let contents = fs::read_to_string(source).await.map_err(|inner| {
+                    MakeChangesError::IoBound(IoBoundChanges {
+                        origin: ChangesSrc::FetchOp(source.clone()),
+                        inner,
                     })
-                    .for_each(|attrs| attrs.push(deprecate!(ConstContainer::DEPRECATION_NOTICE)));
+                })?;
 
-                fs::write(source, prettyplease::unparse(&file))
-                    .await
-                    .map_err(|inner| {
-                        MakeChangesError::IoBound(IoBoundChanges {
-                            origin: ChangesSrc::SaveOp(source.clone()),
-                            inner,
+                // NOTE: this is purposefully sandwiched between await points because it handles
+                // `!Send` types.
+                let modified_file = {
+                    let mut file = syn::parse_file(&contents)
+                        .map_err(|_| MakeChangesError::Parse(source.clone().into()))?;
+                    let Const {
+                        ident: ref_ident,
+                        deprecated,
+                        span: ref_span,
+                        ..
+                    } = unsafe { threaded_constant.as_ref_unchecked() };
+                    file.items
+                        .iter_mut()
+                        .filter_map(|item| {
+                            if item.span().start() == *ref_span
+                                && let Item::Const(ItemConst { attrs, ident, .. }) = item
+                                && ident == ref_ident
+                                && *deprecated
+                            {
+                                Some(attrs)
+                            } else {
+                                None
+                            }
                         })
-                    })?;
+                        .for_each(|attrs| {
+                            attrs.push(deprecate!(ConstContainer::DEPRECATION_NOTICE));
+                        });
+                    prettyplease::unparse(&file)
+                };
 
-                Ok::<_, MakeChangesError>(())
+                fs::write(source, modified_file).await.map_err(|inner| {
+                    MakeChangesError::IoBound(IoBoundChanges {
+                        origin: ChangesSrc::SaveOp(source.clone()),
+                        inner,
+                    })
+                })?;
+
+                Ok(())
             });
         }
 
         while let Some(res) = task_pool.join_next().await {
-            // TODO: map the error to this routine's error and make the above future
-            // thread-safe by wrapping the `syn::File` in a newtype with `unsafe impl`s for
-            // `Send` and `Sync`.
-            res?;
+            res.map_err(Into::into).map_err(MakeChangesError::Other)??;
         }
-
-        // NOTE: this may require some tweaking to make the changes to the codebase
-        // comply with those required by the `style_check.py` script. Either way, it
-        // should be left to the contributor's discretion to have the right formatting
-        // applied to the codebase before submitting a PR with the deprecation changes.
-        Command::new("cargo")
-            .args(["fmt"])
-            .status()
-            .map(|status| status.exit_ok().map_err(|_| MakeChangesError::Format))
-            .map_err(|_| MakeChangesError::Format)??;
 
         Ok(())
     }
