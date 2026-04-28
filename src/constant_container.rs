@@ -28,6 +28,16 @@ impl ConstContainer {
                                                  limit in a set of constants, has been \
                                                  deprecated. See #3131 for details and discussion.";
 
+    pub(crate) fn new(inner: Vec<Const>) -> Self {
+        Self {
+            inner: inner
+                .into_iter()
+                .map(|constant| (constant, false))
+                .collect(),
+            re_cache: HashMap::new(),
+        }
+    }
+
     /// Filters out constants by identifier provided a regex matching against
     /// those identifiers.
     ///
@@ -59,7 +69,10 @@ impl ConstContainer {
                     regex::Error::CompiledTooBig(_) => {
                         FilterErrorRepr::RegexTooBig(re.as_ref().to_owned().into())
                     }
-                    _ => unimplemented!(),
+                    _ => unimplemented!(
+                        "We currently handle all error cases of the `regex` crate. Hitting this \
+                         error condition should be reported to the maintainers."
+                    ),
                 })?,
             );
 
@@ -80,12 +93,17 @@ impl ConstContainer {
     /// This is a no-op if no constants have been changed, as the implementation
     /// will only write to disk whichever constants have been marked deprecated.
     ///
+    /// Note this makes changes to the current codebase, and attempts to keep
+    /// the rewritten files fairly well-behaved when it comes to formatting
+    /// guarantees when _manually_ running `rustfmt` _afterwards_ on the
+    /// codebase.
+    ///
     /// # Errors
     ///
     /// Fails if some I/O-bound operation fails while writing to disk, or if any
     /// one of (1) parsing the existing file from the codebase, or (2)
-    /// formatting that file once the changes are made fails.
-    pub async fn effect_changes(&self) -> Result<(), MakeChangesError> {
+    /// formatting that file once the changes are made, fails.
+    pub async fn effect_changes(&mut self) -> Result<(), MakeChangesError> {
         // NOTE: the pointer here is actually meant to hold a reference into a given
         // `Const`. It just so happens that `tokio`'s tasks require a `'static` lifetime
         // on the futures they run, but we have invariant references to `'static'`. This
@@ -119,7 +137,7 @@ impl ConstContainer {
 
         for constant in self
             .inner
-            .iter()
+            .iter_mut()
             .filter_map(|(constant, modified)| if *modified { Some(constant) } else { None })
         {
             let threaded_constant = ThreadedPtr(&raw const *constant);
@@ -180,9 +198,19 @@ impl ConstContainer {
             });
         }
 
+        // NOTE: we cleanly shut down the tasks instead of just aborting them by letting
+        // the task pool drop because we're handling the FS in each task, and it's best
+        // to safe than sorry.
         while let Some(res) = task_pool.join_next().await {
-            res.map_err(Into::into)
-                .map_err(MakeChangesErrorRepr::Other)??;
+            if let Err(err) | Ok(Err(err)) = res
+                .map_err(Into::into)
+                .map_err(MakeChangesErrorRepr::Other)
+                .map_err(Into::into)
+            {
+                task_pool.shutdown().await;
+
+                return Err(err);
+            }
         }
 
         Ok(())

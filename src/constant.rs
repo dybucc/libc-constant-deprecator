@@ -1,17 +1,17 @@
 use std::path::PathBuf;
 
 use proc_macro2::LineColumn;
-use syn::{Ident, ItemConst, spanned::Spanned};
+use syn::{Attribute, Ident, ItemConst, spanned::Spanned};
 
-// NOTE: we don't hold onto a full `proc_macro2::Span` here because recovering
-// that information from a file (the file this utility embeds its constant
-// information on, to be precise) would be impossible as a `Span` can only be
-// created from `syn`'s parsing facilities. And keeping two different types for
-// file-fetched constants and parse-sourced constants is just a hassle.
 // TODO(perf): instead of only storing the identifier of the constant, it may be
-// a better idea to store an enumeration akin to `Cow`, where the identifier is
-// the base type, and if at some point we require converting one of them into
-// strings, it starts storing them as strings instead.
+// a better idea to store an enumeration akin to `std::Cow`, where the
+// identifier is the base type, and if at some point we require converting one
+// of them into strings, it starts storing them as strings instead.
+/// In-memory representation of parsed constants produced as part of
+/// [`parse_constants()`], within [`ConstContainer`]s.
+///
+/// This type contains additional information on the file span, and on whether
+/// the constant item has been marked deprecated.
 #[derive(Debug, Clone)]
 pub struct Const {
     pub(crate) ident: Ident,
@@ -20,35 +20,39 @@ pub struct Const {
     pub(crate) source: PathBuf,
 }
 
-/// These are necessary for some async stuff that has collections of
-/// `Const` passed between threads. The reason why this is sound is that the
-/// backing `Ident` in the `ident` field (which is the one causing `Const:
-/// !Send` and `Const: !Sync`) is actually the `fallback::Ident` in
-/// `proc_macro2`, which itself is thread-safe. This isn't a public
-/// implementation detail, but it is the way that crate handles the `Ident` type
-/// when outside the context of a proc-macro. This crate is not a proc-macro, so
-/// we can trust the `Ident` type is _not_ the thread-unsafe variant in the
-/// `proc_macro` compiler-provided crate.
-unsafe impl Send for Const {}
+macro_rules! impl_doc {
+    ($($it:tt)+) => {
+        $(
+/// These are necessary for some async stuff that has collections of `Const`s
+/// passed between threads. The reason why this is sound is that the backing
+/// `Ident` in the `ident` field (which is the one causing
+/// `Const: !Send + !Sync`) is actually the `fallback::Ident` in `proc_macro2`,
+/// which itself is thread-safe. This isn't a public implementation detail, but
+/// it is the way that crate handles the `Ident` type when outside the context
+/// of a proc-macro. This crate is not a proc-macro, so we can trust the `Ident`
+/// type is _not_ the thread-unsafe variant in the `proc_macro`
+/// compiler-provided crate.
+            unsafe impl $it for Const {}
+        )+
+    };
+}
 
-/// These are necessary for some async stuff that has collections of
-/// `Const` passed between threads. The reason why this is sound is that the
-/// backing `Ident` in the `ident` field (which is the one causing `Const:
-/// !Send` and `Const: !Sync`) is actually the `fallback::Ident` in
-/// `proc_macro2`, which itself is thread-safe. This isn't a public
-/// implementation detail, but it is the way that crate handles the `Ident` type
-/// when outside the context of a proc-macro. This crate is not a proc-macro, so
-/// we can trust the `Ident` type is _not_ the thread-unsafe variant in the
-/// `proc_macro` compiler-provided crate.
-unsafe impl Sync for Const {}
+impl_doc! {
+    Send
+    Sync
+}
 
 impl Const {
     pub(crate) fn from_item(item: ItemConst, source: PathBuf) -> Self {
         Self {
+            deprecated: item
+                .attrs
+                .iter()
+                .map(Attribute::path)
+                .any(|attr_name| attr_name.is_ident("deprecated")),
             span: item.span().start(),
             source,
             ident: item.ident,
-            deprecated: false,
         }
     }
 

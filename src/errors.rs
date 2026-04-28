@@ -9,6 +9,8 @@ use thiserror::Error;
 
 use crate::ConstContainer;
 
+/// Represents an error condition while parsing the codebase with
+/// [`scan_files()`].
 #[derive(Debug, Error)]
 #[repr(transparent)]
 #[error(transparent)]
@@ -127,6 +129,11 @@ pub(crate) enum FetchParseError {
     Other(Box<dyn Error + Send + Sync>),
 }
 
+/// Represents an error condition when filtering errors with a regex in
+/// [`ConstContainer::filter()`].
+///
+/// The only two possible error conditions correspond with those currently in
+/// the [`regex`] crate.
 #[derive(Debug, Error)]
 #[repr(transparent)]
 #[error(transparent)]
@@ -158,12 +165,20 @@ impl FilterErrorRepr {
     }
 }
 
+/// Represents errors that have taken place as part of effecting changes to disk
+/// in [`ConstContainer::effect_changes()`].
 #[derive(Debug, Error)]
 #[repr(transparent)]
 #[error(transparent)]
 pub struct MakeChangesError(#[from] pub(crate) MakeChangesErrorRepr);
 
 impl MakeChangesError {
+    /// Returns the source path where an underlying [`io::Error`] took place if
+    /// the underlying error is, indeed, an `io::Error`.
+    #[expect(
+        clippy::must_use_candidate,
+        reason = "It's not a bug not to use the result of this routine."
+    )]
     pub fn io_source(&self) -> Option<&Path> {
         if let MakeChangesErrorRepr::IoBound(ref ch) = self.0 {
             ch.source_path().into()
@@ -201,10 +216,6 @@ impl IoBoundChanges {
 }
 
 impl IoBoundChanges {
-    #[expect(
-        clippy::must_use_candidate,
-        reason = "It's not a bug not to use the result of this routine."
-    )]
     pub(crate) fn source_path(&self) -> &Path {
         match self.origin {
             ChangesSrc::FetchOp(ref path) | ChangesSrc::SaveOp(ref path) => path,

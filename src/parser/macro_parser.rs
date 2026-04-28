@@ -30,36 +30,34 @@ impl MacroParser {
 
 impl Parse for MacroParser {
     fn parse(input: ParseStream) -> syn::Result<Self> {
-        let mut out = Vec::new();
-        parse(&mut out, input)?;
+        let mut buf = Vec::new();
+        parse(&mut buf, input)?;
 
-        Ok(Self(out))
+        Ok(Self(buf))
     }
 }
 
-pub(crate) fn parse(alloc: &mut Vec<ItemConst>, input: ParseStream) -> syn::Result<()> {
+pub(crate) fn parse(buf: &mut Vec<ItemConst>, input: ParseStream) -> syn::Result<()> {
     // NOTE: if at some point we find that a `cfg_if` macro invocation contains
     // another `cfg_if` macro invocation nested within it, this should be fairly
     // simple to fix. Currently, we assume that upon entering the macro invocation,
     // no further expansions will happen, and thus only items (possibly constants)
     // are to be found.
     macro_rules! extract_consts {
-        () => {
+        () => {{
             let Block { stmts, .. } = input.parse()?;
 
             stmts
                 .into_iter()
                 .filter_map(|stmt| {
-                    if let Stmt::Item(item) = stmt
-                        && let Item::Const(constant) = item
-                    {
+                    if let Stmt::Item(Item::Const(constant)) = stmt {
                         Some(constant)
                     } else {
                         None
                     }
                 })
-                .for_each(|constant| alloc.push(constant));
-        };
+                .for_each(|constant| buf.push(constant));
+        }};
     }
 
     input.parse::<Token![if]>()?;
@@ -71,7 +69,7 @@ pub(crate) fn parse(alloc: &mut Vec<ItemConst>, input: ParseStream) -> syn::Resu
         input.parse::<Token![else]>()?;
 
         if input.peek(Token![if]) {
-            parse(alloc, input)?;
+            parse(buf, input)?;
         } else {
             extract_consts!();
         }

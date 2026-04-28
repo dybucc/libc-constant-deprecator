@@ -2,25 +2,27 @@ use std::path::Path;
 
 use syn::{Item, ItemConst, ItemMacro, Macro};
 
-use crate::{Const, SourceFile};
+use crate::{Const, ConstContainer, SourceFile};
 
 pub(crate) mod macro_parser;
 
 pub(crate) use macro_parser::MacroParser;
 
-// NOTE: this only scans through top-level module items and the `cfg_if` macro
-// because there's no inner scopes (e.g. inherent impls and traits) that contain
-// constants that ought be deprecated, and because the `cfg_if` macro is the
-// only one in which constant items relevant to target platforms are declared
-// (barring the `c_enum` macro, the generated constants of which we don't
-// require deprecating.)
+/// Parses constants provided a collection of [`SourceFile`]s yield from
+/// [`scan_files()`].
+///
+/// This routine will recursively traverse all files and scan for constant items
+/// at module-level scope and within the [`cfg_if!`] macro body. These are the
+/// only scopes in which such items can be found in the `libc` codebase, beyond
+/// those declared for auxiliary purposes in the `c_enum!` macro (itself from
+/// `libc`.)
 #[expect(
     clippy::must_use_candidate,
     reason = "It's not a bug not to use the result of this routine."
 )]
-pub fn parse_constants(files: &[SourceFile]) -> Vec<Const> {
-    files.iter().fold(
-        Vec::with_capacity(files.len()),
+pub fn parse_constants(files: &[SourceFile]) -> ConstContainer {
+    ConstContainer::new(files.iter().fold(
+        Vec::new(),
         |mut parsed_constants, SourceFile { inner, source }| {
             parsed_constants.append(
                 &mut inner
@@ -43,7 +45,7 @@ pub fn parse_constants(files: &[SourceFile]) -> Vec<Const> {
 
             parsed_constants
         },
-    )
+    ))
 }
 
 #[inline]
