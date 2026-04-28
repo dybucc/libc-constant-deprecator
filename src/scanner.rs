@@ -368,9 +368,9 @@ pub(crate) async fn parse_files(
     // NOTE: this is necessary to have `syn::File` be `Send`, as otherwise we can't
     // have any degree of parallelism/concurrency.
     #[repr(transparent)]
-    struct FileWrapper(File);
+    struct ThreadedFile(File);
 
-    unsafe impl Send for FileWrapper {}
+    unsafe impl Send for ThreadedFile {}
 
     let mut task_pool = JoinSet::new();
     let (inner_tx, mut inner_rx) = mpsc::unbounded_channel();
@@ -388,12 +388,10 @@ pub(crate) async fn parse_files(
     while let Some(path) = rx.recv().await {
         let inner_tx = inner_tx.clone();
 
-        // TODO: get this to possibly stop using a newtype wrapper with unsafe impls,
-        // because it may just be possible.
         task_pool.spawn(async move {
             inner_tx
                 .send((
-                    FileWrapper(
+                    ThreadedFile(
                         syn::parse_file(
                             &fs::read_to_string(&path)
                                 .await
@@ -420,7 +418,7 @@ pub(crate) async fn parse_files(
         .await
         .map(|out| {
             out.into_iter()
-                .map(|(FileWrapper(file), path)| SourceFile::new(file, path))
+                .map(|(ThreadedFile(file), path)| SourceFile::new(file, path))
                 .collect()
         })
         .map_err(Into::into)

@@ -9,7 +9,7 @@ use tokio::{fs, task::JoinSet};
 
 use crate::{
     BorrowedContainer, ChangesSrc, Const, FilterError, FilterErrorRepr, IoBoundChanges,
-    MakeChangesError, deprecate,
+    MakeChangesError, MakeChangesErrorRepr, deprecate,
 };
 
 pub(crate) mod borrowed;
@@ -22,6 +22,7 @@ pub struct ConstContainer {
 
 impl ConstContainer {
     pub(crate) const MAX_RE_POWER: u8 = 20;
+
     pub(crate) const DEPRECATION_NOTICE: &str = "This constant, among others often used in C for \
                                                  the purposes of denoting the latest value or \
                                                  limit in a set of constants, has been \
@@ -102,6 +103,7 @@ impl ConstContainer {
 
         impl<T> Deref for ThreadedPtr<T> {
             type Target = *const T;
+
             fn deref(&self) -> &Self::Target {
                 &self.0
             }
@@ -123,10 +125,12 @@ impl ConstContainer {
             let threaded_constant = ThreadedPtr(&raw const *constant);
 
             task_pool.spawn(async move {
+                // NOTE: we only extract `source` from `constant` because other fields are
+                // `!Send` and we prefer to keep that from going across await points.
                 let source = unsafe { &threaded_constant.as_ref_unchecked().source };
 
                 let contents = fs::read_to_string(source).await.map_err(|inner| {
-                    MakeChangesError::IoBound(IoBoundChanges {
+                    MakeChangesErrorRepr::IoBound(IoBoundChanges {
                         origin: ChangesSrc::FetchOp(source.clone()),
                         inner,
                     })
@@ -136,13 +140,15 @@ impl ConstContainer {
                 // `!Send` types.
                 let modified_file = {
                     let mut file = syn::parse_file(&contents)
-                        .map_err(|_| MakeChangesError::Parse(source.clone().into()))?;
+                        .map_err(|_| MakeChangesErrorRepr::Parse(source.clone().into()))?;
+
                     let Const {
                         ident: ref_ident,
                         deprecated,
                         span: ref_span,
                         ..
                     } = unsafe { threaded_constant.as_ref_unchecked() };
+
                     file.items
                         .iter_mut()
                         .filter_map(|item| {
@@ -159,22 +165,24 @@ impl ConstContainer {
                         .for_each(|attrs| {
                             attrs.push(deprecate!(ConstContainer::DEPRECATION_NOTICE));
                         });
+
                     prettyplease::unparse(&file)
                 };
 
                 fs::write(source, modified_file).await.map_err(|inner| {
-                    MakeChangesError::IoBound(IoBoundChanges {
+                    MakeChangesErrorRepr::IoBound(IoBoundChanges {
                         origin: ChangesSrc::SaveOp(source.clone()),
                         inner,
                     })
                 })?;
 
-                Ok(())
+                Ok::<_, MakeChangesError>(())
             });
         }
 
         while let Some(res) = task_pool.join_next().await {
-            res.map_err(Into::into).map_err(MakeChangesError::Other)??;
+            res.map_err(Into::into)
+                .map_err(MakeChangesErrorRepr::Other)??;
         }
 
         Ok(())

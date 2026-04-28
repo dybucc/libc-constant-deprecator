@@ -158,10 +158,23 @@ impl FilterErrorRepr {
     }
 }
 
-// TODO: layer an opaque representation to this type, like it's already been
-// done with other public error types.
 #[derive(Debug, Error)]
-pub enum MakeChangesError {
+#[repr(transparent)]
+#[error(transparent)]
+pub struct MakeChangesError(#[from] pub(crate) MakeChangesErrorRepr);
+
+impl MakeChangesError {
+    pub fn io_source(&self) -> Option<&Path> {
+        if let MakeChangesErrorRepr::IoBound(ref ch) = self.0 {
+            ch.source_path().into()
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum MakeChangesErrorRepr {
     #[error("io error while {}: `{}`", .0.error(), .0.inner)]
     IoBound(IoBoundChanges),
     #[error("failed to parse file: {0}")]
@@ -171,7 +184,7 @@ pub enum MakeChangesError {
 }
 
 #[derive(Debug)]
-pub struct IoBoundChanges {
+pub(crate) struct IoBoundChanges {
     pub(crate) origin: ChangesSrc,
     pub(crate) inner: io::Error,
 }
@@ -192,7 +205,7 @@ impl IoBoundChanges {
         clippy::must_use_candidate,
         reason = "It's not a bug not to use the result of this routine."
     )]
-    pub fn source_path(&self) -> &Path {
+    pub(crate) fn source_path(&self) -> &Path {
         match self.origin {
             ChangesSrc::FetchOp(ref path) | ChangesSrc::SaveOp(ref path) => path,
         }
