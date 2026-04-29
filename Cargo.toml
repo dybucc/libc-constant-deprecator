@@ -1,24 +1,6 @@
-[package]
-name = "libc-constant-deprecator"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+resolver = "3"
+members = ["libc-constant-deprecator-bin","libc-constant-deprecator-lib"]
 
-[lints.clippy]
+[workspace.lints.clippy]
 pedantic = "warn"
-
-[dependencies]
-cargo_metadata = "0.23.1"
-futures = "0.3.32"
-gix = { version = "0.81.0", features = [
-  "blocking-network-client",
-  "blocking-http-transport-reqwest",
-  "blocking-http-transport-reqwest-rust-tls",
-] }
-prettyplease = "0.2.37"
-proc-macro2 = { version = "1.0.106", features = ["span-locations"] }
-quote = "1.0.45"
-regex = "1.12.3"
-syn = { version = "2.0.117", features = ["full", "extra-traits"] }
-thiserror = "2.0.18"
-tokio = { version = "1.52.1", features = ["full"] }
-walkdir = "2.5.0"

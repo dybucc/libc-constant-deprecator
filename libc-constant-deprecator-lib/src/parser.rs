@@ -12,10 +12,12 @@ pub(crate) use macro_parser::MacroParser;
 /// [`scan_files()`].
 ///
 /// This routine will recursively traverse all files and scan for constant items
-/// at module-level scope and within the [`cfg_if!`] macro body. These are the
+/// at module-level scope and within the `cfg_if!` macro body. These are the
 /// only scopes in which such items can be found in the `libc` codebase, beyond
 /// those declared for auxiliary purposes in the `c_enum!` macro (itself from
 /// `libc`.)
+///
+/// [`scan_files()`]: `crate::scan_files()`
 #[expect(
     clippy::must_use_candidate,
     reason = "It's not a bug not to use the result of this routine."

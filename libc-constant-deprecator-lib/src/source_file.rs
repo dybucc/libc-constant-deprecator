@@ -10,7 +10,12 @@ use syn::File;
 /// from the context of the compiler in a proc-macro invocation. That span
 /// information is not available when parsing with [`syn`] outside proc-macros.
 ///
-/// This type is produced by [`scan_files()`] and is used in [`parse_files()`].
+/// This type is produced by [`scan_files()`] and is used in
+/// [`parse_constants()`].
+///
+/// [`ConstContainer`]: `crate::ConstContainer`
+/// [`scan_files()`]: `crate::scan_files()`
+/// [`parse_constants()`]: `crate::parse_constants()`
 #[derive(Debug)]
 pub struct SourceFile {
     pub(crate) inner: File,

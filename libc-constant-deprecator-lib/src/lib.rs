@@ -1,3 +1,8 @@
+//! This crate is aimed at holding basic functionality to allow deprecation of
+//! constant symbols in the `libc` crate.
+//!
+//! It is most useful when paired with the accompanying binary.
+
 mod constant;
 mod constant_container;
 mod errors;

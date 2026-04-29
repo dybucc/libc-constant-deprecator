@@ -12,6 +12,9 @@ use syn::{Attribute, Ident, ItemConst, spanned::Spanned};
 ///
 /// This type contains additional information on the file span, and on whether
 /// the constant item has been marked deprecated.
+///
+/// [`parse_constants()`]: `crate::parse_constants()`
+/// [`ConstContainer`]: `crate::ConstContainer`
 #[derive(Debug, Clone)]
 pub struct Const {
     pub(crate) ident: Ident,
@@ -51,11 +54,12 @@ impl Const {
                 .map(Attribute::path)
                 .any(|attr_name| attr_name.is_ident("deprecated")),
             span: item.span().start(),
-            source,
             ident: item.ident,
+            source,
         }
     }
 
+    #[inline]
     pub(crate) fn deprecated(&mut self, yes: bool) {
         self.deprecated = yes;
     }

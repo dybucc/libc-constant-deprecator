@@ -11,6 +11,13 @@ use crate::ConstContainer;
 
 /// Represents an error condition while parsing the codebase with
 /// [`scan_files()`].
+///
+/// The error is produced when something git-related fails, or if the constants
+/// fail to parse. Otherwise the error is deemed to be an I/O-bound
+/// [`io::Error`] or a task-bound [`JoinError`] error.
+///
+/// [`scan_files()`]: `crate::scan_files()`
+/// [`JoinError`]: `tokio::task::JoinError`
 #[derive(Debug, Error)]
 #[repr(transparent)]
 #[error(transparent)]

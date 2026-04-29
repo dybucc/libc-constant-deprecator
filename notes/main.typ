@@ -175,4 +175,17 @@ available.
 The entirety of `scan_files()` is now async. The only other part of the library that performs
 I/O-bound operations is the method on `ConstContainer` that persists the changes to disk. Making
 that async and actually exploiting parallelism in `tokio` tasks is going to require having pointers
-to
+to the underlying types for each of the constant's fields. This has been completed and should work
+lest the bound on non-`Send` types is meant to infer further meaning than that found when handling
+raw threads.
+
+The binary should allow specifying the path to the `libc` crate through a CLI argument, but beyond
+that there should not be any need to set up further pre-TUI logic. The TUI should consist of a
+single prompt at the lower end of the screen, followed by a list of constants expanding all the way
+until the very top of the screen. This likely means having to use `ratatui` and alternate screen
+mode, which in and of itself means a lot of UI work. Initially, and to test out the library, it'd be
+best if the binary didn't launch any UI, but rather used `crossterm` without alternate screen mode
+enabled but with raw mode enabled. Then, the prompt would be displayed right after the line to
+launch the command in the user's shell, and the list of constants that got filtered would appear
+right below the prompt. The list would be refreshed every 1 second after the last keypress, which
+should yield relatively simple rendering logic at the cost of snapyness.
