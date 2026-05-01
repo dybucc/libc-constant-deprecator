@@ -188,4 +188,4 @@ best if the binary didn't launch any UI, but rather used `crossterm` without alt
 enabled but with raw mode enabled. Then, the prompt would be displayed right after the line to
 launch the command in the user's shell, and the list of constants that got filtered would appear
 right below the prompt. The list would be refreshed every 1 second after the last keypress, which
-should yield relatively simple rendering logic at the cost of snapyness.
+should yield relatively simple rendering logic at the cost of snappyness.

@@ -21,14 +21,33 @@ pub(crate) struct Args {
 #[non_exhaustive]
 pub(crate) struct State {
     events: UnboundedReceiver<RawUserEvent>,
+    mode: Mode,
 }
 
 impl State {
-    pub(crate) fn new(events_channel: UnboundedReceiver<RawUserEvent>) -> Self {
-        Self {
-            events: events_channel,
-        }
+    pub(crate) fn new() -> (Self, UnboundedSender<RawUserEvent>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        (
+            Self {
+                events: rx,
+                mode: Mode::default(),
+            },
+            tx,
+        )
     }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct Mode {
+    repr: ModeRepr,
+}
+
+#[derive(Debug, Default)]
+pub(crate) enum ModeRepr {
+    Insert,
+    #[default]
+    Normal,
 }
 
 #[derive(Debug)]
@@ -57,8 +76,8 @@ impl RawUserEvent {
 pub(crate) enum RawUserEventRepr {
     PlainText(char),
     Return,
-    ShiftReturn,
     Space,
+    ShiftReturn,
     Escape,
 }
 
@@ -79,21 +98,25 @@ pub(crate) enum UserEventRepr {
     Clear,
 }
 
-#[expect(clippy::unused_async, reason = "WIP.")]
+#[expect(clippy::unused_async, unused, reason = "WIP.")]
 pub(crate) async fn render(constants: ConstContainer, state: State) -> anyhow::Result<()> {
-    // Every time the rendering loop iterates, it ought send the current state of
-    // affairs within `state`, which contains information on the current input mode
-    // (either insert or normal mode.)
     loop {
-        let State { events, .. } = &mut state;
+        let State { events, mode, .. } = &mut state;
 
+        // This is the part of the state machine that determines whether we should
+        // transition to another state.
         match events.try_recv().map(|RawUserEvent { repr }| repr) {
             Ok(RawUserEventRepr::PlainText(c)) => todo!(),
             Ok(RawUserEventRepr::Return) => todo!(),
             Ok(RawUserEventRepr::ShiftReturn) => todo!(),
             Ok(RawUserEventRepr::Space) => todo!(),
             Ok(RawUserEventRepr::Escape) => todo!(),
-            Err(TryRecvError::Empty) => (),
+            Err(TryRecvError::Empty) => {
+                // If no new events have taken place, we display the same screen
+                // state. The last state can one of the
+                // following:
+                // + The screen has some constants displayed on it,
+            }
             Err(TryRecvError::Disconnected) => break,
         }
     }
@@ -101,7 +124,7 @@ pub(crate) async fn render(constants: ConstContainer, state: State) -> anyhow::R
     Ok(())
 }
 
-#[expect(clippy::unused_async, reason = "WIP.")]
+#[expect(clippy::unused_async, unused, reason = "WIP.")]
 pub(crate) async fn handle_input(channel: UnboundedSender<RawUserEvent>) -> anyhow::Result<()> {
     let mut event_stream = EventStream::new().fuse();
 
@@ -150,10 +173,7 @@ async fn main() -> anyhow::Result<()> {
     task::spawn_blocking(terminal::enable_raw_mode).await??;
 
     let mut parsed_constants = libc_constant_deprecator_lib::parse_constants(&files);
-
-    let (events_tx, events_rx) = mpsc::unbounded_channel();
-
-    let mut state = State::new(events_rx);
+    let (mut state, events_tx) = State::new();
 
     let input_handler = task::spawn(handle_input(events_tx));
     let renderer = task::spawn(render(parsed_constants, state));
