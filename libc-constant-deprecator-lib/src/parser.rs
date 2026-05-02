@@ -2,11 +2,9 @@ use std::path::Path;
 
 use syn::{Item, ItemConst, ItemMacro, Macro};
 
-use crate::{Const, ConstContainer, SourceFile};
+use crate::{Const, ConstContainer, MacroParser, SourceFile};
 
 pub(crate) mod macro_parser;
-
-pub(crate) use macro_parser::MacroParser;
 
 /// Parses constants provided a collection of [`SourceFile`]s yield from
 /// [`scan_files()`].
@@ -50,7 +48,6 @@ pub fn parse_constants(files: &[SourceFile]) -> ConstContainer {
     ))
 }
 
-#[inline]
 pub(crate) fn process_constant(constant: &ItemConst, source: impl AsRef<Path>) -> Vec<Const> {
     vec![Const::from_item(
         constant.clone(),

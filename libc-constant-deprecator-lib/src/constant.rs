@@ -35,15 +35,12 @@ macro_rules! impl_doc {
 /// of a proc-macro. This crate is not a proc-macro, so we can trust the `Ident`
 /// type is _not_ the thread-unsafe variant in the `proc_macro`
 /// compiler-provided crate.
-            unsafe impl $it for Const {}
+unsafe impl $it for Const {}
         )+
     };
 }
 
-impl_doc! {
-    Send
-    Sync
-}
+impl_doc! { Send Sync }
 
 impl Const {
     pub(crate) fn from_item(item: ItemConst, source: PathBuf) -> Self {
@@ -59,7 +56,6 @@ impl Const {
         }
     }
 
-    #[inline]
     pub(crate) fn deprecated(&mut self, yes: bool) {
         self.deprecated = yes;
     }

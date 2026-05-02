@@ -29,6 +29,7 @@ pub(crate) use deprecate;
     )
 )]
 pub(crate) use crate::errors::*;
+pub(crate) use crate::parser::macro_parser::MacroParser;
 #[doc(inline)]
 pub use crate::{
     constant::Const,

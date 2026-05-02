@@ -18,21 +18,6 @@ pub struct BorrowedContainer<'a> {
     pub(crate) init_state: Vec<bool>,
 }
 
-impl BorrowedContainer<'_> {
-    pub(crate) fn new() -> Self {
-        Self {
-            source: Vec::new(),
-            init_state: Vec::new(),
-        }
-    }
-}
-
-impl Default for BorrowedContainer<'_> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl<'a> BorrowedContainer<'a> {
     pub(crate) fn from_container(container: Vec<&'a mut (Const, bool)>) -> Self {
         Self {

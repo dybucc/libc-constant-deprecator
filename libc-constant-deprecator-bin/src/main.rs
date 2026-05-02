@@ -106,9 +106,12 @@ pub(crate) enum UserEventRepr {
 
 #[expect(clippy::unused_async, unused, reason = "WIP.")]
 pub(crate) async fn render(constants: ConstContainer, mut state: State) -> anyhow::Result<()> {
-    loop {
-        draw_screen();
+    let mut filter_buf = constants.borrowed_container();
 
+    loop {
+        let mut constants = constants.filter_with(".*", &mut filter_buf);
+
+        draw_screen();
         update();
     }
 }

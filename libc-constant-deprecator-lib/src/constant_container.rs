@@ -17,33 +17,24 @@ pub(crate) mod borrowed;
 #[derive(Debug)]
 pub struct ConstContainer {
     pub(crate) inner: Vec<(Const, bool)>,
+    // NOTE: this uses an unbounded cache for prior computed regexes, in the hopes that full
+    // regexes that get submitted to the `ConstContainer` are "human-paced" (i.e. they aren't
+    // coming at such speed as to cause issues with memory consumption.)
     pub(crate) re_cache: HashMap<String, Regex>,
 }
 
 macro_rules! filter_impl {
-    (@filter_with proto => $body:expr) => {
-        pub fn filter_with<'a>(
-            &'a mut self,
-            re: impl AsRef<str>,
-            borrowed_container: &mut BorrowedContainer<'a>,
-        ) -> Result<(), FilterError> {
-            $body
-        }
-    };
-    (@filter proto => $body:expr) => {
-        pub fn filter(
-            &mut self,
-            re: impl AsRef<str>,
-        ) -> Result<BorrowedContainer<'_>, FilterError> {
-            $body
-        }
-    };
     (@doc filter_with) => {
         "This routine does not allocate a new container for the borrowed view, instead reusing the \
          provided one."
     };
     (@doc filter) => {
         ""
+    };
+    // This branch is required for `rustfmt` not to disambiguate and then further remove a docstring
+    // containing solely a line feed.
+    (@nl) => {
+        "\n"
     };
     (@doc $it:tt { $f:item }) => {
         /// Filters out constants by identifier provided a regex matching against
@@ -53,6 +44,8 @@ macro_rules! filter_impl {
         /// constants at once, and remembers which constants have been modified to
         /// only effect those changes to disk later on.
         #[doc = filter_impl! { @doc $it }]
+        #[doc = filter_impl! { @nl } ]
+        #[doc = filter_impl! { @nl } ]
         /// # Errors
         ///
         /// Fails if the regex failed to compile. This may be due to a byte size
@@ -60,27 +53,44 @@ macro_rules! filter_impl {
         /// regex syntax level.
         $f
     };
-    (@body $it:tt) => {{
-        let ConstContainer { inner, re_cache } = self;
-        let re = probe_re(re, re_cache)?;
-        let iter = inner
+    (@body $it:tt => $self:expr, $re:expr, $iter:expr) => {
+        let ConstContainer { inner, re_cache } = $self;
+        let re = probe_re($re, re_cache)?;
+        $iter = inner
             .iter_mut()
             .filter(|(constant, _)| re.is_match(constant.ident.to_string().as_bytes()));
-
-        Ok(filter_impl! { @$it => iter })
-    }};
-    (@filter_with => $iter:expr) => {
-        iter.collect_into(borrowed_container.buf())
+    };
+    (@filter_with => $iter:expr, $borrowed:expr) => {
+        _ = $iter.collect_into($borrowed.buffer())
     };
     (@filter => $iter:expr) => {
-        iter.collect()
+        $iter.collect()
     };
     () => {
         filter_impl! { @doc filter_with {
-            filter_impl! { @filter_with proto => filter_impl! { @body filter_with } }
+            pub fn filter_with<'a>(
+                &'a mut self,
+                re: impl AsRef<str>,
+                borrowed_container: &mut BorrowedContainer<'a>,
+            ) -> Result<(), FilterError> {
+                let iter;
+                filter_impl! { @body filter_with => self, re, iter }
+
+                Ok(filter_impl! { @filter_with => iter, borrowed_container })
+            }
         } }
         filter_impl! { @doc filter {
-            filter_impl! { @filter proto => filter_impl! { @body filter } }
+            pub fn filter(
+                &mut self,
+                re: impl AsRef<str>,
+            ) -> Result<BorrowedContainer<'_>, FilterError> {
+                let iter;
+                filter_impl! { @body filter => self, re, iter }
+
+                Ok(BorrowedContainer::from_container(
+                    filter_impl! { @filter => iter },
+                ))
+            }
         } }
     };
 }
@@ -103,73 +113,31 @@ impl ConstContainer {
         }
     }
 
-    /// Returns an empty, borrowed container that can be reused across calls to
-    /// `filter_with()`.
+    /// Returns a borrowed container that can be reused across calls to
+    /// [`filter_with()`].
     ///
     /// This can be paired up with `filter_with()`, which is a more efficient
-    /// alternative to `filter()`, as it will reuse a given borrowed view
-    /// instead of allocating a new view.
-    #[expect(
-        clippy::must_use_candidate,
-        reason = "It's not a bug not to use the result of this routine."
-    )]
-    pub fn borrowed_container(&self) -> BorrowedContainer<'_> {
-        BorrowedContainer::new()
+    /// alternative to [`filter()`], as it will reuse a given borrowed view
+    /// instead of allocating a new one.
+    ///
+    /// The reason why there's two and not just one of these filtering routines
+    /// is that there's a tradeoff in allocations and potential allocations.
+    /// `filter_with()` requires a borrowed container, which may be obtained
+    /// through either one of `filter()`'s allocated container, or
+    /// `borrowed_container()`. If sourced from the former, the container may
+    /// reallocate if some future filtering operation requires resolving a
+    /// larger amount of constants. If sourced from the latter, the container is
+    /// guaranteed to never reallocate as it will always have a capacity
+    /// equivalent to that of a borrowed container returned by a filtering
+    /// operation with an input regex `.*`.
+    ///
+    /// [`filter_with()`]: `crate::ConstContainer::filter_with()`
+    /// [`filter()`]: `crate::ConstContainer::filter()`
+    pub fn borrowed_container(&mut self) -> BorrowedContainer<'_> {
+        BorrowedContainer::from_container(self.inner.iter_mut().collect())
     }
 
     filter_impl! {}
-
-    /// Filters out constants by identifier provided a regex matching against
-    /// those identifiers.
-    ///
-    /// Returns a borrowed container that can bulk deprecate the matched
-    /// constants at once, and remembers which constants have been modified to
-    /// only effect those changes to disk later on.
-    ///
-    /// # Errors
-    ///
-    /// Fails if the regex failed to compile. This may be due to a byte size
-    /// failure at the regex engine level, or due to a parsing failure at the
-    /// regex syntax level.
-    // pub fn filter_with<'a>(
-    //     &'a mut self,
-    //     re: impl AsRef<str>,
-    //     borrowed_container: &mut BorrowedContainer<'a>,
-    // ) -> Result<(), FilterError> {
-    //     let ConstContainer { inner, re_cache } = self;
-    //     let re = probe_re(re, re_cache)?;
-
-    //     inner
-    //         .iter_mut()
-    //         .filter(|(constant, _)| re.is_match(constant.ident.to_string().as_bytes()))
-    //         .collect_into(borrowed_container.buffer());
-
-    //     Ok(())
-    // }
-
-    /// Filters out constants by identifier provided a regex matching against
-    /// those identifiers.
-    ///
-    /// Returns a borrowed container that can bulk deprecate the matched
-    /// constants at once, and remembers which constants have been modified to
-    /// only effect those changes to disk later on.
-    ///
-    /// # Errors
-    ///
-    /// Fails if the regex failed to compile. This may be due to a byte size
-    /// failure at the regex engine level, or due to a parsing failure at the
-    /// regex syntax level.
-    // pub fn filter(&mut self, re: impl AsRef<str>) -> Result<BorrowedContainer<'_>, FilterError> {
-    //     let Self { inner, re_cache } = self;
-    //     let re = probe_re(re, re_cache)?;
-
-    //     Ok(BorrowedContainer::from_container(
-    //         inner
-    //             .iter_mut()
-    //             .filter(|(constant, _)| re.is_match(constant.ident.to_string().as_bytes()))
-    //             .collect(),
-    //     ))
-    // }
 
     /// Effects the changes registered thus far over the parsed constants to the
     /// on-disk `libc` codebase.
@@ -180,8 +148,7 @@ impl ConstContainer {
     ///
     /// Note this makes changes to the current codebase, and attempts to keep
     /// the rewritten files fairly well-behaved when it comes to formatting
-    /// guarantees when _manually_ running `rustfmt` _afterwards_ on the
-    /// codebase.
+    /// guarantees when _manually_ running `rustfmt` on the codebase.
     ///
     /// # Errors
     ///
@@ -320,10 +287,7 @@ pub(crate) fn probe_re(
                 regex::Error::CompiledTooBig(_) => {
                     FilterErrorRepr::RegexTooBig(re.as_ref().to_owned().into())
                 }
-                _ => unimplemented!(
-                    "We currently handle all error cases of the `regex` crate. Update the handled \
-                     cases for regex errors."
-                ),
+                _ => unimplemented!("An unhandled case in the `regex::Error` type has appeared!"),
             })?,
         );
 
