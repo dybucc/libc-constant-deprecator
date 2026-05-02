@@ -20,6 +20,71 @@ pub struct ConstContainer {
     pub(crate) re_cache: HashMap<String, Regex>,
 }
 
+macro_rules! filter_impl {
+    (@filter_with proto => $body:expr) => {
+        pub fn filter_with<'a>(
+            &'a mut self,
+            re: impl AsRef<str>,
+            borrowed_container: &mut BorrowedContainer<'a>,
+        ) -> Result<(), FilterError> {
+            $body
+        }
+    };
+    (@filter proto => $body:expr) => {
+        pub fn filter(
+            &mut self,
+            re: impl AsRef<str>,
+        ) -> Result<BorrowedContainer<'_>, FilterError> {
+            $body
+        }
+    };
+    (@doc filter_with) => {
+        "This routine does not allocate a new container for the borrowed view, instead reusing the \
+         provided one."
+    };
+    (@doc filter) => {
+        ""
+    };
+    (@doc $it:tt { $f:item }) => {
+        /// Filters out constants by identifier provided a regex matching against
+        /// those identifiers.
+        ///
+        /// Returns a borrowed container that can bulk deprecate the matched
+        /// constants at once, and remembers which constants have been modified to
+        /// only effect those changes to disk later on.
+        #[doc = filter_impl! { @doc $it }]
+        /// # Errors
+        ///
+        /// Fails if the regex failed to compile. This may be due to a byte size
+        /// failure at the regex engine level, or due to a parsing failure at the
+        /// regex syntax level.
+        $f
+    };
+    (@body $it:tt) => {{
+        let ConstContainer { inner, re_cache } = self;
+        let re = probe_re(re, re_cache)?;
+        let iter = inner
+            .iter_mut()
+            .filter(|(constant, _)| re.is_match(constant.ident.to_string().as_bytes()));
+
+        Ok(filter_impl! { @$it => iter })
+    }};
+    (@filter_with => $iter:expr) => {
+        iter.collect_into(borrowed_container.buf())
+    };
+    (@filter => $iter:expr) => {
+        iter.collect()
+    };
+    () => {
+        filter_impl! { @doc filter_with {
+            filter_impl! { @filter_with proto => filter_impl! { @body filter_with } }
+        } }
+        filter_impl! { @doc filter {
+            filter_impl! { @filter proto => filter_impl! { @body filter } }
+        } }
+    };
+}
+
 impl ConstContainer {
     pub(crate) const MAX_RE_POWER: u8 = 20;
 
@@ -38,6 +103,22 @@ impl ConstContainer {
         }
     }
 
+    /// Returns an empty, borrowed container that can be reused across calls to
+    /// `filter_with()`.
+    ///
+    /// This can be paired up with `filter_with()`, which is a more efficient
+    /// alternative to `filter()`, as it will reuse a given borrowed view
+    /// instead of allocating a new view.
+    #[expect(
+        clippy::must_use_candidate,
+        reason = "It's not a bug not to use the result of this routine."
+    )]
+    pub fn borrowed_container(&self) -> BorrowedContainer<'_> {
+        BorrowedContainer::new()
+    }
+
+    filter_impl! {}
+
     /// Filters out constants by identifier provided a regex matching against
     /// those identifiers.
     ///
@@ -50,48 +131,52 @@ impl ConstContainer {
     /// Fails if the regex failed to compile. This may be due to a byte size
     /// failure at the regex engine level, or due to a parsing failure at the
     /// regex syntax level.
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "The panic code path is (at the time of writing) impossible to reach."
-    )]
-    pub fn filter(&mut self, re: impl AsRef<str>) -> Result<BorrowedContainer<'_>, FilterError> {
-        let Self { inner, re_cache } = self;
+    // pub fn filter_with<'a>(
+    //     &'a mut self,
+    //     re: impl AsRef<str>,
+    //     borrowed_container: &mut BorrowedContainer<'a>,
+    // ) -> Result<(), FilterError> {
+    //     let ConstContainer { inner, re_cache } = self;
+    //     let re = probe_re(re, re_cache)?;
 
-        let re = if let Some(re) = re_cache.get(re.as_ref()) {
-            re
-        } else {
-            re_cache.insert(
-                re.as_ref().to_string(),
-                build_re(&re).map_err(|err| match err {
-                    regex::Error::Syntax(_) => {
-                        FilterErrorRepr::RegexSyntax(re.as_ref().to_owned().into())
-                    }
-                    regex::Error::CompiledTooBig(_) => {
-                        FilterErrorRepr::RegexTooBig(re.as_ref().to_owned().into())
-                    }
-                    _ => unimplemented!(
-                        "We currently handle all error cases of the `regex` crate. Hitting this \
-                         error condition should be reported to the maintainers."
-                    ),
-                })?,
-            );
+    //     inner
+    //         .iter_mut()
+    //         .filter(|(constant, _)| re.is_match(constant.ident.to_string().as_bytes()))
+    //         .collect_into(borrowed_container.buffer());
 
-            re_cache.get(re.as_ref()).unwrap()
-        };
+    //     Ok(())
+    // }
 
-        Ok(BorrowedContainer::new(
-            inner
-                .iter_mut()
-                .filter(|(constant, _)| re.is_match(constant.ident.to_string().as_bytes()))
-                .collect(),
-        ))
-    }
+    /// Filters out constants by identifier provided a regex matching against
+    /// those identifiers.
+    ///
+    /// Returns a borrowed container that can bulk deprecate the matched
+    /// constants at once, and remembers which constants have been modified to
+    /// only effect those changes to disk later on.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the regex failed to compile. This may be due to a byte size
+    /// failure at the regex engine level, or due to a parsing failure at the
+    /// regex syntax level.
+    // pub fn filter(&mut self, re: impl AsRef<str>) -> Result<BorrowedContainer<'_>, FilterError> {
+    //     let Self { inner, re_cache } = self;
+    //     let re = probe_re(re, re_cache)?;
+
+    //     Ok(BorrowedContainer::from_container(
+    //         inner
+    //             .iter_mut()
+    //             .filter(|(constant, _)| re.is_match(constant.ident.to_string().as_bytes()))
+    //             .collect(),
+    //     ))
+    // }
 
     /// Effects the changes registered thus far over the parsed constants to the
     /// on-disk `libc` codebase.
     ///
     /// This is a no-op if no constants have been changed, as the implementation
-    /// will only write to disk whichever constants have been marked deprecated.
+    /// will only write to disk whichever constants have had their deprecation
+    /// status modified.
     ///
     /// Note this makes changes to the current codebase, and attempts to keep
     /// the rewritten files fairly well-behaved when it comes to formatting
@@ -200,7 +285,7 @@ impl ConstContainer {
 
         // NOTE: we cleanly shut down the tasks instead of just aborting them by letting
         // the task pool drop because we're handling the FS in each task, and it's best
-        // to safe than sorry.
+        // to be safe than to be sorry.
         while let Some(res) = task_pool.join_next().await {
             if let Err(err) | Ok(Err(err)) = res
                 .map_err(Into::into)
@@ -215,6 +300,37 @@ impl ConstContainer {
 
         Ok(())
     }
+}
+
+pub(crate) fn probe_re(
+    re: impl AsRef<str>,
+    cache: &mut HashMap<String, Regex>,
+) -> Result<&Regex, FilterError> {
+    // NOTE: Yes, this is ugly and could be made into an `if-let`, but borrowck
+    // complains that the shared reference we get in the condition with
+    // `cache.get()` makes it impossible to fetch an exclusive reference in the
+    // `else` branch.
+    if cache.get(re.as_ref()).is_none() {
+        cache.insert(
+            re.as_ref().to_string(),
+            build_re(&re).map_err(|err| match err {
+                regex::Error::Syntax(_) => {
+                    FilterErrorRepr::RegexSyntax(re.as_ref().to_owned().into())
+                }
+                regex::Error::CompiledTooBig(_) => {
+                    FilterErrorRepr::RegexTooBig(re.as_ref().to_owned().into())
+                }
+                _ => unimplemented!(
+                    "We currently handle all error cases of the `regex` crate. Update the handled \
+                     cases for regex errors."
+                ),
+            })?,
+        );
+
+        return Ok(cache.get(re.as_ref()).unwrap());
+    }
+
+    Ok(cache.get(re.as_ref()).unwrap())
 }
 
 pub(crate) fn build_re(re: impl AsRef<str>) -> Result<Regex, regex::Error> {

@@ -8,7 +8,7 @@ use crossterm::{
 use futures::{StreamExt, future};
 use libc_constant_deprecator_lib::ConstContainer;
 use tokio::{
-    sync::mpsc::{self, UnboundedReceiver, UnboundedSender, error::TryRecvError},
+    sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
     task,
 };
 
@@ -41,6 +41,12 @@ impl State {
 #[derive(Debug, Default)]
 pub(crate) struct Mode {
     repr: ModeRepr,
+}
+
+impl Mode {
+    pub(crate) fn repr(&self) -> &ModeRepr {
+        &self.repr
+    }
 }
 
 #[derive(Debug, Default)]
@@ -99,32 +105,14 @@ pub(crate) enum UserEventRepr {
 }
 
 #[expect(clippy::unused_async, unused, reason = "WIP.")]
-pub(crate) async fn render(constants: ConstContainer, state: State) -> anyhow::Result<()> {
+pub(crate) async fn render(constants: ConstContainer, mut state: State) -> anyhow::Result<()> {
     loop {
-        let State { events, mode, .. } = &mut state;
+        draw_screen();
 
-        // This is the part of the state machine that determines whether we should
-        // transition to another state.
-        match events.try_recv().map(|RawUserEvent { repr }| repr) {
-            Ok(RawUserEventRepr::PlainText(c)) => todo!(),
-            Ok(RawUserEventRepr::Return) => todo!(),
-            Ok(RawUserEventRepr::ShiftReturn) => todo!(),
-            Ok(RawUserEventRepr::Space) => todo!(),
-            Ok(RawUserEventRepr::Escape) => todo!(),
-            Err(TryRecvError::Empty) => {
-                // If no new events have taken place, we display the same screen
-                // state. The last state can one of the
-                // following:
-                // + The screen has some constants displayed on it,
-            }
-            Err(TryRecvError::Disconnected) => break,
-        }
+        update();
     }
-
-    Ok(())
 }
 
-#[expect(clippy::unused_async, unused, reason = "WIP.")]
 pub(crate) async fn handle_input(channel: UnboundedSender<RawUserEvent>) -> anyhow::Result<()> {
     let mut event_stream = EventStream::new().fuse();
 
@@ -172,14 +160,17 @@ async fn main() -> anyhow::Result<()> {
 
     task::spawn_blocking(terminal::enable_raw_mode).await??;
 
-    let mut parsed_constants = libc_constant_deprecator_lib::parse_constants(&files);
-    let (mut state, events_tx) = State::new();
+    let parsed_constants = libc_constant_deprecator_lib::parse_constants(&files);
+    let (state, events_tx) = State::new();
 
     let input_handler = task::spawn(handle_input(events_tx));
     let renderer = task::spawn(render(parsed_constants, state));
 
     match future::try_join(input_handler, renderer).await? {
-        (Err(err), _) | (_, Err(err)) => Err(err),
+        (Err(err), _) | (_, Err(err)) => {
+            task::spawn_blocking(terminal::disable_raw_mode).await??;
+            Err(err)
+        }
         _ => Ok(()),
     }
 }

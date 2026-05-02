@@ -4,18 +4,37 @@ use crate::Const;
 /// a single, contiguous container of its own.
 ///
 /// This is produced as part of [`filter()`]ing [`Const`]s in a
-/// [`ConstContainer`].
+/// [`ConstContainer`], or by calling [`ConstContainer::borrowed_container()`],
+/// which should yield an empty borrowed view that can be reused with
+/// [`filter_with()`].
 ///
 /// [`filter()`]: `crate::ConstContainer::filter()`
 /// [`ConstContainer`]: `crate::ConstContainer`
+/// [`ConstContainer::borrowed_container()`]: `crate::ConstContainer::borrowed_container()`
+/// [`filter_with()`]: `crate::ConstContainer::filter_with()`
 #[derive(Debug)]
 pub struct BorrowedContainer<'a> {
     pub(crate) source: Vec<&'a mut (Const, bool)>,
     pub(crate) init_state: Vec<bool>,
 }
 
+impl BorrowedContainer<'_> {
+    pub(crate) fn new() -> Self {
+        Self {
+            source: Vec::new(),
+            init_state: Vec::new(),
+        }
+    }
+}
+
+impl Default for BorrowedContainer<'_> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<'a> BorrowedContainer<'a> {
-    pub(crate) fn new(container: Vec<&'a mut (Const, bool)>) -> Self {
+    pub(crate) fn from_container(container: Vec<&'a mut (Const, bool)>) -> Self {
         Self {
             init_state: container
                 .iter()
@@ -23,6 +42,10 @@ impl<'a> BorrowedContainer<'a> {
                 .collect(),
             source: container,
         }
+    }
+
+    pub(crate) fn buffer<'b>(&'b mut self) -> &'b mut Vec<&'a mut (Const, bool)> {
+        &mut self.source
     }
 }
 
