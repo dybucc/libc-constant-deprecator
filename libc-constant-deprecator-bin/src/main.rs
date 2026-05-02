@@ -1,3 +1,5 @@
+#![expect(unused, reason = "WIP.")]
+
 use std::{env, path::PathBuf};
 
 use clap::Parser;
@@ -6,7 +8,7 @@ use crossterm::{
     terminal,
 };
 use futures::{StreamExt, future};
-use libc_constant_deprecator_lib::ConstContainer;
+use libc_constant_deprecator_lib::{BorrowedContainer, ConstContainer};
 use tokio::{
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
     task,
@@ -68,6 +70,23 @@ impl UserEvent {
 }
 
 #[derive(Debug)]
+pub(crate) enum UserEventRepr {
+    // Corresponds with plain text user input at the prompt.
+    TextualInput(String),
+    // Is triggered with the return key and should trigger a filtering event with the last saved
+    // regex input at the prompt.
+    Search,
+    // Is triggered with the space key and should toggle all selected constants' state to
+    // "deprecated", unless all selected constants are already deprecated, in which case it should
+    // undeprecate.
+    Toggle,
+    // Is triggered with the shift + return combo and should effect the changes to disk.
+    Effect,
+    // Is triggered with the escape key and should clear the currently input regex.
+    Clear,
+}
+
+#[derive(Debug)]
 pub(crate) struct RawUserEvent {
     repr: RawUserEventRepr,
 }
@@ -87,34 +106,20 @@ pub(crate) enum RawUserEventRepr {
     Escape,
 }
 
-#[derive(Debug)]
-pub(crate) enum UserEventRepr {
-    // Corresponds with plain text user input at the prompt.
-    TextualInput(String),
-    // Is triggered with the return key and should trigger a filtering event with the last saved
-    // regex input at the prompt.
-    Search,
-    // Is triggered with the space key and should toggle all selected constants' state to
-    // "deprecated", unless all selected constants are already deprecated, in which case it should
-    // undeprecate.
-    Toggle,
-    // Is triggered with the shift + return combo and should effect the changes to disk.
-    Effect,
-    // Is triggered with the escape key and should clear the currently input regex.
-    Clear,
-}
-
 #[expect(clippy::unused_async, unused, reason = "WIP.")]
-pub(crate) async fn render(constants: ConstContainer, mut state: State) -> anyhow::Result<()> {
+pub(crate) async fn render(mut constants: ConstContainer, mut state: State) -> anyhow::Result<()> {
     let mut filter_buf = constants.borrowed_container();
 
     loop {
-        let mut constants = constants.filter_with(".*", &mut filter_buf);
-
-        draw_screen();
+        constants.filter_with("", &mut filter_buf);
+        draw_screen(&mut filter_buf, &mut state);
         update();
     }
 }
+
+pub(crate) fn draw_screen(buf: &mut BorrowedContainer, state: &mut State) {}
+
+pub(crate) fn update() {}
 
 pub(crate) async fn handle_input(channel: UnboundedSender<RawUserEvent>) -> anyhow::Result<()> {
     let mut event_stream = EventStream::new().fuse();
