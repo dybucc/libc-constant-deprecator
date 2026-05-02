@@ -158,6 +158,12 @@ pub(crate) async fn handle_input(channel: UnboundedSender<RawUserEvent>) -> anyh
     Ok(())
 }
 
+pub(crate) fn prepare_screen() -> anyhow::Result<()> {
+    todo!();
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let files = if let Some(path) = Args::parse().path {
@@ -170,6 +176,8 @@ async fn main() -> anyhow::Result<()> {
 
     let parsed_constants = libc_constant_deprecator_lib::parse_constants(&files);
     let (state, events_tx) = State::new();
+
+    prepare_screen()?;
 
     let input_handler = task::spawn(handle_input(events_tx));
     let renderer = task::spawn(render(parsed_constants, state));
