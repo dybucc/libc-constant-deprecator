@@ -1,11 +1,16 @@
 #![expect(unused, reason = "WIP.")]
 
-use std::{env, path::PathBuf};
+use std::{
+    env,
+    io::{self, Write},
+    path::PathBuf,
+};
 
 use clap::Parser;
 use crossterm::{
+    cursor::{self, MoveToNextLine, MoveToRow, SetCursorStyle},
     event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers},
-    terminal,
+    terminal::{self, Clear, ClearType},
 };
 use futures::{StreamExt, future};
 use libc_constant_deprecator_lib::{BorrowedContainer, ConstContainer};
@@ -159,10 +164,31 @@ pub(crate) async fn handle_input(channel: UnboundedSender<RawUserEvent>) -> anyh
 }
 
 pub(crate) fn prepare_screen() -> anyhow::Result<()> {
-    todo!();
+    let (rows, _) = terminal::size()?;
+    let (current_row, _) = cursor::position()?;
+
+    let mut stdout = io::stdout().lock();
+
+    crossterm::queue!(stdout, SetCursorStyle::SteadyBlock)?;
+
+    // NOTE: we must make space for one row for the prompt, and ten rows for the
+    // list of constants currently being displayed. The reason why we use one more
+    // unit in the result of the difference than in the command to set the row is
+    // due to the fact `rows` is 1-indexed, while `current_row` is 0-indexed.
+    if rows - current_row < 12 {
+        crossterm::queue!(stdout, MoveToRow(current_row - 11))?;
+        crossterm::queue!(stdout, Clear(ClearType::FromCursorDown))?;
+        crossterm::queue!(stdout, MoveToNextLine(1))?;
+    }
+
+    stdout.flush()?;
 
     Ok(())
 }
+
+// FIXME: disable raw mode on fallible expressions beyond those that come before
+// it's enabled and while enabling it. This could benefit from the `defer_drm`
+// proc-macro that we developed in the `tester-impl` crate for `tester`.
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -177,7 +203,7 @@ async fn main() -> anyhow::Result<()> {
     let parsed_constants = libc_constant_deprecator_lib::parse_constants(&files);
     let (state, events_tx) = State::new();
 
-    prepare_screen()?;
+    task::spawn_blocking(prepare_screen).await??;
 
     let input_handler = task::spawn(handle_input(events_tx));
     let renderer = task::spawn(render(parsed_constants, state));
