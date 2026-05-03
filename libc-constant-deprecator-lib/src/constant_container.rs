@@ -17,25 +17,20 @@ pub(crate) mod borrowed;
 
 #[derive(Debug)]
 pub struct ConstContainer {
-    pub(crate) inner: Vec<Arc<(Const, bool)>>,
+    inner: Vec<Arc<(Const, bool)>>,
     // NOTE: this uses an unbounded cache for prior computed regexes, in the hopes that full
-    // regexes that get submitted to the `ConstContainer` are "human-paced" (i.e. they aren't
+    // regexes that get submitted to `ConstContainer::filter()` are "human-paced" (i.e. they aren't
     // coming at such speed and volume as to cause issues with memory consumption.)
-    pub(crate) re_cache: HashMap<String, Regex>,
+    re_cache: HashMap<String, Regex>,
 }
 
 macro_rules! filter_impl {
     (@doc filter_with) => {
-        "This routine does not allocate a new container for the borrowed view, \ninstead reusing \
-         the provided one."
+        "This routine does not allocate a new container for the borrowed view,\ninstead reusing \
+         the provided one.\n\n"
     };
     (@doc filter) => {
         ""
-    };
-    // This subtree is required for `rustfmt` not to disambiguate and then further remove a
-    // docstring containing solely a line feed.
-    (@nl) => {
-        "\n"
     };
     (@doc $it:tt { $f:item }) => {
         /// Filters out constants by identifier provided a regex matching against
@@ -45,8 +40,6 @@ macro_rules! filter_impl {
         /// constants at once, and remembers which constants have been modified to
         /// only effect those changes to disk later on.
         #[doc = filter_impl! { @doc $it }]
-        #[doc = filter_impl! { @nl } ]
-        #[doc = filter_impl! { @nl } ]
         /// # Errors
         ///
         /// Fails if the regex failed to compile. This may be due to a byte size
@@ -59,14 +52,13 @@ macro_rules! filter_impl {
         let re = $crate::constant_container::probe_re($re, re_cache)?;
         $iter = inner
             .iter()
-            .cloned()
             .filter(|ptr| re.is_match(ptr.0.ident.to_string().as_bytes()));
     };
     (@filter_with => $iter:expr, $borrowed:expr) => {
-        _ = $iter.collect_into($borrowed.buffer())
+        _ = $iter.map(Arc::downgrade).collect_into($borrowed.buffer())
     };
     (@filter => $iter:expr) => {
-        $iter.collect()
+        $iter.cloned().collect::<Vec<_>>()
     };
     // This subtree requires so much repetition because once it recurses to the branch that
     // generates the docstrings, the macro system seems to require the item to already be there, not
@@ -85,6 +77,7 @@ macro_rules! filter_impl {
                 Ok(filter_impl! { @filter_with => iter, borrowed_container })
             }
         } }
+
         filter_impl! { @doc filter {
             pub fn filter(
                 &mut self,
@@ -93,7 +86,7 @@ macro_rules! filter_impl {
                 let iter;
                 filter_impl! { @body filter => self, re, iter }
 
-                Ok(BorrowedContainer::from_container(filter_impl! { @filter => iter }))
+                Ok(BorrowedContainer::from_container(&filter_impl! { @filter => iter }))
             }
         } }
     };
@@ -142,7 +135,7 @@ impl ConstContainer {
         reason = "It's not a bug not to use the result of this routine."
     )]
     pub fn borrowed(&self) -> BorrowedContainer {
-        BorrowedContainer::from_container(self.inner.clone())
+        BorrowedContainer::from_container(&self.inner.clone())
     }
 
     filter_impl! {}

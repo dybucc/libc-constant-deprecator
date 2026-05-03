@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use crate::Const;
 
@@ -16,19 +16,19 @@ use crate::Const;
 /// [`filter_with()`]: `crate::ConstContainer::filter_with()`
 #[derive(Debug)]
 pub struct BorrowedContainer {
-    pub(crate) source: Vec<Arc<(Const, bool)>>,
-    pub(crate) init_state: Vec<bool>,
+    source: Vec<Weak<(Const, bool)>>,
+    init_state: Vec<bool>,
 }
 
 impl BorrowedContainer {
-    pub(crate) fn from_container(container: Vec<Arc<(Const, bool)>>) -> Self {
+    pub(crate) fn from_container(container: &[Arc<(Const, bool)>]) -> Self {
         Self {
             init_state: container.iter().map(|ptr| ptr.1).collect(),
-            source: container,
+            source: container.iter().map(Arc::downgrade).collect(),
         }
     }
 
-    pub(crate) fn buffer(&mut self) -> &mut Vec<Arc<(Const, bool)>> {
+    pub(crate) fn buffer(&mut self) -> &mut Vec<Weak<(Const, bool)>> {
         &mut self.source
     }
 }
@@ -37,11 +37,12 @@ macro_rules! deprecate_impl {
     (body @deprecate) => { true };
     (body @undeprecate) => { false };
     (@body $op:tt, $self:expr) => {
-        let BorrowedContainer { source, init_state } = $self;
+        let Self { source, init_state } = $self;
 
         source
             .iter_mut()
-            .map(|ptr| unsafe { Arc::as_ptr(ptr).cast_mut().as_mut_unchecked() })
+            .map(|ptr| ptr.upgrade().map(|ptr| unsafe { Arc::as_ptr(&ptr).cast_mut().as_mut_unchecked() }))
+            .filter_map(|ptr| ptr)
             .zip(init_state)
             .for_each(|((constant, modified), init_modified)| {
                 constant.deprecated(deprecate_impl!(body @$op));
