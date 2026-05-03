@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::PathBuf;
 
 use syn::{
     Attribute, Block, Item, ItemConst, Stmt, Token,
@@ -11,20 +11,12 @@ use crate::Const;
 pub(crate) struct MacroParser(pub(crate) Vec<ItemConst>);
 
 impl MacroParser {
-    // NOTE: we don't take ownership of `source` because we're going to clone it
-    // anyway however as many times as there are elements in the underlying
-    // `ItemConst` buffer.
-    pub(crate) fn into_vec(self, source: impl AsRef<Path>) -> Vec<Const> {
-        let Self(mut buffer) = self;
+    pub(crate) fn into_iter(self, source: PathBuf) -> impl Iterator<Item = Const> {
+        let Self(buffer) = self;
 
-        (0..buffer.len()).fold(Vec::with_capacity(buffer.len()), |mut out, idx| {
-            out.push(Const::from_item(
-                buffer.swap_remove(idx),
-                source.as_ref().to_owned(),
-            ));
-
-            out
-        })
+        buffer
+            .into_iter()
+            .map(move |constant| Const::from_item(constant, source.clone()))
     }
 }
 

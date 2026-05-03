@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{iter, path::Path};
 
 use syn::{Item, ItemConst, ItemMacro, Macro};
 
@@ -21,26 +21,26 @@ pub(crate) mod macro_parser;
     reason = "It's not a bug not to use the result of this routine."
 )]
 pub fn parse_constants(files: &[SourceFile]) -> ConstContainer {
+    macro_rules! cast {
+        ($iter:expr) => {{ Box::new($iter) as Box<dyn Iterator<Item = Const>> }};
+    }
+
     ConstContainer::new(files.iter().fold(
         Vec::new(),
         |mut parsed_constants, SourceFile { inner, source }| {
-            parsed_constants.append(
-                &mut inner
+            parsed_constants.extend(
+                inner
                     .items
                     .iter()
                     .filter_map(|item| match item {
-                        Item::Const(constant) => process_constant(constant, source).into(),
+                        Item::Const(constant) => cast!(process_constant(constant, source)).into(),
                         Item::Macro(ItemMacro {
                             mac: mac @ Macro { path, .. },
                             ..
-                        }) if path.is_ident("cfg_if") => process_macro(mac, source).into(),
+                        }) if path.is_ident("cfg_if") => cast!(process_macro(mac, source)).into(),
                         _ => None,
                     })
-                    .fold(Vec::new(), |mut file_constants, mut constants| {
-                        file_constants.append(&mut constants);
-
-                        file_constants
-                    }),
+                    .flatten(),
             );
 
             parsed_constants
@@ -48,15 +48,18 @@ pub fn parse_constants(files: &[SourceFile]) -> ConstContainer {
     ))
 }
 
-pub(crate) fn process_constant(constant: &ItemConst, source: impl AsRef<Path>) -> Vec<Const> {
-    vec![Const::from_item(
+pub(crate) fn process_constant(
+    constant: &ItemConst,
+    source: impl AsRef<Path>,
+) -> impl Iterator<Item = Const> {
+    iter::once(Const::from_item(
         constant.clone(),
         source.as_ref().to_owned(),
-    )]
+    ))
 }
 
-pub(crate) fn process_macro(mac: &Macro, source: impl AsRef<Path>) -> Vec<Const> {
+pub(crate) fn process_macro(mac: &Macro, source: impl AsRef<Path>) -> impl Iterator<Item = Const> {
     mac.parse_body::<MacroParser>()
-        .expect("macro body couldn't be parsed correctly; time to check the implementation again")
-        .into_vec(source.as_ref())
+        .expect("macro body couldn't be parsed correctly; time to check the implementation")
+        .into_iter(source.as_ref().to_owned())
 }
