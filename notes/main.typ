@@ -189,3 +189,29 @@ enabled but with raw mode enabled. Then, the prompt would be displayed right aft
 launch the command in the user's shell, and the list of constants that got filtered would appear
 right below the prompt. The list would be refreshed every 1 second after the last keypress, which
 should yield relatively simple rendering logic at the cost of snappyness.
+
+Synchronization between updates to the borrowed view into the container of constant symbols, and the
+actual container should not require anything relating to atomics. There is an implicit contract
+between their types in the public interfaces of both. On the one hand, the owning container has no
+point of mutation beyond mutation through the borrowed container. There is no way of changing the
+container if it's not through the borrowed container. The fact we can fetch a borrowed container and
+also require filling the borrowed container with exclusive refences by calling a method on the
+owning container that has an exclusive reference as the receiver by no means does it break Rust's
+guarantees. Of course, executing on this scheme goes through either using interior mutability with
+reference-counted pointers, or otherwise thinking up a new strategy based on types that encode this
+implicit guarantee.
+
+I would prefer to implement the latter alternative, as that way the main change would not strictly
+be tied to the individual units being shared (i.e. the constant symbols.) The simplest
+implementation likely goes through using an `Arc`, with another `Arc` to the same allocation in the
+borrowed view for each of the constant-boolean tuples. Then, I would have to use some `unsafe` to
+get a raw pointer to the underlying data, cast it and actually manipulate the inner data.
+
+An even simpler approach might be to completely change the implementation of `BorrowedContainer`. It
+could hold indices into the overarching container, alongside flags to indicate whether they have
+been modified. The issue here would be that upon dropping the value, there would be no way of
+effecting the changes, lest some external state was altered. This would imply that the type would
+have to write to some global static its inner state, such that the ovearching container, upon
+effecting changes to disk, checked that global. This is messy, so it's probably best to go for the
+`Arc`, and use some `unsafe` to mutate the value in the borrowed container, provided a raw pointer
+to the underlying allocation.

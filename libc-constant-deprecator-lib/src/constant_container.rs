@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     ops::{Deref, DerefMut},
+    sync::Arc,
 };
 
 use regex::bytes::{Regex, RegexBuilder};
@@ -16,23 +17,23 @@ pub(crate) mod borrowed;
 
 #[derive(Debug)]
 pub struct ConstContainer {
-    pub(crate) inner: Vec<(Const, bool)>,
+    pub(crate) inner: Vec<Arc<(Const, bool)>>,
     // NOTE: this uses an unbounded cache for prior computed regexes, in the hopes that full
     // regexes that get submitted to the `ConstContainer` are "human-paced" (i.e. they aren't
-    // coming at such speed as to cause issues with memory consumption.)
+    // coming at such speed and volume as to cause issues with memory consumption.)
     pub(crate) re_cache: HashMap<String, Regex>,
 }
 
 macro_rules! filter_impl {
     (@doc filter_with) => {
-        "This routine does not allocate a new container for the borrowed view, instead reusing the \
-         provided one."
+        "This routine does not allocate a new container for the borrowed view, \ninstead reusing \
+         the provided one."
     };
     (@doc filter) => {
         ""
     };
-    // This branch is required for `rustfmt` not to disambiguate and then further remove a docstring
-    // containing solely a line feed.
+    // This subtree is required for `rustfmt` not to disambiguate and then further remove a
+    // docstring containing solely a line feed.
     (@nl) => {
         "\n"
     };
@@ -54,11 +55,12 @@ macro_rules! filter_impl {
         $f
     };
     (@body $it:tt => $self:expr, $re:expr, $iter:expr) => {
-        let ConstContainer { inner, re_cache } = $self;
-        let re = probe_re($re, re_cache)?;
+        let $crate::ConstContainer { inner, re_cache } = $self;
+        let re = $crate::constant_container::probe_re($re, re_cache)?;
         $iter = inner
-            .iter_mut()
-            .filter(|(constant, _)| re.is_match(constant.ident.to_string().as_bytes()));
+            .iter()
+            .cloned()
+            .filter(|ptr| re.is_match(ptr.0.ident.to_string().as_bytes()));
     };
     (@filter_with => $iter:expr, $borrowed:expr) => {
         _ = $iter.collect_into($borrowed.buffer())
@@ -66,12 +68,16 @@ macro_rules! filter_impl {
     (@filter => $iter:expr) => {
         $iter.collect()
     };
+    // This subtree requires so much repetition because once it recurses to the branch that
+    // generates the docstrings, the macro system seems to require the item to already be there, not
+    // requiring further macro invocations to actually resolve to an item. Otherwise, the docstrings
+    // don't get attached to it, and you get the lints against free docstrings.
     () => {
         filter_impl! { @doc filter_with {
-            pub fn filter_with<'a>(
-                &'a mut self,
+            pub fn filter_with(
+                &mut self,
                 re: impl AsRef<str>,
-                borrowed_container: &mut BorrowedContainer<'a>,
+                borrowed_container: &mut BorrowedContainer,
             ) -> Result<(), FilterError> {
                 let iter;
                 filter_impl! { @body filter_with => self, re, iter }
@@ -83,13 +89,11 @@ macro_rules! filter_impl {
             pub fn filter(
                 &mut self,
                 re: impl AsRef<str>,
-            ) -> Result<BorrowedContainer<'_>, FilterError> {
+            ) -> Result<BorrowedContainer, FilterError> {
                 let iter;
                 filter_impl! { @body filter => self, re, iter }
 
-                Ok(BorrowedContainer::from_container(
-                    filter_impl! { @filter => iter },
-                ))
+                Ok(BorrowedContainer::from_container(filter_impl! { @filter => iter }))
             }
         } }
     };
@@ -107,7 +111,7 @@ impl ConstContainer {
         Self {
             inner: inner
                 .into_iter()
-                .map(|constant| (constant, false))
+                .map(|constant| Arc::new((constant, false)))
                 .collect(),
             re_cache: HashMap::new(),
         }
@@ -133,8 +137,12 @@ impl ConstContainer {
     ///
     /// [`filter_with()`]: `crate::ConstContainer::filter_with()`
     /// [`filter()`]: `crate::ConstContainer::filter()`
-    pub fn borrowed_container(&mut self) -> BorrowedContainer<'_> {
-        BorrowedContainer::from_container(self.inner.iter_mut().collect())
+    #[expect(
+        clippy::must_use_candidate,
+        reason = "It's not a bug not to use the result of this routine."
+    )]
+    pub fn borrowed(&self) -> BorrowedContainer {
+        BorrowedContainer::from_container(self.inner.clone())
     }
 
     filter_impl! {}
@@ -155,7 +163,7 @@ impl ConstContainer {
     /// Fails if some I/O-bound operation fails while writing to disk, or if any
     /// one of (1) parsing the existing file from the codebase, or (2)
     /// formatting that file once the changes are made, fails.
-    pub async fn effect_changes(&mut self) -> Result<(), MakeChangesError> {
+    pub async fn effect_changes(&self) -> Result<(), MakeChangesError> {
         // NOTE: the pointer here is actually meant to hold a reference into a given
         // `Const`. It just so happens that `tokio`'s tasks require a `'static` lifetime
         // on the futures they run, but we have invariant references to `'static'`. This
@@ -189,7 +197,8 @@ impl ConstContainer {
 
         for constant in self
             .inner
-            .iter_mut()
+            .iter()
+            .map(|ptr| (&ptr.0, &ptr.1))
             .filter_map(|(constant, modified)| if *modified { Some(constant) } else { None })
         {
             let threaded_constant = ThreadedPtr(&raw const *constant);

@@ -113,10 +113,15 @@ pub(crate) enum RawUserEventRepr {
 
 #[expect(clippy::unused_async, unused, reason = "WIP.")]
 pub(crate) async fn render(mut constants: ConstContainer, mut state: State) -> anyhow::Result<()> {
-    let mut filter_buf = constants.borrowed_container();
+    // TODO: possibly make `BorrowedContainer` hold `Weak`s and probe into the
+    // validty of the `ConstContainer` it sources from by `upgrade()`ing and only
+    // then actually mutating. It holds that the `BorrowedContainer` we have here
+    // will never have a longer lifetime than the `ConstContainer`, but it's better
+    // to be safe than to be sorry.
+    let mut filter_buf = constants.borrowed();
 
     loop {
-        constants.filter_with("", &mut filter_buf);
+        constants.filter_with("", &mut filter_buf)?;
         draw_screen(&mut filter_buf, &mut state);
         update();
     }
@@ -163,7 +168,7 @@ pub(crate) async fn handle_input(channel: UnboundedSender<RawUserEvent>) -> anyh
     Ok(())
 }
 
-pub(crate) fn prepare_screen() -> anyhow::Result<()> {
+pub(crate) fn prepare_space() -> anyhow::Result<()> {
     let (rows, _) = terminal::size()?;
     let (current_row, _) = cursor::position()?;
 
@@ -174,7 +179,8 @@ pub(crate) fn prepare_screen() -> anyhow::Result<()> {
     // NOTE: we must make space for one row for the prompt, and ten rows for the
     // list of constants currently being displayed. The reason why we use one more
     // unit in the result of the difference than in the command to set the row is
-    // due to the fact `rows` is 1-indexed, while `current_row` is 0-indexed.
+    // due to the fact `rows` is 1-indexed, while `current_row` and `MoveToRow` are
+    // 0-indexed.
     if rows - current_row < 12 {
         crossterm::queue!(stdout, MoveToRow(current_row - 11))?;
         crossterm::queue!(stdout, Clear(ClearType::FromCursorDown))?;
@@ -203,16 +209,12 @@ async fn main() -> anyhow::Result<()> {
     let parsed_constants = libc_constant_deprecator_lib::parse_constants(&files);
     let (state, events_tx) = State::new();
 
-    task::spawn_blocking(prepare_screen).await??;
+    task::spawn_blocking(prepare_space).await??;
 
     let input_handler = task::spawn(handle_input(events_tx));
     let renderer = task::spawn(render(parsed_constants, state));
 
-    match future::try_join(input_handler, renderer).await? {
-        (Err(err), _) | (_, Err(err)) => {
-            task::spawn_blocking(terminal::disable_raw_mode).await??;
-            Err(err)
-        }
-        _ => Ok(()),
-    }
+    future::try_join(input_handler, renderer)
+        .await
+        .map(|(res1, res2)| res1.and(res2))?
 }

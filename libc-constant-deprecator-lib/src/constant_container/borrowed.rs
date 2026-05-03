@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::Const;
 
 /// Represents a borrowed view into multiple segments of a [`ConstContainer`] as
@@ -13,23 +15,20 @@ use crate::Const;
 /// [`ConstContainer::borrowed_container()`]: `crate::ConstContainer::borrowed_container()`
 /// [`filter_with()`]: `crate::ConstContainer::filter_with()`
 #[derive(Debug)]
-pub struct BorrowedContainer<'a> {
-    pub(crate) source: Vec<&'a mut (Const, bool)>,
+pub struct BorrowedContainer {
+    pub(crate) source: Vec<Arc<(Const, bool)>>,
     pub(crate) init_state: Vec<bool>,
 }
 
-impl<'a> BorrowedContainer<'a> {
-    pub(crate) fn from_container(container: Vec<&'a mut (Const, bool)>) -> Self {
+impl BorrowedContainer {
+    pub(crate) fn from_container(container: Vec<Arc<(Const, bool)>>) -> Self {
         Self {
-            init_state: container
-                .iter()
-                .map(|&&mut (_, modified)| modified)
-                .collect(),
+            init_state: container.iter().map(|ptr| ptr.1).collect(),
             source: container,
         }
     }
 
-    pub(crate) fn buffer<'b>(&'b mut self) -> &'b mut Vec<&'a mut (Const, bool)> {
+    pub(crate) fn buffer(&mut self) -> &mut Vec<Arc<(Const, bool)>> {
         &mut self.source
     }
 }
@@ -42,6 +41,7 @@ macro_rules! deprecate_impl {
 
         source
             .iter_mut()
+            .map(|ptr| unsafe { Arc::as_ptr(ptr).cast_mut().as_mut_unchecked() })
             .zip(init_state)
             .for_each(|((constant, modified), init_modified)| {
                 constant.deprecated(deprecate_impl!(body @$op));
@@ -49,11 +49,9 @@ macro_rules! deprecate_impl {
                 *modified = *init_modified == *modified;
             });
     };
-    (doc @deprecate) => { "deprecate" };
-    (doc @undeprecate) => { "undeprecate" };
     (@doc $op:tt { $it:item }) => {
     /// Bulk
-    #[doc = deprecate_impl! { doc @$op }]
+    #[doc = stringify! { $op }]
     /// all [`Const`]s gathered from the underlying [`ConstContainer`].
     ///
     /// This will mark all constants as having been modified, so long as their
@@ -64,7 +62,7 @@ macro_rules! deprecate_impl {
     $it
     };
     () => {
-        impl BorrowedContainer<'_> {
+        impl BorrowedContainer {
             deprecate_impl! { @doc deprecate {
                 pub fn deprecate(&mut self) { deprecate_impl! { @body deprecate, self } }
             } }
@@ -76,4 +74,4 @@ macro_rules! deprecate_impl {
     };
 }
 
-deprecate_impl!();
+deprecate_impl! {}
