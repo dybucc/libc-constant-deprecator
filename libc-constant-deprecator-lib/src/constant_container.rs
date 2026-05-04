@@ -193,13 +193,13 @@ impl ConstContainer {
             .iter()
             .map(|ptr| (&ptr.0, &ptr.1))
             .filter_map(|(constant, modified)| if *modified { Some(constant) } else { None })
+            .map(|constant| &raw const *constant)
+            .map(ThreadedPtr)
         {
-            let threaded_constant = ThreadedPtr(&raw const *constant);
-
             task_pool.spawn(async move {
                 // NOTE: we only extract `source` from `constant` because other fields are
                 // `!Send` and we prefer to keep that from going across await points.
-                let source = unsafe { &threaded_constant.as_ref_unchecked().source };
+                let source = unsafe { &constant.as_ref_unchecked().source };
 
                 let contents = fs::read_to_string(source).await.map_err(|inner| {
                     MakeChangesErrorRepr::IoBound(IoBoundChanges {
@@ -219,7 +219,7 @@ impl ConstContainer {
                         deprecated,
                         span: ref_span,
                         ..
-                    } = unsafe { threaded_constant.as_ref_unchecked() };
+                    } = unsafe { constant.as_ref_unchecked() };
 
                     file.items
                         .iter_mut()

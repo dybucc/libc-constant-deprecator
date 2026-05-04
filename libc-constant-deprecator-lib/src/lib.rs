@@ -3,7 +3,7 @@
 //!
 //! It is most useful when paired with the accompanying binary.
 
-#![feature(iter_collect_into)]
+#![feature(iter_collect_into, control_flow_into_value)]
 
 mod constant;
 mod constant_container;
@@ -33,7 +33,10 @@ pub(crate) use crate::parser::macro_parser::MacroParser;
 #[doc(inline)]
 pub use crate::{
     constant::Const,
-    constant_container::{ConstContainer, borrowed::BorrowedContainer},
+    constant_container::{
+        ConstContainer,
+        borrowed::{BorrowedContainer, BorrowedSubset, Visit},
+    },
     errors::{FilterError, MakeChangesError, ScanFilesError},
     parser::parse_constants,
     scanner::scan_files,

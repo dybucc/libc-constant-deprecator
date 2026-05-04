@@ -3,7 +3,7 @@
 use std::{
     env,
     io::{self, Stdout, StdoutLock, Write},
-    ops::{Deref, Range},
+    ops::{ControlFlow, Deref, Range, RangeBounds},
     path::PathBuf,
     sync::LazyLock,
 };
@@ -16,7 +16,7 @@ use crossterm::{
     terminal::{self, Clear, ClearType, DisableLineWrap},
 };
 use futures::{StreamExt, future};
-use libc_constant_deprecator_lib::{BorrowedContainer, ConstContainer};
+use libc_constant_deprecator_lib::{BorrowedContainer, Const, ConstContainer, Visit};
 use tokio::{
     process::ChildStdout,
     sync::{
@@ -53,6 +53,7 @@ impl<T> Termination<T> {
         }
     }
 
+    #[track_caller]
     pub(crate) fn into_inner(self) -> T {
         self.repr.unwrap()
     }
@@ -78,26 +79,36 @@ impl<T> TerminationRepr<T> {
 pub(crate) struct State {
     events: UnboundedReceiver<RawUserEvent>,
     mode: Mode,
+    constants: ConstContainer,
     filter_buf: BorrowedContainer,
-    // The logic here is that even if in insert mode, the last selected constant is meant to be the
-    // one that was under the cursor prior to entering insert mode. In normal mode, it is the last
-    // registered constant that was under the cursor, and in select mode it is a range that could
-    // comprise a set of values larger than 1.
+    // NOTE: the following invariant holds for the range of selected symbols:
+    // - If in normal mode, the range is empty. This, by extension, also holds when entering insert
+    //   mode though that matters not because the only actions available in insert mode are those
+    //   for switching modes and those for searching.
+    // - If in select mode, the range may be empty or not. The logic here is that it starts off
+    //   empty as it comes from normal mode, but can be extended within select mode. A consequence
+    //   of this is that range selection is reset back to an empty range once the user exits out of
+    //   select mode.
     selected: Range<usize>,
     prompt: String,
 }
 
 // NOTE: we will require modifying some of the routines here once we get to
-// implementing scrolling in the 10-row constant symbol layout.
+// implementing scrolling in the 10-row list of constant symbols.
 impl State {
-    pub(crate) fn new(borrowed_view: BorrowedContainer) -> (Self, UnboundedSender<RawUserEvent>) {
+    pub(crate) fn new(constants: ConstContainer) -> (Self, UnboundedSender<RawUserEvent>) {
         let (tx, rx) = mpsc::unbounded_channel();
 
+        // NOTE: it could be that the `Default` impl of `Range` does not produce an
+        // empty range (it should, though, because it relies on the `Default` impl of
+        // the `Idx` polymorphic parameter; A `usize` here,) so keep an eye out for that
+        // once testing starts.
         (
             Self {
                 events: rx,
                 mode: Mode::default(),
-                filter_buf: borrowed_view,
+                filter_buf: constants.borrowed(),
+                constants,
                 selected: Range::default(),
                 prompt: String::default(),
             },
@@ -105,11 +116,13 @@ impl State {
         )
     }
 
-    pub(crate) fn update(&mut self, event: Option<UserEvent>) {
+    pub(crate) async fn update(&mut self, event: Option<UserEvent>) {
         let Self {
             filter_buf,
             selected,
             prompt,
+            constants,
+            mode,
             ..
         } = self;
 
@@ -117,7 +130,33 @@ impl State {
             return;
         };
 
-        // TODO: actually get to updating the stuff.
+        if event.is_effect() {
+            constants.effect_changes().await;
+        }
+
+        if event.is_search() {}
+
+        // NOTE: because the same toggling event is used when the user is both in normal
+        // and in select mode, we have to further check if there's some active selection
+        // (i.e. the range is non-empty.) Otherwise, we act on all constants currently
+        // on display.
+        if event.is_toggle() {
+            if selected.is_empty() {
+                if all_deprecated(filter_buf) {
+                    filter_buf.undeprecate();
+                } else {
+                    filter_buf.deprecate();
+                }
+            } else {
+                let mut selected_constants = filter_buf.select(selected);
+
+                if all_deprecated(&selected_constants) {
+                    selected_constants.undeprecate();
+                } else {
+                    selected_constants.deprecate();
+                }
+            }
+        }
 
         todo!()
     }
@@ -141,6 +180,7 @@ impl State {
             filter_buf,
             selected,
             prompt,
+            ..
         } = self;
 
         crossterm::queue!(stdout, Print("> "))?;
@@ -156,48 +196,43 @@ impl State {
     }
 }
 
+fn all_deprecated(visited: &impl Visit) -> bool {
+    let mut check = true;
+
+    visited.visit(|constant| {
+        if !constant.is_deprecated() {
+            check = false;
+            return ControlFlow::Break(());
+        }
+
+        ControlFlow::Continue(())
+    });
+
+    check
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct Mode {
     repr: ModeRepr,
 }
 
+macro_rules! trivial_is_ctor {
+    ($($ctor:ident, $is:ident => $var:tt);+ ;) => {
+        $(
+            pub(crate) fn $ctor() -> Self {
+                Self { repr: ModeRepr::$var }
+            }
+
+            pub(crate) fn $is(&self) -> bool {
+                matches!(self.repr, ModeRepr::$var)
+            }
+        )+
+    };
+}
+
 impl Mode {
     fn new(repr: ModeRepr) -> Self {
         Self { repr }
-    }
-
-    pub(crate) fn kind(&self) -> ModeRepr {
-        self.repr
-    }
-
-    pub(crate) fn is_normal(&self) -> bool {
-        matches!(self.repr, ModeRepr::Normal)
-    }
-
-    pub(crate) fn is_insert(&self) -> bool {
-        matches!(self.repr, ModeRepr::Insert)
-    }
-
-    pub(crate) fn is_select(&self) -> bool {
-        matches!(self.repr, ModeRepr::Select)
-    }
-
-    pub(crate) fn normal() -> Self {
-        Self {
-            repr: ModeRepr::Normal,
-        }
-    }
-
-    pub(crate) fn insert() -> Self {
-        Self {
-            repr: ModeRepr::Insert,
-        }
-    }
-
-    pub(crate) fn select() -> Self {
-        Self {
-            repr: ModeRepr::Select,
-        }
     }
 
     pub(crate) fn interpret(&self, event: &RawUserEvent) -> Option<UserEvent> {
@@ -221,13 +256,16 @@ impl Mode {
             {
                 UserEvent::action(action).into()
             }
-            (ModeRepr::Normal, RawUserEventRepr::Return) => UserEvent::search().into(),
             (ModeRepr::Normal, RawUserEventRepr::ShiftReturn) => UserEvent::effect().into(),
             (ModeRepr::Normal, RawUserEventRepr::Escape) => UserEvent::clear().into(),
             (ModeRepr::Select, RawUserEventRepr::PlainText(c))
                 if let Some(action) = ModeAction::is_navigation(c) =>
             {
                 UserEvent::action(action).into()
+            }
+
+            (ModeRepr::Insert | ModeRepr::Normal, RawUserEventRepr::Return) => {
+                UserEvent::search().into()
             }
 
             // Toggling the deprecated state of a set of contant symbols can happen in both normal
@@ -249,6 +287,12 @@ impl Mode {
             _ => None,
         }
     }
+
+    trivial_is_ctor! {
+        normal, is_normal => Normal;
+        insert, is_insert => Insert;
+        select, is_select => Select;
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -264,9 +308,35 @@ pub(crate) struct UserEvent {
     repr: UserEventRepr,
 }
 
+macro_rules! trivial_is_ctor {
+    ($($ctor:ident, $is:ident => $var:tt);+ $(;)?) => {
+        $(
+            pub(crate) fn $ctor() -> Self {
+                Self { repr: UserEventRepr::$var }
+            }
+
+            pub(crate) fn $is(&self) -> bool {
+                matches!(self.repr, UserEventRepr::$var)
+            }
+        )+
+    };
+}
+
 impl UserEvent {
     fn new(event: UserEventRepr) -> Self {
         Self { repr: event }
+    }
+
+    pub(crate) fn text(c: char) -> Self {
+        Self {
+            repr: UserEventRepr::TextualInput(c),
+        }
+    }
+
+    pub(crate) fn action(action: ModeAction) -> Self {
+        Self {
+            repr: UserEventRepr::ModeAction(action),
+        }
     }
 
     pub(crate) fn is_text(&self) -> Option<char> {
@@ -277,22 +347,6 @@ impl UserEvent {
         }
     }
 
-    pub(crate) fn is_search(&self) -> bool {
-        matches!(self.repr, UserEventRepr::Search)
-    }
-
-    pub(crate) fn is_toggle(&self) -> bool {
-        matches!(self.repr, UserEventRepr::Toggle)
-    }
-
-    pub(crate) fn is_effect(&self) -> bool {
-        matches!(self.repr, UserEventRepr::Effect)
-    }
-
-    pub(crate) fn is_clear(&self) -> bool {
-        matches!(self.repr, UserEventRepr::Clear)
-    }
-
     pub(crate) fn is_action(&self) -> Option<&ModeAction> {
         if let UserEventRepr::ModeAction(action) = &self.repr {
             action.into()
@@ -301,40 +355,11 @@ impl UserEvent {
         }
     }
 
-    pub(crate) fn text(c: char) -> Self {
-        Self {
-            repr: UserEventRepr::TextualInput(c),
-        }
-    }
-
-    pub(crate) fn search() -> Self {
-        Self {
-            repr: UserEventRepr::Search,
-        }
-    }
-
-    pub(crate) fn toggle() -> Self {
-        Self {
-            repr: UserEventRepr::Toggle,
-        }
-    }
-
-    pub(crate) fn effect() -> Self {
-        Self {
-            repr: UserEventRepr::Effect,
-        }
-    }
-
-    pub(crate) fn clear() -> Self {
-        Self {
-            repr: UserEventRepr::Clear,
-        }
-    }
-
-    pub(crate) fn action(action: ModeAction) -> Self {
-        Self {
-            repr: UserEventRepr::ModeAction(action),
-        }
+    trivial_is_ctor! {
+        search, is_search => Search;
+        toggle, is_toggle => Toggle;
+        effect, is_effect => Effect;
+        clear, is_clear => Clear;
     }
 }
 
@@ -342,12 +367,12 @@ impl UserEvent {
 enum UserEventRepr {
     // Corresponds with plain text user input at the prompt.
     TextualInput(char),
-    // Is triggered with the return key and should trigger a filtering event with the last saved
-    // regex input at the prompt.
+    // Is triggered with the return key and should trigger a filtering event with the current
+    // contents of the prompt.
     Search,
     // Is triggered with the space key and should toggle all selected constants' state to
     // "deprecated", unless all selected constants are already deprecated, in which case it should
-    // undeprecate.
+    // undeprecate them.
     Toggle,
     // Is triggered with the shift + return combo and should effect the changes to disk.
     Effect,
@@ -468,15 +493,17 @@ pub(crate) enum RawUserEventRepr {
 
 pub(crate) static SYNC_BUF: LazyLock<Mutex<Stdout>> = LazyLock::new(|| Mutex::new(io::stdout()));
 
-pub(crate) async fn render(mut constants: ConstContainer, mut state: State) -> anyhow::Result<()> {
+pub(crate) async fn render(mut state: State) -> anyhow::Result<()> {
     let mut stdout = SYNC_BUF.lock().await;
 
     loop {
         // NOTE: there may be a better way of doing this, as I don't believe constant
-        // moves on every loop iteration are even remotely optimal.
+        // moves on every loop iteration are even remotely optimal. The reason why we
+        // have to move everything into the closure is because `tokio` requires
+        // everythin that is captured to be captured for `'static`.
         (state, stdout) = task::spawn_blocking(move || draw_screen(state, stdout)).await??;
 
-        if update(&mut state).should_terminate() {
+        if update(&mut state).await.should_terminate() {
             break Ok(());
         }
     }
@@ -491,7 +518,7 @@ pub(crate) fn draw_screen(
     Ok((state, stdout))
 }
 
-pub(crate) fn update(state: &mut State) -> Termination<()> {
+pub(crate) async fn update(state: &mut State) -> Termination<()> {
     let res = state.receive_event();
 
     if res.should_terminate() {
@@ -499,10 +526,11 @@ pub(crate) fn update(state: &mut State) -> Termination<()> {
     }
 
     // NOTE: this won't panic because the inner representation for a state of
-    // termination has already been proved to not be a termination state.
-    state.update(res.into_inner());
+    // termination has already been proved to not be a termination state by the
+    // above condition.
+    state.update(res.into_inner()).await;
 
-    todo!()
+    Termination::keep_going(())
 }
 
 pub(crate) async fn handle_input(channel: UnboundedSender<RawUserEvent>) -> anyhow::Result<()> {
@@ -538,6 +566,10 @@ pub(crate) async fn handle_input(channel: UnboundedSender<RawUserEvent>) -> anyh
 
             // The termination event, which should break out of the loop and drop the producer end
             // of the channel to have the receiver end indicate termination to the task managing it.
+            // This tries to replicate getting sent SIGINT or EOF, which are likely the most common
+            // ways of triggering relatively smooth termination in the absence of an explicit
+            // mechanism to do so. Such control sequences/signals are not available through the
+            // keyboard in raw mode.
             Event::Key(KeyEvent {
                 code: KeyCode::Char('c' | 'd'),
                 modifiers: KeyModifiers::CONTROL,
@@ -595,12 +627,12 @@ async fn main() -> anyhow::Result<()> {
     task::spawn_blocking(terminal::enable_raw_mode).await??;
 
     let parsed_constants = libc_constant_deprecator_lib::parse_constants(&files);
-    let (state, events_tx) = State::new(parsed_constants.borrowed());
+    let (state, events_tx) = State::new(parsed_constants);
 
     prepare_space().await?;
 
     let input_handler = task::spawn(handle_input(events_tx));
-    let renderer = task::spawn(render(parsed_constants, state));
+    let renderer = task::spawn(render(state));
 
     future::try_join(input_handler, renderer)
         .await

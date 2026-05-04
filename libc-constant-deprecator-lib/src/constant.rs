@@ -24,7 +24,7 @@ pub struct Const {
 }
 
 macro_rules! impl_doc {
-    ($($it:tt)+) => {
+    ($($it:ident)+) => {
         $(
 /// These are necessary for some async stuff that has collections of `Const`s
 /// passed between threads. The reason why this is sound is that the backing
@@ -41,6 +41,23 @@ unsafe impl $it for Const {}
 }
 
 impl_doc! { Send Sync }
+
+impl Const {
+    /// Checks if the constant is marked deprecated or not.
+    ///
+    /// Note this check is not necessarily relative to its current state in the
+    /// codebase, but rather to its current state in memory. It could very well
+    /// be that the constant has been loaded and modified, but changes not
+    /// effected to disk. In that instance, the symbol would report being
+    /// deprecated if it wasn't on-disk, and undeprecated if it were so on-disk.
+    #[expect(
+        clippy::must_use_candidate,
+        reason = "It's not a bug not to use the result of this routine."
+    )]
+    pub fn is_deprecated(&self) -> bool {
+        self.deprecated
+    }
+}
 
 impl Const {
     pub(crate) fn from_item(item: ItemConst, source: PathBuf) -> Self {
