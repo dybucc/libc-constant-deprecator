@@ -3,7 +3,7 @@
 use std::{
     env,
     io::{self, Stdout, StdoutLock, Write},
-    ops::Deref,
+    ops::{Deref, Range},
     path::PathBuf,
     sync::LazyLock,
 };
@@ -31,14 +31,20 @@ pub(crate) struct Args {
     path: Option<String>,
 }
 
-#[derive(Debug, Default)]
-pub(crate) struct Termination {
-    repr: TerminationRepr,
+#[derive(Debug)]
+pub(crate) struct Termination<T> {
+    repr: TerminationRepr<T>,
 }
 
-impl Termination {
+impl<T> Termination<T> {
     pub(crate) fn should_terminate(&self) -> bool {
         matches!(self.repr, TerminationRepr::Termination)
+    }
+
+    pub(crate) fn keep_going(val: T) -> Self {
+        Self {
+            repr: TerminationRepr::NonTermination(val),
+        }
     }
 
     pub(crate) fn terminate() -> Self {
@@ -46,23 +52,43 @@ impl Termination {
             repr: TerminationRepr::Termination,
         }
     }
-}
 
-#[derive(Debug, Default)]
-pub(crate) enum TerminationRepr {
-    Termination,
-    #[default]
-    NonTermination,
+    pub(crate) fn into_inner(self) -> T {
+        self.repr.unwrap()
+    }
 }
 
 #[derive(Debug)]
-#[non_exhaustive]
+pub(crate) enum TerminationRepr<T> {
+    Termination,
+    NonTermination(T),
+}
+
+impl<T> TerminationRepr<T> {
+    #[track_caller]
+    pub(crate) fn unwrap(self) -> T {
+        match self {
+            Self::Termination => panic!(),
+            Self::NonTermination(val) => val,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct State {
     events: UnboundedReceiver<RawUserEvent>,
     mode: Mode,
     filter_buf: BorrowedContainer,
+    // The logic here is that even if in insert mode, the last selected constant is meant to be the
+    // one that was under the cursor prior to entering insert mode. In normal mode, it is the last
+    // registered constant that was under the cursor, and in select mode it is a range that could
+    // comprise a set of values larger than 1.
+    selected: Range<usize>,
+    prompt: String,
 }
 
+// NOTE: we will require modifying some of the routines here once we get to
+// implementing scrolling in the 10-row constant symbol layout.
 impl State {
     pub(crate) fn new(borrowed_view: BorrowedContainer) -> (Self, UnboundedSender<RawUserEvent>) {
         let (tx, rx) = mpsc::unbounded_channel();
@@ -72,31 +98,59 @@ impl State {
                 events: rx,
                 mode: Mode::default(),
                 filter_buf: borrowed_view,
+                selected: Range::default(),
+                prompt: String::default(),
             },
             tx,
         )
     }
 
-    pub(crate) fn receive_event(&mut self) -> Termination {
-        let Self { events, mode, .. } = self;
-        let event = match events.try_recv() {
-            Ok(event) => event,
-            Err(TryRecvError::Empty) => return Termination::default(),
-            Err(_) => return Termination::terminate(),
-        };
-        let res = mode.meaning(&event);
+    pub(crate) fn update(&mut self, event: Option<UserEvent>) {
+        let Self {
+            filter_buf,
+            selected,
+            prompt,
+            ..
+        } = self;
 
-        Termination::default()
+        let Some(event) = event else {
+            return;
+        };
+
+        // TODO: actually get to updating the stuff.
+
+        todo!()
+    }
+
+    pub(crate) fn receive_event(&mut self) -> Termination<Option<UserEvent>> {
+        let Self { events, mode, .. } = self;
+
+        match events.try_recv() {
+            Ok(event) if let Some(event) = mode.interpret(&event) => {
+                Termination::keep_going(event.into())
+            }
+            Err(TryRecvError::Disconnected) => Termination::terminate(),
+            _ => Termination::keep_going(None),
+        }
     }
 
     pub(crate) fn draw(&self, mut stdout: impl Write) -> anyhow::Result<()> {
-        let State {
+        let Self {
             events,
             mode,
             filter_buf,
+            selected,
+            prompt,
         } = self;
 
         crossterm::queue!(stdout, Print("> "))?;
+
+        // TODO: finish drawing the ten-row table with the constant symbols, those which
+        // are currently selected if inside select mode, and those marked deprecated.
+        // The mark for deprecation is something specific to each constant that is
+        // already kept track of within the borrowed view into the set of constants. The
+        // selection status is kept track of by the instance of `State` that is handling
+        // this drawing call.
 
         stdout.flush().map_err(Into::into)
     }
@@ -108,12 +162,24 @@ pub(crate) struct Mode {
 }
 
 impl Mode {
-    pub(crate) fn new(repr: ModeRepr) -> Self {
+    fn new(repr: ModeRepr) -> Self {
         Self { repr }
     }
 
     pub(crate) fn kind(&self) -> ModeRepr {
         self.repr
+    }
+
+    pub(crate) fn is_normal(&self) -> bool {
+        matches!(self.repr, ModeRepr::Normal)
+    }
+
+    pub(crate) fn is_insert(&self) -> bool {
+        matches!(self.repr, ModeRepr::Insert)
+    }
+
+    pub(crate) fn is_select(&self) -> bool {
+        matches!(self.repr, ModeRepr::Select)
     }
 
     pub(crate) fn normal() -> Self {
@@ -134,33 +200,48 @@ impl Mode {
         }
     }
 
-    // NOTE: we return an `Option` here because there's some events which, within
-    // certain modes, just don't have any meaning once interpreted beyond raw user
-    // input.
-    pub(crate) fn meaning(&self, event: &RawUserEvent) -> Option<UserEvent> {
-        match (self.repr, event.kind()) {
+    pub(crate) fn interpret(&self, event: &RawUserEvent) -> Option<UserEvent> {
+        match (self.repr, event.inner()) {
             // TODO: it may prove beneficial to further filter out plain text input, as there may be
-            // some keys that just shouldn't even be printable on-screen.
+            // some characters that just shouldn't even be printable on-screen.
             (ModeRepr::Insert, RawUserEventRepr::PlainText(c)) => UserEvent::text(c).into(),
             (ModeRepr::Insert, RawUserEventRepr::Space) => UserEvent::text(' ').into(),
-            (ModeRepr::Insert, RawUserEventRepr::Escape) => UserEvent::action(ModeAction::new(
-                ModeActionRepr::ModeSwitch(Mode::new(ModeRepr::Normal)),
-            ))
-            .into(),
             (ModeRepr::Normal, RawUserEventRepr::PlainText(c))
                 if let Some(action) = ModeAction::is_navigation(c) =>
             {
-                UserEvent::new(UserEventRepr::ModeAction(action)).into()
+                UserEvent::action(action).into()
             }
-            (ModeRepr::Normal, RawUserEventRepr::Return) => todo!(),
-            (ModeRepr::Normal, RawUserEventRepr::Space) => todo!(),
-            (ModeRepr::Normal, RawUserEventRepr::ShiftReturn) => todo!(),
-            (ModeRepr::Normal, RawUserEventRepr::Escape) => todo!(),
-            (ModeRepr::Select, RawUserEventRepr::PlainText(_)) => todo!(),
-            (ModeRepr::Select, RawUserEventRepr::Return) => todo!(),
-            (ModeRepr::Select, RawUserEventRepr::Space) => todo!(),
-            (ModeRepr::Select, RawUserEventRepr::ShiftReturn) => todo!(),
-            (ModeRepr::Select, RawUserEventRepr::Escape) => todo!(),
+            (ModeRepr::Normal, RawUserEventRepr::PlainText(c))
+                if let Some(action) = ModeAction::is_to_mode(c, Mode::insert()) =>
+            {
+                UserEvent::action(action).into()
+            }
+            (ModeRepr::Normal, RawUserEventRepr::PlainText(c))
+                if let Some(action) = ModeAction::is_to_mode(c, Mode::select()) =>
+            {
+                UserEvent::action(action).into()
+            }
+            (ModeRepr::Normal, RawUserEventRepr::Return) => UserEvent::search().into(),
+            (ModeRepr::Normal, RawUserEventRepr::ShiftReturn) => UserEvent::effect().into(),
+            (ModeRepr::Normal, RawUserEventRepr::Escape) => UserEvent::clear().into(),
+            (ModeRepr::Select, RawUserEventRepr::PlainText(c))
+                if let Some(action) = ModeAction::is_navigation(c) =>
+            {
+                UserEvent::action(action).into()
+            }
+
+            // Toggling the deprecated state of a set of contant symbols can happen in both normal
+            // mode and in select mode. The former performs deprecation of the constant symbol under
+            // the cursor, while the latter does so for a range of symbols under the cursor (which
+            // could be 1+.)
+            (ModeRepr::Normal | ModeRepr::Select, RawUserEventRepr::Space) => {
+                UserEvent::toggle().into()
+            }
+
+            // If in any one of insert or select mode, just move back to normal mode.
+            (ModeRepr::Insert | ModeRepr::Select, RawUserEventRepr::Escape) => {
+                UserEvent::action(ModeAction::switch_modes(Mode::normal())).into()
+            }
 
             // NOTE: this includes a bunch of cases where input processing shouldn't even be
             // performed, as the event that has taken place has no meaning in the currently active
@@ -184,8 +265,40 @@ pub(crate) struct UserEvent {
 }
 
 impl UserEvent {
-    pub(crate) fn new(event: UserEventRepr) -> Self {
+    fn new(event: UserEventRepr) -> Self {
         Self { repr: event }
+    }
+
+    pub(crate) fn is_text(&self) -> Option<char> {
+        if let UserEventRepr::TextualInput(c) = self.repr {
+            c.into()
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn is_search(&self) -> bool {
+        matches!(self.repr, UserEventRepr::Search)
+    }
+
+    pub(crate) fn is_toggle(&self) -> bool {
+        matches!(self.repr, UserEventRepr::Toggle)
+    }
+
+    pub(crate) fn is_effect(&self) -> bool {
+        matches!(self.repr, UserEventRepr::Effect)
+    }
+
+    pub(crate) fn is_clear(&self) -> bool {
+        matches!(self.repr, UserEventRepr::Clear)
+    }
+
+    pub(crate) fn is_action(&self) -> Option<&ModeAction> {
+        if let UserEventRepr::ModeAction(action) = &self.repr {
+            action.into()
+        } else {
+            None
+        }
     }
 
     pub(crate) fn text(c: char) -> Self {
@@ -252,34 +365,8 @@ pub(crate) struct ModeAction {
     repr: ModeActionRepr,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum Dir {
-    Up,
-    Down,
-    Left,
-    Right,
-}
-
-impl Dir {
-    pub(crate) fn up() -> Self {
-        Self::Up
-    }
-
-    pub(crate) fn down() -> Self {
-        Self::Down
-    }
-
-    pub(crate) fn left() -> Self {
-        Self::Left
-    }
-
-    pub(crate) fn right() -> Self {
-        Self::Right
-    }
-}
-
 impl ModeAction {
-    pub(crate) fn new(repr: ModeActionRepr) -> Self {
+    fn new(repr: ModeActionRepr) -> Self {
         Self { repr }
     }
 
@@ -289,20 +376,11 @@ impl ModeAction {
         }
     }
 
-    pub(crate) fn navigate(dir: Dir) -> Self {
-        match dir {
-            Dir::Up => Self {
-                repr: ModeActionRepr::GoUp,
-            },
-            Dir::Down => Self {
-                repr: ModeActionRepr::GoDown,
-            },
-            Dir::Left => Self {
-                repr: ModeActionRepr::GoLeft,
-            },
-            Dir::Right => Self {
-                repr: ModeActionRepr::GoRight,
-            },
+    pub(crate) fn is_to_mode(c: char, mode: Mode) -> Option<Self> {
+        if c == 'i' && mode.is_insert() || c == 'v' && mode.is_select() {
+            ModeAction::switch_modes(mode).into()
+        } else {
+            None
         }
     }
 
@@ -337,12 +415,42 @@ pub(crate) struct RawUserEvent {
 }
 
 impl RawUserEvent {
-    pub(crate) fn kind(&self) -> RawUserEventRepr {
+    fn new(event: RawUserEventRepr) -> Self {
+        Self { repr: event }
+    }
+
+    pub(crate) fn inner(&self) -> RawUserEventRepr {
         self.repr
     }
 
-    pub(crate) fn new(event: RawUserEventRepr) -> Self {
-        Self { repr: event }
+    pub(crate) fn space() -> Self {
+        Self {
+            repr: RawUserEventRepr::Space,
+        }
+    }
+
+    pub(crate) fn text(c: char) -> Self {
+        Self {
+            repr: RawUserEventRepr::PlainText(c),
+        }
+    }
+
+    pub(crate) fn ret() -> Self {
+        Self {
+            repr: RawUserEventRepr::Return,
+        }
+    }
+
+    pub(crate) fn sret() -> Self {
+        Self {
+            repr: RawUserEventRepr::ShiftReturn,
+        }
+    }
+
+    pub(crate) fn esc() -> Self {
+        Self {
+            repr: RawUserEventRepr::Escape,
+        }
     }
 }
 
@@ -350,7 +458,7 @@ impl RawUserEvent {
 pub(crate) enum RawUserEventRepr {
     PlainText(char),
     Return,
-    // NOTE: even though this could pass off as character input, we prefer to keep it as a
+    // NOTE: even though this could be passed as plain text input, we prefer to keep it as a
     // separate variant for the purposes of easing other user commands once they're processed
     // beyond raw user events.
     Space,
@@ -364,8 +472,13 @@ pub(crate) async fn render(mut constants: ConstContainer, mut state: State) -> a
     let mut stdout = SYNC_BUF.lock().await;
 
     loop {
+        // NOTE: there may be a better way of doing this, as I don't believe constant
+        // moves on every loop iteration are even remotely optimal.
         (state, stdout) = task::spawn_blocking(move || draw_screen(state, stdout)).await??;
-        update(&mut state);
+
+        if update(&mut state).should_terminate() {
+            break Ok(());
+        }
     }
 }
 
@@ -378,12 +491,18 @@ pub(crate) fn draw_screen(
     Ok((state, stdout))
 }
 
-pub(crate) fn update(state: &mut State) -> Termination {
-    if state.receive_event().should_terminate() {
-        Termination::terminate()
-    } else {
-        Termination::default()
+pub(crate) fn update(state: &mut State) -> Termination<()> {
+    let res = state.receive_event();
+
+    if res.should_terminate() {
+        return Termination::terminate();
     }
+
+    // NOTE: this won't panic because the inner representation for a state of
+    // termination has already been proved to not be a termination state.
+    state.update(res.into_inner());
+
+    todo!()
 }
 
 pub(crate) async fn handle_input(channel: UnboundedSender<RawUserEvent>) -> anyhow::Result<()> {
@@ -395,30 +514,41 @@ pub(crate) async fn handle_input(channel: UnboundedSender<RawUserEvent>) -> anyh
                 code: KeyCode::Char(' '),
                 modifiers: KeyModifiers::NONE,
                 ..
-            }) => _ = channel.send(RawUserEvent::new(RawUserEventRepr::Space)),
+            }) => _ = channel.send(RawUserEvent::space()),
             Event::Key(KeyEvent {
                 code: KeyCode::Char(c),
                 modifiers: KeyModifiers::NONE,
                 ..
-            }) => _ = channel.send(RawUserEvent::new(RawUserEventRepr::PlainText(c))),
+            }) => _ = channel.send(RawUserEvent::text(c)),
             Event::Key(KeyEvent {
                 code: KeyCode::Enter,
                 modifiers: KeyModifiers::NONE,
                 ..
-            }) => _ = channel.send(RawUserEvent::new(RawUserEventRepr::Return)),
+            }) => _ = channel.send(RawUserEvent::ret()),
             Event::Key(KeyEvent {
                 code: KeyCode::Enter,
                 modifiers: KeyModifiers::SHIFT,
                 ..
-            }) => _ = channel.send(RawUserEvent::new(RawUserEventRepr::ShiftReturn)),
+            }) => _ = channel.send(RawUserEvent::sret()),
             Event::Key(KeyEvent {
                 code: KeyCode::Esc,
                 modifiers: KeyModifiers::NONE,
                 ..
-            }) => _ = channel.send(RawUserEvent::new(RawUserEventRepr::Escape)),
+            }) => _ = channel.send(RawUserEvent::esc()),
+
+            // The termination event, which should break out of the loop and drop the producer end
+            // of the channel to have the receiver end indicate termination to the task managing it.
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('c' | 'd'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            }) => break,
+
             _ => (),
         }
     }
+
+    drop(channel);
 
     Ok(())
 }
