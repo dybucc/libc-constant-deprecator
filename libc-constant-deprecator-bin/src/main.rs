@@ -26,14 +26,121 @@ use tokio::{
     task,
 };
 
+// NOTE: this is used for the purposes of easing declaration of two sets of
+// enums from the same variants. This then allows to implement internal
+// functionality in terms of the fields without public values, and internal
+// functionality in terms of variants with compound fields. It also defines an
+// impl with a method to transition between the internal, field-rich
+// representation to the public-facing external representation, which loses all
+// of the field information for the purposes of opaqueness.
+// NOTE: we use `allow` here instead of the usual `expect` because the lint
+// system seems to be getting wrong the `unfulflled_lint_expectation` lint when
+// using the latter.
+macro_rules! repr {
+    // NOTE: we don't take into consideration parametric polymorphism for the
+    // public type that is generated because that enumeration is not meant to
+    // hold any real information beyond the opaque representation of the
+    // internal type. We also force the presence of at least one attribute to
+    // enforce the implementation of `Debug` on all types.
+    (
+        $(#[$pub_attr:meta])+
+        $pub:tt // The public-facing, opaque representation.
+        $(#[$priv_attr:meta])+
+        $priv:tt$(<$($t:tt),+>)? => // The internal, field-rich type.
+        {
+            $(
+                $($(#[$var_attr:meta])+)? // Matches attributes like `#[default]`.
+                $var:ident // Matches the actual identifier for the variant.
+                $(($($content:tt),*))? // Matches a tuple variant.
+                $({$($field_content:tt: $ty_content:ty),*})? // Matches a struct-like variant.
+            ), +$(,)?
+        }
+        $(#[$wrap_attr:meta])+
+        $wrap:tt // The wrapper type around the internal representation.
+        // Which may or may not have fields other than its internal `repr`.
+        $({
+            $($wrap_field:tt: $wrap_type:ty),+
+        })?
+    ) => {
+        // NOTE: the treatment of field variants is not exhaustive, and it could
+        // conflict it the provided syntax tree in the matched macro subtree is
+        // not valid Rust code. We assume that is easy to spot at invocation
+        // site.
+        $(#[$priv_attr])*
+        enum $priv$(<$($t),+>)? {
+            $(
+                $($(#[$var_attr])+)? $var$(($($content),*))?$({$($field_content: $ty_content),*})?,
+            )+
+        }
+
+        impl$(<$($t),+>)? $priv$(<$($t),+>)? {
+            fn map_public(&self) -> $pub {
+                #[allow(
+                    non_snake_case,
+                    reason = "The macro that produces this method cannot match against anything \
+                              but the metavariables that repeat at the required depth, so the \
+                              bindings in the below pattern have the same identifiers as the types \
+                              of the corresponding fields in the above declaration (i.e. \
+                              uppercase.)"
+                )]
+
+                match self {
+                    $(
+                        Self::$var$(($($content),*))?$({$(_$field_content),*})? => $pub::$var
+                    ),+
+                }
+            }
+        }
+
+        $(#[$pub_attr])*
+        pub(crate) enum $pub {
+            $(
+                $($(#[$var_attr])+)? $var,
+            )+
+        }
+
+        $(#[$wrap_attr])*
+        pub(crate) struct $wrap$(<$($t),+>)? {
+            repr: $priv$(<$($t),+>)?,
+            $($($wrap_field: $wrap_type),+)?
+        }
+
+        impl$(<$($t),+>)? $wrap$(<$($t),+>)? {
+            fn kind(&self) -> $pub {
+                #[allow(
+                    non_snake_case,
+                    reason = "The macro that produces this method cannot match against anything \
+                              but the metavariables that repeat at the required depth, so the \
+                              bindings in the below pattern have the same identifiers as the types \
+                              of the corresponding fields in the above declaration (i.e. \
+                              uppercase.)"
+                )]
+
+                match &self.repr {
+                    $(
+                        $priv::$var$(($($content),*))?$({$(_$field_content),*})? => $pub::$var
+                    ),+
+                }
+            }
+        }
+    };
+}
+
 #[derive(Debug, Parser)]
 pub(crate) struct Args {
     path: Option<String>,
 }
 
-#[derive(Debug)]
-pub(crate) struct Termination<T> {
-    repr: TerminationRepr<T>,
+repr! {
+    #[derive(Debug)]
+    TerminationKind
+    #[derive(Debug)]
+    TerminationRepr<T> => {
+        Termination,
+        NonTermination(T)
+    }
+    #[derive(Debug)]
+    Termination
 }
 
 impl<T> Termination<T> {
@@ -57,12 +164,6 @@ impl<T> Termination<T> {
     pub(crate) fn into_inner(self) -> T {
         self.repr.unwrap()
     }
-}
-
-#[derive(Debug)]
-pub(crate) enum TerminationRepr<T> {
-    Termination,
-    NonTermination(T),
 }
 
 impl<T> TerminationRepr<T> {
@@ -116,7 +217,14 @@ impl State {
         )
     }
 
-    pub(crate) async fn update(&mut self, event: Option<UserEvent>) {
+    pub(crate) async fn update(&mut self, event: Option<UserEvent>) -> anyhow::Result<()> {
+        #![expect(
+            unstable_name_collisions,
+            reason = "The issue in question is with the `is_empty()` call on a `Range`, which is \
+                      not strictly wrong as there's a function with the same name under \
+                      `ExactSizeIterator`."
+        )]
+
         let Self {
             filter_buf,
             selected,
@@ -127,38 +235,42 @@ impl State {
         } = self;
 
         let Some(event) = event else {
-            return;
+            return Ok(());
         };
 
-        if event.is_effect() {
-            constants.effect_changes().await;
-        }
-
-        if event.is_search() {}
-
-        // NOTE: because the same toggling event is used when the user is both in normal
-        // and in select mode, we have to further check if there's some active selection
-        // (i.e. the range is non-empty.) Otherwise, we act on all constants currently
-        // on display.
-        if event.is_toggle() {
-            if selected.is_empty() {
+        match event.kind() {
+            // This is not quite as intuitive as getting the event payload directly from the
+            // internal representation, but get the job done just fine.
+            UserEventKind::TextualInput => prompt.push(event.is_text().unwrap()),
+            UserEventKind::Search => constants.filter_with(&prompt, filter_buf)?,
+            // Toggles all constants because we are either (1) outside select mode, or within it
+            // but withiout a selection ranging beyond a single constant symbol.
+            UserEventKind::Toggle if selected.is_empty() => {
                 if all_deprecated(filter_buf) {
                     filter_buf.undeprecate();
                 } else {
                     filter_buf.deprecate();
                 }
-            } else {
-                let mut selected_constants = filter_buf.select(selected);
+            }
+            // Toggles only the contants currently selected through select mode.
+            UserEventKind::Toggle => {
+                let mut selected = filter_buf.select(&*selected);
 
-                if all_deprecated(&selected_constants) {
-                    selected_constants.undeprecate();
+                if all_deprecated(&selected) {
+                    selected.undeprecate();
                 } else {
-                    selected_constants.deprecate();
+                    selected.deprecate();
                 }
             }
+            UserEventKind::Effect => constants.effect_changes().await?,
+            UserEventKind::Clear => constants.filter_with(".*", filter_buf)?,
+            UserEventKind::ModeAction => todo!(
+                "Match against the mode action with the corresponding method and possibly modify \
+                 the `repr` macro to provide a more ergonomic means of doing this."
+            ),
         }
 
-        todo!()
+        Ok(())
     }
 
     pub(crate) fn receive_event(&mut self) -> Termination<Option<UserEvent>> {
@@ -211,9 +323,18 @@ fn all_deprecated(visited: &impl Visit) -> bool {
     check
 }
 
-#[derive(Debug, Default)]
-pub(crate) struct Mode {
-    repr: ModeRepr,
+repr! {
+    #[derive(Debug, Default, Clone, Copy)]
+    ModeKind
+    #[derive(Debug, Default, Clone, Copy)]
+    ModeRepr => {
+        Insert,
+        #[default]
+        Normal,
+        Select,
+    }
+    #[derive(Debug, Default)]
+    Mode
 }
 
 macro_rules! trivial_is_ctor {
@@ -295,17 +416,29 @@ impl Mode {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy)]
-pub(crate) enum ModeRepr {
-    Insert,
-    #[default]
-    Normal,
-    Select,
-}
-
-#[derive(Debug)]
-pub(crate) struct UserEvent {
-    repr: UserEventRepr,
+repr! {
+    #[derive(Debug)]
+    UserEventKind
+    #[derive(Debug)]
+    UserEventRepr => {
+        // Corresponds with plain text user input at the prompt.
+        TextualInput(char),
+        // Is triggered with the return key and should trigger a filtering event with the current
+        // contents of the prompt.
+        Search,
+        // Is triggered with the space key and should toggle all selected constants' state to
+        // "deprecated", unless all selected constants are already deprecated, in which case it
+        // should undeprecate them.
+        Toggle,
+        // Is triggered with the shift + return combo and should effect the changes to disk.
+        Effect,
+        // Is triggered with the escape key and should clear the currently input regex.
+        Clear,
+        // Is triggered when going from insert mode to normal mode.
+        ModeAction(ModeAction),
+    }
+    #[derive(Debug)]
+    UserEvent
 }
 
 macro_rules! trivial_is_ctor {
@@ -363,33 +496,6 @@ impl UserEvent {
     }
 }
 
-#[derive(Debug)]
-enum UserEventRepr {
-    // Corresponds with plain text user input at the prompt.
-    TextualInput(char),
-    // Is triggered with the return key and should trigger a filtering event with the current
-    // contents of the prompt.
-    Search,
-    // Is triggered with the space key and should toggle all selected constants' state to
-    // "deprecated", unless all selected constants are already deprecated, in which case it should
-    // undeprecate them.
-    Toggle,
-    // Is triggered with the shift + return combo and should effect the changes to disk.
-    Effect,
-    // Is triggered with the escape key and should clear the currently input regex.
-    Clear,
-    // Is triggered when going from insert mode to normal mode.
-    ModeAction(ModeAction),
-}
-
-// NOTE: this type serves as a general LUT for all commands involving anything
-// but (1) major actions, which are stored inline under `UserEvent`, and (2)
-// plain text user input.
-#[derive(Debug)]
-pub(crate) struct ModeAction {
-    repr: ModeActionRepr,
-}
-
 impl ModeAction {
     fn new(repr: ModeActionRepr) -> Self {
         Self { repr }
@@ -420,23 +526,45 @@ impl ModeAction {
     }
 }
 
-#[derive(Debug)]
-enum ModeActionRepr {
-    // Corresponds with using the escape key in insert mode to go back to normal mode.
-    ModeSwitch(Mode),
-    // Corresponds with the navigation binding assigned to `h`.
-    GoLeft,
-    // Corresponds with the navigation binding assigned to `l`.
-    GoRight,
-    // Corresponds with the navigation binding assigned to `k`.
-    GoUp,
-    // Corresponds with the navigation binding assigned to `j`.
-    GoDown,
+// NOTE: this type serves as a general LUT for all commands involving anything
+// but (1) major actions, which are stored inline under `UserEvent`, and (2)
+// plain text user input.
+repr! {
+    #[derive(Debug)]
+    ModeActionKind
+    #[derive(Debug)]
+    ModeActionRepr => {
+        // Corresponds with using the escape key in insert mode to go back to normal mode.
+        ModeSwitch(Mode),
+        // Corresponds with the navigation binding assigned to `h`.
+        GoLeft,
+        // Corresponds with the navigation binding assigned to `l`.
+        GoRight,
+        // Corresponds with the navigation binding assigned to `k`.
+        GoUp,
+        // Corresponds with the navigation binding assigned to `j`.
+        GoDown
+    }
+    #[derive(Debug)]
+    ModeAction
 }
 
-#[derive(Debug)]
-pub(crate) struct RawUserEvent {
-    repr: RawUserEventRepr,
+repr! {
+    #[derive(Debug, Clone, Copy)]
+    RawUserEventKind
+    #[derive(Debug, Clone, Copy)]
+    RawUserEventRepr => {
+        PlainText(char),
+        Return,
+        // NOTE: even though this could be passed as plain text input, we prefer to keep it as a
+        // separate variant for the purposes of easing other user commands once they're processed
+        // beyond raw user events.
+        Space,
+        ShiftReturn,
+        Escape,
+    }
+    #[derive(Debug)]
+    RawUserEvent
 }
 
 impl RawUserEvent {
@@ -477,18 +605,6 @@ impl RawUserEvent {
             repr: RawUserEventRepr::Escape,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum RawUserEventRepr {
-    PlainText(char),
-    Return,
-    // NOTE: even though this could be passed as plain text input, we prefer to keep it as a
-    // separate variant for the purposes of easing other user commands once they're processed
-    // beyond raw user events.
-    Space,
-    ShiftReturn,
-    Escape,
 }
 
 pub(crate) static SYNC_BUF: LazyLock<Mutex<Stdout>> = LazyLock::new(|| Mutex::new(io::stdout()));
