@@ -1,9 +1,10 @@
 #![expect(unused, reason = "WIP.")]
+#![feature(range_bounds_is_empty)]
 
 use std::{
     env,
     io::{self, Stdout, StdoutLock, Write},
-    ops::{ControlFlow, Deref, Range, RangeBounds},
+    ops::{Add, AddAssign, ControlFlow, Deref, Range, RangeBounds, Sub, SubAssign},
     path::PathBuf,
     sync::LazyLock,
 };
@@ -57,15 +58,15 @@ macro_rules! repr {
         }
         $(#[$wrap_attr:meta])+
         $wrap:tt // The wrapper type around the internal representation.
-        // Which may or may not have fields other than its internal `repr`.
+        // Which may or may not have fields other than the internal `repr` we generate it with.
         $({
             $($wrap_field:tt: $wrap_type:ty),+
         })?
     ) => {
         // NOTE: the treatment of field variants is not exhaustive, and it could
-        // conflict it the provided syntax tree in the matched macro subtree is
-        // not valid Rust code. We assume that is easy to spot at invocation
-        // site.
+        // cause errors if the provided syntax tree in the matched macro subtree
+        // is not valid Rust code. We assume such errors would be easy to spot
+        // at invocation site.
         $(#[$priv_attr])*
         enum $priv$(<$($t),+>)? {
             $(
@@ -73,6 +74,9 @@ macro_rules! repr {
             )+
         }
 
+        // NOTE: the impl for the internal representation is verbosily repeated for both the public
+        // type implementing the kind and the internal type denoting the variants because its body
+        // requires metavariable expansion at multiple levels of depth.
         impl$(<$($t),+>)? $priv$(<$($t),+>)? {
             fn map_public(&self) -> $pub {
                 #[allow(
@@ -80,8 +84,7 @@ macro_rules! repr {
                     reason = "The macro that produces this method cannot match against anything \
                               but the metavariables that repeat at the required depth, so the \
                               bindings in the below pattern have the same identifiers as the types \
-                              of the corresponding fields in the above declaration (i.e. \
-                              uppercase.)"
+                              of the corresponding fields in their declaration (i.e. uppercase.)"
                 )]
 
                 match self {
@@ -107,22 +110,88 @@ macro_rules! repr {
 
         impl$(<$($t),+>)? $wrap$(<$($t),+>)? {
             fn kind(&self) -> $pub {
-                #[allow(
-                    non_snake_case,
-                    reason = "The macro that produces this method cannot match against anything \
-                              but the metavariables that repeat at the required depth, so the \
-                              bindings in the below pattern have the same identifiers as the types \
-                              of the corresponding fields in the above declaration (i.e. \
-                              uppercase.)"
-                )]
-
-                match &self.repr {
-                    $(
-                        $priv::$var$(($($content),*))?$({$(_$field_content),*})? => $pub::$var
-                    ),+
-                }
+                self.repr.map_public()
             }
         }
+    };
+}
+
+// NOTE: this abstracts over the implementation of checker methods expressed in
+// terms of the internal representation of a given type, and over the
+// implementation of both constructors and infallible-unwrappers that panic if
+// the underlying representation is not the requested one. This is especially
+// suited for types generated using the above macro -- `repr`.
+//
+// The implementation requires naming tuple fields for the purposes of having a
+// metavariable to match for routine parameters, which unlike pattern
+// destructuring, cannot accept type identifiers.
+macro_rules! trivial_impl {
+    ($over_t:tt => {
+        $(
+            $ctor:ident, // The constructor that yields the wrapper type over the internal repr.
+            $fallible_is:ident, // The checker operation to ensure a certain variant is within it.
+            $infallible_is:ident, // The infallible operation that unwraps a variant or panics.
+            $infallible_is_ref:ident // The non-consuming version of the infallible op.
+            => $var:tt $(($($tuple:tt: $tuple_t:ty),*))? $({$($field:tt: $field_t:ty),*})?
+        );+ ;
+    }) => {
+        $(
+            pub(crate) fn $ctor($($($tuple: $tuple_t),*)? $($($field: $field_t),*)?) -> Self {
+                Self { repr: $over_t::$var $(($($tuple),*))? $({$($field),*})? }
+            }
+
+            $(
+                #[track_caller]
+                pub(crate) fn $infallible_is(self) -> ($($tuple_t),*) {
+                    if let $over_t::$var(res) = self.repr {
+                        res
+                    } else {
+                        let mut err = String::new();
+                        $(err.push_str(stringify!($tuple_t));)*
+                        panic!("variant did not contain {}", err);
+                    }
+                }
+
+                #[track_caller]
+                pub(crate) fn $infallible_is_ref(&self) -> ($(&$tuple_t),*) {
+                    if let $over_t::$var(res) = &self.repr {
+                        res
+                    } else {
+                        let mut err = String::new();
+                        $(err.push_str(stringify!($tuple_t));)*
+                        panic!("variant did not contain {}", err);
+                    }
+                }
+            )?
+
+            $(
+                #[track_caller]
+                pub(crate) fn $infallible_is(self) -> ($($field),*) {
+                    if let $over_t::$var{$($field:tt),*} = self.repr {
+                        ($($field),*)
+                    } else {
+                        let mut err = String::new();
+                        $(err.push_str(stringify!($field_t));)*
+                        panic!("variant did not contain {}", err);
+                    }
+                }
+
+                #[track_caller]
+                pub(crate) fn $infallible_is_ref(self) -> ($(&$field),*) {
+                    if let $over_t::$var{$($field:tt),*} = &self.repr {
+                        ($($field),*)
+                    } else {
+                        let mut err = String::new();
+                        $(err.push_str(stringify!($field_t));)*
+                        panic!("variant did not contain {}", err);
+                    }
+                }
+            )?
+
+            pub(crate) fn $fallible_is(&self) -> bool {
+                matches!(&self.repr, $over_t::$var $(($($tuple),*))? $({$($field),*})?)
+            }
+        )+
     };
 }
 
@@ -192,6 +261,7 @@ pub(crate) struct State {
     //   select mode.
     selected: Range<usize>,
     prompt: String,
+    pos: Position,
 }
 
 // NOTE: we will require modifying some of the routines here once we get to
@@ -212,25 +282,20 @@ impl State {
                 constants,
                 selected: Range::default(),
                 prompt: String::default(),
+                pos: Position::default(),
             },
             tx,
         )
     }
 
     pub(crate) async fn update(&mut self, event: Option<UserEvent>) -> anyhow::Result<()> {
-        #![expect(
-            unstable_name_collisions,
-            reason = "The issue in question is with the `is_empty()` call on a `Range`, which is \
-                      not strictly wrong as there's a function with the same name under \
-                      `ExactSizeIterator`."
-        )]
-
         let Self {
             filter_buf,
             selected,
             prompt,
             constants,
             mode,
+            pos,
             ..
         } = self;
 
@@ -239,22 +304,24 @@ impl State {
         };
 
         match event.kind() {
-            // This is not quite as intuitive as getting the event payload directly from the
-            // internal representation, but get the job done just fine.
-            UserEventKind::TextualInput => prompt.push(event.is_text().unwrap()),
+            // NOTE: this is not quite as ergonomic as getting the event payload directly from the
+            // internal representation, but it gets the job done just fine.
+            UserEventKind::TextualInput => prompt.push(event.text()),
             UserEventKind::Search => constants.filter_with(&prompt, filter_buf)?,
-            // Toggles all constants because we are either (1) outside select mode, or within it
-            // but withiout a selection ranging beyond a single constant symbol.
-            UserEventKind::Toggle if selected.is_empty() => {
+            // NOTE: toggles all constants because we are either (1) outside select mode, or (2)
+            // within it but without a selection ranging beyond a single row.
+            UserEventKind::Toggle if <Range<usize> as RangeBounds<usize>>::is_empty(selected) => {
                 if all_deprecated(filter_buf) {
                     filter_buf.undeprecate();
                 } else {
                     filter_buf.deprecate();
                 }
             }
-            // Toggles only the contants currently selected through select mode.
+            // NOTE: this uses `BorrowedSubset` to add another degree of refinement to the set of
+            // constants currently under consideration. This only happens in select mode, where the
+            // range in `selected` is non-empty.
             UserEventKind::Toggle => {
-                let mut selected = filter_buf.select(&*selected);
+                let mut selected = filter_buf.select(selected);
 
                 if all_deprecated(&selected) {
                     selected.undeprecate();
@@ -264,10 +331,20 @@ impl State {
             }
             UserEventKind::Effect => constants.effect_changes().await?,
             UserEventKind::Clear => constants.filter_with(".*", filter_buf)?,
-            UserEventKind::ModeAction => todo!(
-                "Match against the mode action with the corresponding method and possibly modify \
-                 the `repr` macro to provide a more ergonomic means of doing this."
-            ),
+            UserEventKind::ModeAction => {
+                let action = event.action();
+
+                match action.kind() {
+                    ModeActionKind::ModeSwitch => *mode = action.mode(),
+                    // TODO: use the utilities implemented for the `Position` type to more
+                    // ergonomically implement navigation. Take into account the fact the user could
+                    // be in both normal and select mode when a navigation event is triggered.
+                    ModeActionKind::GoLeft => todo!(),
+                    ModeActionKind::GoRight => todo!(),
+                    ModeActionKind::GoUp => todo!(),
+                    ModeActionKind::GoDown => todo!(),
+                }
+            }
         }
 
         Ok(())
@@ -277,9 +354,11 @@ impl State {
         let Self { events, mode, .. } = self;
 
         match events.try_recv() {
-            Ok(event) if let Some(event) = mode.interpret(&event) => {
-                Termination::keep_going(event.into())
-            }
+            Ok(event) => mode
+                .interpret(event)
+                .map_or_else(Termination::terminate, |event| {
+                    Termination::keep_going(event.into())
+                }),
             Err(TryRecvError::Disconnected) => Termination::terminate(),
             _ => Termination::keep_going(None),
         }
@@ -323,6 +402,105 @@ fn all_deprecated(visited: &impl Visit) -> bool {
     check
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Position {
+    row: u16,
+    col: u16,
+}
+
+impl SubAssign for Position {
+    fn sub_assign(&mut self, rhs: Self) {
+        let Self { row, col } = self;
+        let Self {
+            row: orow,
+            col: ocol,
+        } = rhs;
+
+        *row = row.saturating_sub(orow);
+        *col = col.saturating_sub(ocol);
+    }
+}
+
+impl Sub for Position {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        let Self { row, col } = self;
+        let Self {
+            row: orow,
+            col: ocol,
+        } = rhs;
+
+        Self {
+            row: row.saturating_sub(orow),
+            col: col.saturating_sub(ocol),
+        }
+    }
+}
+
+impl AddAssign for Position {
+    fn add_assign(&mut self, rhs: Self) {
+        let Self { row, col } = self;
+        let Self {
+            row: orow,
+            col: ocol,
+        } = rhs;
+        let (max_row, max_col) = terminal::size().unwrap();
+
+        if *row + orow < max_row && *col + ocol < max_col {
+            *row += orow;
+            *col += ocol;
+        } else {
+            *row = max_row - 1;
+            *col = max_col - 1;
+        }
+    }
+}
+
+impl Add for Position {
+    type Output = Self;
+
+    /// Because the `Saturating` type in `std::num` does not seem to be usable
+    /// with non-primitive types, this operation performs saturating arithmetic,
+    /// not based off of the numerical limits but rather off of the terminal
+    /// dimensions.
+    fn add(self, rhs: Self) -> Self::Output {
+        let Self { row, col } = self;
+        let Self {
+            row: orow,
+            col: ocol,
+        } = rhs;
+        let (max_row, max_col) = terminal::size().unwrap();
+
+        // NOTE: here both `row` and `orow` are 0-indexed, but `max_row` is 1-indexed,
+        // so we must compare for a relation of strict "less than," and in the `else`
+        // branch perform unit subtraction.
+        if row + orow < max_row && col + ocol < max_col {
+            Self {
+                row: row + orow,
+                col: col + ocol,
+            }
+        } else {
+            Self {
+                row: max_row - 1,
+                col: max_col - 1,
+            }
+        }
+    }
+}
+
+impl Default for Position {
+    fn default() -> Self {
+        // NOTE: this is only called when initializing the running state, which itself
+        // only happens right after calling `prepare_space()`. If that routine did not
+        // fail (and it shouldn't have if we've reached this point,) then the only
+        // chance this fails is if some unknown I/O-bound error takes place.
+        let (row, col) = cursor::position().unwrap();
+
+        Self { row, col }
+    }
+}
+
 repr! {
     #[derive(Debug, Default, Clone, Copy)]
     ModeKind
@@ -337,83 +515,63 @@ repr! {
     Mode
 }
 
-macro_rules! trivial_is_ctor {
-    ($($ctor:ident, $is:ident => $var:tt);+ ;) => {
-        $(
-            pub(crate) fn $ctor() -> Self {
-                Self { repr: ModeRepr::$var }
-            }
-
-            pub(crate) fn $is(&self) -> bool {
-                matches!(self.repr, ModeRepr::$var)
-            }
-        )+
-    };
-}
-
 impl Mode {
     fn new(repr: ModeRepr) -> Self {
         Self { repr }
     }
 
-    pub(crate) fn interpret(&self, event: &RawUserEvent) -> Option<UserEvent> {
-        match (self.repr, event.inner()) {
-            // TODO: it may prove beneficial to further filter out plain text input, as there may be
-            // some characters that just shouldn't even be printable on-screen.
-            (ModeRepr::Insert, RawUserEventRepr::PlainText(c)) => UserEvent::text(c).into(),
-            (ModeRepr::Insert, RawUserEventRepr::Space) => UserEvent::text(' ').into(),
-            (ModeRepr::Normal, RawUserEventRepr::PlainText(c))
-                if let Some(action) = ModeAction::is_navigation(c) =>
-            {
-                UserEvent::action(action).into()
+    pub(crate) fn interpret(&self, event: RawUserEvent) -> Option<UserEvent> {
+        match (self.kind(), event.kind()) {
+            // Insert mode
+            (ModeKind::Insert, RawUserEventKind::PlainText) => UserEvent::new_text(event.text()),
+            (ModeKind::Insert, RawUserEventKind::Space) => UserEvent::new_text(' '),
+
+            // Normal mode.
+            (ModeKind::Normal, RawUserEventKind::PlainText) => {
+                let text = event.text();
+
+                // NOTE: we have to keep this logic mixed because otherwise the payload is lost
+                // when moved out of `event` (by the `text()` method.)
+                if let Some(action) = ModeAction::is_navigation(text) {
+                    UserEvent::new_action(action)
+                } else {
+                    UserEvent::new_action(ModeAction::is_mode_transition(text)?)
+                }
             }
-            (ModeRepr::Normal, RawUserEventRepr::PlainText(c))
-                if let Some(action) = ModeAction::is_to_mode(c, Mode::insert()) =>
+            (ModeKind::Normal, RawUserEventKind::ShiftReturn) => UserEvent::new_effect(),
+            (ModeKind::Normal, RawUserEventKind::Escape) => UserEvent::new_clear(),
+
+            // Select mode.
+            (ModeKind::Select, RawUserEventKind::PlainText)
+                if let Some(action) = ModeAction::is_navigation(event.text()) =>
             {
-                UserEvent::action(action).into()
-            }
-            (ModeRepr::Normal, RawUserEventRepr::PlainText(c))
-                if let Some(action) = ModeAction::is_to_mode(c, Mode::select()) =>
-            {
-                UserEvent::action(action).into()
-            }
-            (ModeRepr::Normal, RawUserEventRepr::ShiftReturn) => UserEvent::effect().into(),
-            (ModeRepr::Normal, RawUserEventRepr::Escape) => UserEvent::clear().into(),
-            (ModeRepr::Select, RawUserEventRepr::PlainText(c))
-                if let Some(action) = ModeAction::is_navigation(c) =>
-            {
-                UserEvent::action(action).into()
+                UserEvent::new_action(action)
             }
 
-            (ModeRepr::Insert | ModeRepr::Normal, RawUserEventRepr::Return) => {
-                UserEvent::search().into()
+            // Shared cases.
+            (ModeKind::Insert | ModeKind::Normal, RawUserEventKind::Return) => {
+                UserEvent::new_search()
             }
-
-            // Toggling the deprecated state of a set of contant symbols can happen in both normal
-            // mode and in select mode. The former performs deprecation of the constant symbol under
-            // the cursor, while the latter does so for a range of symbols under the cursor (which
-            // could be 1+.)
-            (ModeRepr::Normal | ModeRepr::Select, RawUserEventRepr::Space) => {
-                UserEvent::toggle().into()
+            (ModeKind::Normal | ModeKind::Select, RawUserEventKind::Space) => {
+                UserEvent::new_toggle()
             }
-
-            // If in any one of insert or select mode, just move back to normal mode.
-            (ModeRepr::Insert | ModeRepr::Select, RawUserEventRepr::Escape) => {
-                UserEvent::action(ModeAction::switch_modes(Mode::normal())).into()
+            (ModeKind::Insert | ModeKind::Select, RawUserEventKind::Escape) => {
+                UserEvent::new_action(ModeAction::switch_modes(Mode::new_normal()))
             }
 
             // NOTE: this includes a bunch of cases where input processing shouldn't even be
-            // performed, as the event that has taken place has no meaning in the currently active
-            // mode.
-            _ => None,
+            // performed, as the combination of mode/event does not make for a viable event to
+            // process.
+            _ => return None,
         }
+        .into()
     }
 
-    trivial_is_ctor! {
-        normal, is_normal => Normal;
-        insert, is_insert => Insert;
-        select, is_select => Select;
-    }
+    trivial_impl! { ModeRepr => {
+        new_normal, is_normal, normal, normal_ref => Normal;
+        new_insert, is_insert, insert, insert_ref => Insert;
+        new_select, is_select, select, select_ref => Select;
+    }}
 }
 
 repr! {
@@ -441,89 +599,19 @@ repr! {
     UserEvent
 }
 
-macro_rules! trivial_is_ctor {
-    ($($ctor:ident, $is:ident => $var:tt);+ $(;)?) => {
-        $(
-            pub(crate) fn $ctor() -> Self {
-                Self { repr: UserEventRepr::$var }
-            }
-
-            pub(crate) fn $is(&self) -> bool {
-                matches!(self.repr, UserEventRepr::$var)
-            }
-        )+
-    };
-}
-
 impl UserEvent {
     fn new(event: UserEventRepr) -> Self {
         Self { repr: event }
     }
 
-    pub(crate) fn text(c: char) -> Self {
-        Self {
-            repr: UserEventRepr::TextualInput(c),
-        }
-    }
-
-    pub(crate) fn action(action: ModeAction) -> Self {
-        Self {
-            repr: UserEventRepr::ModeAction(action),
-        }
-    }
-
-    pub(crate) fn is_text(&self) -> Option<char> {
-        if let UserEventRepr::TextualInput(c) = self.repr {
-            c.into()
-        } else {
-            None
-        }
-    }
-
-    pub(crate) fn is_action(&self) -> Option<&ModeAction> {
-        if let UserEventRepr::ModeAction(action) = &self.repr {
-            action.into()
-        } else {
-            None
-        }
-    }
-
-    trivial_is_ctor! {
-        search, is_search => Search;
-        toggle, is_toggle => Toggle;
-        effect, is_effect => Effect;
-        clear, is_clear => Clear;
-    }
-}
-
-impl ModeAction {
-    fn new(repr: ModeActionRepr) -> Self {
-        Self { repr }
-    }
-
-    pub(crate) fn switch_modes(new_mode: Mode) -> Self {
-        Self {
-            repr: ModeActionRepr::ModeSwitch(new_mode),
-        }
-    }
-
-    pub(crate) fn is_to_mode(c: char, mode: Mode) -> Option<Self> {
-        if c == 'i' && mode.is_insert() || c == 'v' && mode.is_select() {
-            ModeAction::switch_modes(mode).into()
-        } else {
-            None
-        }
-    }
-
-    pub(crate) fn is_navigation(c: char) -> Option<Self> {
-        match c {
-            'h' => Self::new(ModeActionRepr::GoLeft).into(),
-            'l' => Self::new(ModeActionRepr::GoRight).into(),
-            'k' => Self::new(ModeActionRepr::GoUp).into(),
-            'j' => Self::new(ModeActionRepr::GoDown).into(),
-            _ => None,
-        }
-    }
+    trivial_impl! { UserEventRepr => {
+        new_text, is_text, text, text_ref => TextualInput(c: char);
+        new_action, is_action, action, action_ref => ModeAction(action: ModeAction);
+        new_search, is_search, search, search_ref => Search;
+        new_toggle, is_toggle, toggle, toggle_ref => Toggle;
+        new_effect, is_effect, effect, effect_ref => Effect;
+        new_clear, is_clear, clear, clear_ref => Clear;
+    }}
 }
 
 // NOTE: this type serves as a general LUT for all commands involving anything
@@ -549,6 +637,39 @@ repr! {
     ModeAction
 }
 
+impl ModeAction {
+    fn new(repr: ModeActionRepr) -> Self {
+        Self { repr }
+    }
+
+    trivial_impl! { ModeActionRepr => {
+        switch_modes, is_mode, mode, mode_ref => ModeSwitch(mode: Mode);
+        new_left, is_left, left, left_ref => GoLeft;
+        new_right, is_right, right, right_ref => GoRight;
+        new_up, is_up, up, up_ref => GoUp;
+        new_down, is_down, down, down_ref => GoDown;
+    }}
+
+    pub(crate) fn is_mode_transition(c: char) -> Option<Self> {
+        match c {
+            'i' => ModeAction::switch_modes(Mode::new_insert()),
+            'v' => ModeAction::switch_modes(Mode::new_select()),
+            _ => return None,
+        }
+        .into()
+    }
+
+    pub(crate) fn is_navigation(c: char) -> Option<Self> {
+        match c {
+            'h' => Self::new(ModeActionRepr::GoLeft).into(),
+            'l' => Self::new(ModeActionRepr::GoRight).into(),
+            'k' => Self::new(ModeActionRepr::GoUp).into(),
+            'j' => Self::new(ModeActionRepr::GoDown).into(),
+            _ => None,
+        }
+    }
+}
+
 repr! {
     #[derive(Debug, Clone, Copy)]
     RawUserEventKind
@@ -572,39 +693,13 @@ impl RawUserEvent {
         Self { repr: event }
     }
 
-    pub(crate) fn inner(&self) -> RawUserEventRepr {
-        self.repr
-    }
-
-    pub(crate) fn space() -> Self {
-        Self {
-            repr: RawUserEventRepr::Space,
-        }
-    }
-
-    pub(crate) fn text(c: char) -> Self {
-        Self {
-            repr: RawUserEventRepr::PlainText(c),
-        }
-    }
-
-    pub(crate) fn ret() -> Self {
-        Self {
-            repr: RawUserEventRepr::Return,
-        }
-    }
-
-    pub(crate) fn sret() -> Self {
-        Self {
-            repr: RawUserEventRepr::ShiftReturn,
-        }
-    }
-
-    pub(crate) fn esc() -> Self {
-        Self {
-            repr: RawUserEventRepr::Escape,
-        }
-    }
+    trivial_impl! { RawUserEventRepr => {
+        new_space, is_space, space, space_ref => Space;
+        new_text, is_text, text, text_ref => PlainText(c: char);
+        new_ret, is_ret, ret, ret_ref => Return;
+        new_sret, is_sret, sret, sret_ref => ShiftReturn;
+        new_esc, is_esc, esc, esc_ref => Escape;
+    }}
 }
 
 pub(crate) static SYNC_BUF: LazyLock<Mutex<Stdout>> = LazyLock::new(|| Mutex::new(io::stdout()));
@@ -658,27 +753,27 @@ pub(crate) async fn handle_input(channel: UnboundedSender<RawUserEvent>) -> anyh
                 code: KeyCode::Char(' '),
                 modifiers: KeyModifiers::NONE,
                 ..
-            }) => _ = channel.send(RawUserEvent::space()),
+            }) => _ = channel.send(RawUserEvent::new_space()),
             Event::Key(KeyEvent {
                 code: KeyCode::Char(c),
                 modifiers: KeyModifiers::NONE,
                 ..
-            }) => _ = channel.send(RawUserEvent::text(c)),
+            }) => _ = channel.send(RawUserEvent::new_text(c)),
             Event::Key(KeyEvent {
                 code: KeyCode::Enter,
                 modifiers: KeyModifiers::NONE,
                 ..
-            }) => _ = channel.send(RawUserEvent::ret()),
+            }) => _ = channel.send(RawUserEvent::new_ret()),
             Event::Key(KeyEvent {
                 code: KeyCode::Enter,
                 modifiers: KeyModifiers::SHIFT,
                 ..
-            }) => _ = channel.send(RawUserEvent::sret()),
+            }) => _ = channel.send(RawUserEvent::new_sret()),
             Event::Key(KeyEvent {
                 code: KeyCode::Esc,
                 modifiers: KeyModifiers::NONE,
                 ..
-            }) => _ = channel.send(RawUserEvent::esc()),
+            }) => _ = channel.send(RawUserEvent::new_esc()),
 
             // The termination event, which should break out of the loop and drop the producer end
             // of the channel to have the receiver end indicate termination to the task managing it.

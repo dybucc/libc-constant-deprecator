@@ -108,45 +108,38 @@ impl BorrowedContainer {
     }
 }
 
+/// Utility trait to enable common constant symbol traversal pattern between
+/// borrowed views.
 pub trait Visit {
+    /// Provides an immutable traversal throughout gathered constants that can
+    /// be put on halt.
+    ///
+    /// This is akin to a far less powerful version of iteration that gates the
+    /// actual iterator, and only provides a temporary, in-place view with a
+    /// closure that can capture callsite state.
     fn visit(&self, visitor: impl FnMut(&Const) -> ControlFlow<()>);
 }
 
 macro_rules! visit_impl {
-    (@body => $self:expr, $visitor:expr) => {
-        let Self { source, .. } = $self;
+    (@body) => {
+        fn visit(&self, visitor: impl FnMut(&Const) -> ControlFlow<()>) {
+            let Self { source, .. } = self;
 
-        source
-            .iter()
-            .map(Weak::upgrade)
-            .filter_map(|ptr| ptr.map(|ptr| unsafe { &Arc::as_ptr(&ptr).as_ref_unchecked().0 }))
-            .try_for_each($visitor)
-            .into_value();
-    };
-    (@doc =>  { $it:item }) => {
-        /// Provides an immutable traversal throughout gathered constants that can
-        /// be put on halt.
-        ///
-        /// This is akin to a far less powerful version of iteration that gates the
-        /// actual iterator, and only provides a temporary, in-place view with a
-        /// closure that can capture callsite state.
-        $it
+            source
+                .iter()
+                .map(Weak::upgrade)
+                .filter_map(|ptr| ptr.map(|ptr| unsafe { &Arc::as_ptr(&ptr).as_ref_unchecked().0 }))
+                .try_for_each(visitor)
+                .into_value();
+        }
     };
     () => {
         impl Visit for BorrowedContainer {
-            visit_impl! { @doc => {
-                fn visit(&self, visitor: impl FnMut(&Const) -> ControlFlow<()>) {
-                    visit_impl! { @body => self, visitor }
-                }
-            }}
+            visit_impl! { @body }
         }
 
         impl Visit for BorrowedSubset<'_> {
-            visit_impl! { @doc => {
-                fn visit(&self, visitor: impl FnMut(&Const) -> ControlFlow<()>) {
-                    visit_impl! { @body => self, visitor }
-                }
-            }}
+            visit_impl! { @body }
         }
     };
 }
