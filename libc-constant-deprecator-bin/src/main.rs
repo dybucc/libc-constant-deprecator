@@ -2,13 +2,15 @@
 #![feature(range_bounds_is_empty)]
 
 use std::{
+    cell::RefCell,
     env,
     io::{self, Stdout, StdoutLock, Write},
     ops::{Add, AddAssign, ControlFlow, Deref, Range, RangeBounds, Sub, SubAssign},
     path::PathBuf,
-    sync::LazyLock,
+    sync::{LazyLock, Mutex as StdMutex, OnceLock},
 };
 
+use anyhow::anyhow;
 use clap::Parser;
 use crossterm::{
     cursor::{self, MoveToNextLine, MoveToRow, SetCursorStyle},
@@ -128,16 +130,25 @@ macro_rules! repr {
 macro_rules! trivial_impl {
     ($over_t:tt => {
         $(
-            $ctor:ident, // The constructor that yields the wrapper type over the internal repr.
+            // The constructor that yields the wrapper type over the internal repr.
+            $ctor:ident $({
+                $($ctor_field:tt $(: $ctor_field_init:expr)?),* $(,)?
+            })?,
             $fallible_is:ident, // The checker operation to ensure a certain variant is within it.
             $infallible_is:ident, // The infallible operation that unwraps a variant or panics.
-            $infallible_is_ref:ident // The non-consuming version of the infallible op.
+            $infallible_is_ref:ident // The non-consuming version of the infallible operation.
             => $var:tt $(($($tuple:tt: $tuple_t:ty),*))? $({$($field:tt: $field_t:ty),*})?
         );+ ;
     }) => {
         $(
             pub(crate) fn $ctor($($($tuple: $tuple_t),*)? $($($field: $field_t),*)?) -> Self {
-                Self { repr: $over_t::$var $(($($tuple),*))? $({$($field),*})? }
+                Self {
+                    // The field for the internal representation that is always present.
+                    repr: $over_t::$var $(($($tuple),*))? $({$($field),*})?,
+                    // Other fields that we may have added as part of the wrapper type's
+                    // information.
+                    $($($ctor_field $(: $ctor_field_init)?),*)?
+                }
             }
 
             $(
@@ -331,18 +342,33 @@ impl State {
             }
             UserEventKind::Effect => constants.effect_changes().await?,
             UserEventKind::Clear => constants.filter_with(".*", filter_buf)?,
+            // TODO: finish up handling immediate transitions between the list and the prompt.
+            UserEventKind::Switch => match mode.kind() {
+                ModeKind::Insert => {
+                    *mode = Mode::new_normal();
+                    pos.transition();
+                }
+                ModeKind::Normal => {
+                    *mode = Mode::new_insert();
+                    todo!()
+                }
+                ModeKind::Select => {
+                    *mode = Mode::new_insert();
+                    todo!()
+                }
+            },
             UserEventKind::ModeAction => {
                 let action = event.action();
 
                 match action.kind() {
                     ModeActionKind::ModeSwitch => *mode = action.mode(),
-                    // TODO: use the utilities implemented for the `Position` type to more
-                    // ergonomically implement navigation. Take into account the fact the user could
-                    // be in both normal and select mode when a navigation event is triggered.
-                    ModeActionKind::GoLeft => todo!(),
-                    ModeActionKind::GoRight => todo!(),
-                    ModeActionKind::GoUp => todo!(),
-                    ModeActionKind::GoDown => todo!(),
+
+                    // NOTE: because which one of the row or column should be modified is already
+                    // handled in the corresponding impl that `Position` has for both addition and
+                    // subtraction, we can converge events into the two basic operations over an
+                    // x-axis and a y-axis.
+                    ModeActionKind::GoLeft | ModeActionKind::GoUp => *pos -= 1,
+                    ModeActionKind::GoRight | ModeActionKind::GoDown => *pos += 1,
                 }
             }
         }
@@ -402,90 +428,129 @@ fn all_deprecated(visited: &impl Visit) -> bool {
     check
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct Position {
-    row: u16,
-    col: u16,
-}
-
-impl SubAssign for Position {
-    fn sub_assign(&mut self, rhs: Self) {
-        let Self { row, col } = self;
-        let Self {
-            row: orow,
-            col: ocol,
-        } = rhs;
-
-        *row = row.saturating_sub(orow);
-        *col = col.saturating_sub(ocol);
+// NOTE: the logic here is that beyond the raw row and columns in the terminal
+// grid, the position is, at a higher level, either inside the prompt or in the
+// list of filtered symbols. If on the former, there is only the column position
+// to worry about; If on the latter, there is only the row position to worry
+// about.
+repr! {
+    #[derive(Debug, Clone, Copy)]
+    PositionKind
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    PositionRepr => {
+        Prompt(u16),
+        List(u16)
+    }
+    // NOTE: the raw position in the terminal grid is stored inline as fields of
+    // the public type, while the actual, bounded position within the prompt is
+    // in the range 0-{terminal column width}; The list of filtered symbols is
+    // within range 0-9. These last two correspond with each of the two numbers
+    // in the tuple fields of the above two variants of the internal
+    // representation type.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    Position {
+        row: u16,
+        col: u16
     }
 }
 
-impl Sub for Position {
+impl Position {
+    pub(crate) fn transition(&mut self) {
+        let Self { repr, .. } = *self;
+
+        match repr {
+            PositionRepr::Prompt(_) => *self = Self::new_list(0),
+            PositionRepr::List(_) => *self = Self::new_prompt(0),
+        }
+    }
+
+    // NOTE: when constructing a new instance of a position within any one of the
+    // layout container we use as a list, or the prompt, we always require the raw
+    // row to be fetched externally because out of the 2-dimensional pieces of state
+    // we keep, the row index is the one that is not in sync with the higher-level
+    // abstraction that is kept in the `repr` field.
+    trivial_impl! { PositionRepr => {
+        new_prompt {
+            row: PROMPT_START.get().unwrap().1,
+            col,
+        },
+        is_prompt, prompt, prompt_ref => Prompt(col: u16);
+        new_list {
+            row: PROMPT_START.get().unwrap().1 + 1,
+            col: u16::default(),
+        },
+        is_list, list, list_ref => List(row: u16);
+    }}
+}
+
+// NOTE: this does not seem to be implementable through a trait derivation of
+// `Default` on `PositionRepr` so we must implement it manually.
+impl Default for PositionRepr {
+    fn default() -> Self {
+        Self::Prompt(0)
+    }
+}
+
+impl SubAssign<u16> for Position {
+    fn sub_assign(&mut self, rhs: u16) {
+        *self = *self - rhs;
+    }
+}
+
+impl Sub<u16> for Position {
     type Output = Self;
 
-    fn sub(self, rhs: Self) -> Self::Output {
-        let Self { row, col } = self;
-        let Self {
-            row: orow,
-            col: ocol,
-        } = rhs;
+    fn sub(mut self, rhs: u16) -> Self::Output {
+        let Self { repr, row, col } = &mut self;
 
-        Self {
-            row: row.saturating_sub(orow),
-            col: col.saturating_sub(ocol),
+        // NOTE: unlike in the impl of `Add<u16>`, we don't require performing
+        // bound checks here because it holds that `prompt_col` already starts
+        // at 0. The same applies for `list_row`, which even though not constructed
+        // through a `Default` impl, behaves the same way when transitioning between
+        // layout containers.
+        match repr {
+            PositionRepr::Prompt(prompt_col) => {
+                *prompt_col = prompt_col.saturating_sub(rhs);
+                *col = col.saturating_sub(rhs);
+            }
+            PositionRepr::List(list_row) => {
+                *list_row = list_row.saturating_sub(rhs);
+                *col = col.saturating_sub(rhs);
+            }
         }
+
+        self
     }
 }
 
-impl AddAssign for Position {
-    fn add_assign(&mut self, rhs: Self) {
-        let Self { row, col } = self;
-        let Self {
-            row: orow,
-            col: ocol,
-        } = rhs;
-        let (max_row, max_col) = terminal::size().unwrap();
-
-        if *row + orow < max_row && *col + ocol < max_col {
-            *row += orow;
-            *col += ocol;
-        } else {
-            *row = max_row - 1;
-            *col = max_col - 1;
-        }
+impl AddAssign<u16> for Position {
+    fn add_assign(&mut self, rhs: u16) {
+        *self = *self + rhs;
     }
 }
 
-impl Add for Position {
+impl Add<u16> for Position {
     type Output = Self;
 
-    /// Because the `Saturating` type in `std::num` does not seem to be usable
-    /// with non-primitive types, this operation performs saturating arithmetic,
-    /// not based off of the numerical limits but rather off of the terminal
-    /// dimensions.
-    fn add(self, rhs: Self) -> Self::Output {
-        let Self { row, col } = self;
-        let Self {
-            row: orow,
-            col: ocol,
-        } = rhs;
-        let (max_row, max_col) = terminal::size().unwrap();
+    fn add(mut self, rhs: u16) -> Self::Output {
+        let Self { repr, row, col } = &mut self;
+        let (max_col, max_row) = terminal::size().unwrap();
 
-        // NOTE: here both `row` and `orow` are 0-indexed, but `max_row` is 1-indexed,
-        // so we must compare for a relation of strict "less than," and in the `else`
-        // branch perform unit subtraction.
-        if row + orow < max_row && col + ocol < max_col {
-            Self {
-                row: row + orow,
-                col: col + ocol,
+        // NOTE: we intentionally implement the operation with saturating arithmetic as
+        // otherwise we'd have to deal with that at callsite.
+        match repr {
+            PositionRepr::Prompt(prompt_col) if *prompt_col + rhs < max_col => {
+                *prompt_col += rhs;
+                *col += rhs;
             }
-        } else {
-            Self {
-                row: max_row - 1,
-                col: max_col - 1,
+            PositionRepr::List(list_row) if *list_row + rhs < 10 => {
+                *list_row += rhs;
+                *row += rhs;
             }
+            _ => (),
         }
+
+        self
     }
 }
 
@@ -497,7 +562,11 @@ impl Default for Position {
         // chance this fails is if some unknown I/O-bound error takes place.
         let (row, col) = cursor::position().unwrap();
 
-        Self { row, col }
+        Self {
+            row,
+            col,
+            repr: PositionRepr::default(),
+        }
     }
 }
 
@@ -527,16 +596,15 @@ impl Mode {
             (ModeKind::Insert, RawUserEventKind::Space) => UserEvent::new_text(' '),
 
             // Normal mode.
-            (ModeKind::Normal, RawUserEventKind::PlainText) => {
-                let text = event.text();
-
-                // NOTE: we have to keep this logic mixed because otherwise the payload is lost
-                // when moved out of `event` (by the `text()` method.)
-                if let Some(action) = ModeAction::is_navigation(text) {
-                    UserEvent::new_action(action)
-                } else {
-                    UserEvent::new_action(ModeAction::is_mode_transition(text)?)
-                }
+            (ModeKind::Normal, RawUserEventKind::PlainText)
+                if let Some(action) = ModeAction::is_navigation(*event.text_ref()) =>
+            {
+                UserEvent::new_action(action)
+            }
+            (ModeKind::Normal, RawUserEventKind::PlainText)
+                if let Some(action) = ModeAction::is_mode_transition(*event.text_ref()) =>
+            {
+                UserEvent::new_action(action)
             }
             (ModeKind::Normal, RawUserEventKind::ShiftReturn) => UserEvent::new_effect(),
             (ModeKind::Normal, RawUserEventKind::Escape) => UserEvent::new_clear(),
@@ -557,6 +625,12 @@ impl Mode {
             }
             (ModeKind::Insert | ModeKind::Select, RawUserEventKind::Escape) => {
                 UserEvent::new_action(ModeAction::switch_modes(Mode::new_normal()))
+            }
+
+            // The one and only event that is allowed in all modes is to switch between the prompt
+            // and the list of constants, whichever one it is that the user is in.
+            (ModeKind::Insert | ModeKind::Normal | ModeKind::Select, RawUserEventKind::Tab) => {
+                UserEvent::new_switch()
             }
 
             // NOTE: this includes a bunch of cases where input processing shouldn't even be
@@ -592,6 +666,8 @@ repr! {
         Effect,
         // Is triggered with the escape key and should clear the currently input regex.
         Clear,
+        // Is triggered when the user switches between modes with the TAB key.
+        Switch,
         // Is triggered when going from insert mode to normal mode.
         ModeAction(ModeAction),
     }
@@ -611,6 +687,7 @@ impl UserEvent {
         new_toggle, is_toggle, toggle, toggle_ref => Toggle;
         new_effect, is_effect, effect, effect_ref => Effect;
         new_clear, is_clear, clear, clear_ref => Clear;
+        new_switch, is_switch, switch, switch_ref => Switch;
     }}
 }
 
@@ -683,6 +760,7 @@ repr! {
         Space,
         ShiftReturn,
         Escape,
+        Tab,
     }
     #[derive(Debug)]
     RawUserEvent
@@ -699,6 +777,7 @@ impl RawUserEvent {
         new_ret, is_ret, ret, ret_ref => Return;
         new_sret, is_sret, sret, sret_ref => ShiftReturn;
         new_esc, is_esc, esc, esc_ref => Escape;
+        new_tab, is_tab, tab, tab_ref => Tab;
     }}
 }
 
@@ -774,6 +853,13 @@ pub(crate) async fn handle_input(channel: UnboundedSender<RawUserEvent>) -> anyh
                 modifiers: KeyModifiers::NONE,
                 ..
             }) => _ = channel.send(RawUserEvent::new_esc()),
+            Event::Key(KeyEvent {
+                code: KeyCode::Tab,
+                modifiers: KeyModifiers::NONE,
+                ..
+            }) => _ = channel.send(RawUserEvent::new_tab()),
+
+            // TODO: handle backspace key for character removal.
 
             // The termination event, which should break out of the loop and drop the producer end
             // of the channel to have the receiver end indicate termination to the task managing it.
@@ -796,9 +882,18 @@ pub(crate) async fn handle_input(channel: UnboundedSender<RawUserEvent>) -> anyh
     Ok(())
 }
 
+// NOTE: we use this while transitioning between the prompt and the list of
+// symbols, such that we are not required to keep that as part of the running
+// state. The reason why it's best this way is that the TUI is launched in a
+// fixed layout that never experiments changes in size, so unless the user is
+// changing their terminal emulator size, which we don't handle just yet, this
+// should be constant beyond its point of initialization in `prepare_space()`.
+// That is why, at the moment, we use `OnceLock`.
+static PROMPT_START: OnceLock<(u16, u16)> = OnceLock::new();
+
 pub(crate) async fn prepare_space() -> anyhow::Result<()> {
-    let (rows, _) = terminal::size()?;
-    let (current_row, _) = cursor::position()?;
+    let (_, rows) = terminal::size()?;
+    let (_, current_row) = cursor::position()?;
 
     let mut stdout = SYNC_BUF.lock().await;
 
@@ -816,6 +911,12 @@ pub(crate) async fn prepare_space() -> anyhow::Result<()> {
         crossterm::queue!(stdout, MoveToRow(current_row - 11))?;
         crossterm::queue!(stdout, Clear(ClearType::FromCursorDown))?;
         crossterm::queue!(stdout, MoveToNextLine(1))?;
+
+        // NOTE: we `unwrap` here because there's no point in assumming that the static
+        // got initialized already, and that's the only point of failure. At the time of
+        // writing, this flow of execution when entering this routine is fully
+        // sequential (of course, only in appearance.)
+        PROMPT_START.set(cursor::position()?).unwrap();
     }
 
     stdout.flush()?;
