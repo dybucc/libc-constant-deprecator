@@ -94,11 +94,11 @@ impl BorrowedContainer {
     ///
     /// This is useful when requiring multiple subsequent levels of detail into
     /// the same overarching `ConstContainer`, without giving up on any of the
-    /// intermdiate, borrowed views.
+    /// intermediate, borrowed views.
     #[expect(
         private_bounds,
         reason = "It's meant to be this way. The trait with which we can index into the borrowed \
-                  view is not meant to be disclosed."
+                  view is not meant to be implementable by library users."
     )]
     pub fn select(&mut self, range: impl Indexer<Range<usize>>) -> BorrowedSubset<'_> {
         let Self { source, init_state } = self;
@@ -110,6 +110,9 @@ impl BorrowedContainer {
 
 /// Utility trait to enable common constant symbol traversal pattern between
 /// borrowed views.
+///
+/// This is implemented for both [`BorrowedContainer`] and [`BorrowedSubset`],
+/// such that in-place (weaker) iteration through the constants is possible.
 pub trait Visit {
     /// Provides an immutable traversal throughout gathered constants that can
     /// be put on halt.
