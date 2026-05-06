@@ -1,16 +1,13 @@
 #![feature(range_bounds_is_empty)]
-#![expect(unused, reason = "WIP.")]
 
 use std::{
-    cell::RefCell,
     env,
-    io::{self, Stdout, StdoutLock, Write},
-    ops::{Add, AddAssign, ControlFlow, Deref, Range, RangeBounds, Sub, SubAssign},
+    io::{self, Write},
+    ops::{Add, AddAssign, ControlFlow, Range, RangeBounds, Sub, SubAssign},
     path::PathBuf,
-    sync::{LazyLock, Mutex as StdMutex, OnceLock},
+    sync::{LazyLock, OnceLock},
 };
 
-use anyhow::anyhow;
 use clap::Parser;
 use crossterm::{
     cursor::{self, MoveToNextLine, MoveToRow, SetCursorStyle},
@@ -19,11 +16,12 @@ use crossterm::{
     terminal::{self, Clear, ClearType, DisableLineWrap},
 };
 use futures::{StreamExt, future};
-use libc_constant_deprecator_lib::{BorrowedContainer, Const, ConstContainer, Visit};
+use libc_constant_deprecator_lib::{BorrowedContainer, ConstContainer, Visit};
 use tokio::{
-    process::ChildStdout,
+    io::{AsyncWrite, AsyncWriteExt, Stdout},
+    runtime::{Builder, Runtime},
     sync::{
-        Mutex, MutexGuard,
+        Mutex,
         mpsc::{self, UnboundedReceiver, UnboundedSender, error::TryRecvError},
     },
     task,
@@ -79,6 +77,12 @@ macro_rules! repr {
         // NOTE: the impl for the internal representation is verbosily repeated for both the public
         // type implementing the kind and the internal type denoting the variants because its body
         // requires metavariable expansion at multiple levels of depth.
+        #[allow(
+            unused,
+            reason = "The macro requires having some type parameters expand to semantically \
+                      unignored parameters because I can't think of a way to modify the provided \
+                      parameter token trees."
+        )]
         impl$(<$($t),+>)? $priv$(<$($t),+>)? {
             fn map_public(&self) -> $pub {
                 #[allow(
@@ -110,6 +114,12 @@ macro_rules! repr {
             $($($wrap_field: $wrap_type),+)?
         }
 
+        #[allow(
+            unused,
+            reason = "The macro requires having some type parameters expand to semantically \
+                      unignored parameters because I can't think of a way to modify the provided \
+                      parameter token trees."
+        )]
         impl$(<$($t),+>)? $wrap$(<$($t),+>)? {
             fn kind(&self) -> $pub {
                 self.repr.map_public()
@@ -142,6 +152,12 @@ macro_rules! repr_impl {
         );+ ;
     }) => {
         $(
+            #[allow(
+                unused,
+                reason = "The macro requires having some type parameters expand to semantically \
+                          unignored parameters because I can't think of a way to modify the \
+                          provided parameter token trees."
+            )]
             pub(crate) fn $ctor($($($tuple: $tuple_t),*)? $($($field: $field_t),*)?) -> Self {
                 Self {
                     // The field for the internal representation that is always present.
@@ -158,6 +174,12 @@ macro_rules! repr_impl {
             // latter corresponds with having an enum variant that contains some struct-like fields.
 
             $(
+                #[allow(
+                    unused,
+                    reason = "The macro requires having some type parameters expand to \
+                              semantically unignored parameters because I can't think of a way to \
+                              modify the provided parameter token trees."
+                )]
                 #[track_caller]
                 pub(crate) fn $infallible_is(self) -> ($($tuple_t),*) {
                     if let $over_t::$var(res) = self.repr {
@@ -169,6 +191,12 @@ macro_rules! repr_impl {
                     }
                 }
 
+                #[allow(
+                    unused,
+                    reason = "The macro requires having some type parameters expand to \
+                              semantically unignored parameters because I can't think of a way to \
+                              modify the provided parameter token trees."
+                )]
                 #[track_caller]
                 pub(crate) fn $infallible_is_ref(&self) -> ($(&$tuple_t),*) {
                     if let $over_t::$var(res) = &self.repr {
@@ -182,6 +210,12 @@ macro_rules! repr_impl {
             )?
 
             $(
+                #[allow(
+                    unused,
+                    reason = "The macro requires having some type parameters expand to \
+                              semantically unignored parameters because I can't think of a way to \
+                              modify the provided parameter token trees."
+                )]
                 #[track_caller]
                 pub(crate) fn $infallible_is(self) -> ($($field),*) {
                     if let $over_t::$var{$($field:tt),*} = self.repr {
@@ -193,6 +227,12 @@ macro_rules! repr_impl {
                     }
                 }
 
+                #[allow(
+                    unused,
+                    reason = "The macro requires having some type parameters expand to \
+                              semantically unignored parameters because I can't think of a way to \
+                              modify the provided parameter token trees."
+                )]
                 #[track_caller]
                 pub(crate) fn $infallible_is_ref(self) -> ($(&$field),*) {
                     if let $over_t::$var{$($field:tt),*} = &self.repr {
@@ -205,6 +245,12 @@ macro_rules! repr_impl {
                 }
             )?
 
+            #[allow(
+                unused,
+                reason = "The macro requires having some type parameters expand to semantically \
+                          unignored parameters because I can't think of a way to modify the \
+                          provided parameter token trees."
+            )]
             pub(crate) fn $fallible_is(&self) -> bool {
                 matches!(&self.repr, $over_t::$var $(($($tuple),*))? $({$($field),*})?)
             }
@@ -265,9 +311,48 @@ pub(crate) struct State {
     //   empty as it comes from normal mode, but can be extended within select mode. A consequence
     //   of this is that range selection is reset back to an empty range once the user exits out of
     //   select mode.
+    // TODO: transition into the `Selection` type once its interface is done.
     selected: Range<usize>,
     prompt: String,
     pos: Position,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct Selection {
+    repr: Range<usize>,
+}
+
+impl Selection {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn extend(&mut self, dir: Dir) {
+        todo!()
+    }
+
+    pub(crate) fn decrease(&mut self, dir: Dir) {
+        todo!()
+    }
+}
+
+repr! {
+    #[derive(Debug)]
+    DirKind
+    #[derive(Debug)]
+    DirRepr => {
+        Up,
+        Down
+    }
+    #[derive(Debug)]
+    Dir
+}
+
+impl Dir {
+    repr_impl! { DirRepr => {
+        new_up, is_up, up, up_ref => Up;
+        new_down, is_down, down, down_ref => Down;
+    }}
 }
 
 // NOTE: we will require modifying some of the routines here once we get to
@@ -325,7 +410,7 @@ impl State {
             }
             // NOTE: this uses `BorrowedSubset` to add another degree of refinement to the set of
             // constants currently under consideration. This only happens in select mode, where the
-            // range in `selected` is non-empty.
+            // range in `selected` may be non-empty.
             UserEventKind::Toggle => {
                 let mut selected = filter_buf.select(selected);
 
@@ -335,24 +420,28 @@ impl State {
                     selected.deprecate();
                 }
             }
+            // TODO: this is the only piece of this routine that forces it to be run in an async
+            // context. This should not be the case, and this match arm should instead use a channel
+            // to send a message to the async rendering loop, such that while effecting changes
+            // there, we can also update the state and provide a minimal report message. I am
+            // hesitant to make the main drawing and update routines in the rendering loop be run in
+            // parallel because that would make sequential reaction to events much harder to
+            // implement.
             UserEventKind::Effect => constants.effect_changes().await?,
             UserEventKind::Clear => {
                 prompt.clear();
                 constants.filter_with(".*", filter_buf)?;
             }
-            // TODO: finish up handling immediate transitions between the list and the prompt.
             UserEventKind::Switch => match mode.kind() {
                 ModeKind::Insert => {
                     *mode = Mode::new_normal();
                     pos.transition();
                 }
-                ModeKind::Normal => {
-                    *mode = Mode::new_insert();
-                    todo!()
-                }
+                ModeKind::Normal => pos.transition(),
                 ModeKind::Select => {
-                    *mode = Mode::new_insert();
-                    todo!()
+                    *mode = Mode::new_normal();
+                    *selected = Range::default();
+                    pos.transition();
                 }
             },
             UserEventKind::ModeAction => {
@@ -399,8 +488,20 @@ impl State {
                     // NOTE: which one of the row or column should be modified is already handled in
                     // the corresponding impl of `Add` and `Sub` for `Position`. This allows us to
                     // converge events into two basic operations over an x-axis and a y-axis.
-                    ModeActionKind::GoLeft | ModeActionKind::GoUp => *pos -= 1,
-                    ModeActionKind::GoRight | ModeActionKind::GoDown => *pos += 1,
+                    ModeActionKind::GoLeft | ModeActionKind::GoUp => {
+                        *pos -= 1;
+
+                        if pos.is_list() && mode.is_select() {
+                            todo!();
+                        }
+                    }
+                    ModeActionKind::GoRight | ModeActionKind::GoDown => {
+                        *pos += 1;
+
+                        if pos.is_list() && mode.is_select() {
+                            todo!();
+                        }
+                    }
                 }
             }
         }
@@ -422,6 +523,7 @@ impl State {
         }
     }
 
+    #[expect(unused, reason = "WIP.")]
     pub(crate) fn draw(&self, mut stdout: impl Write) -> anyhow::Result<()> {
         let Self {
             events,
@@ -575,7 +677,7 @@ impl AddAssign<u16> for Position {
 impl Add<u16> for Position {
     type Output = Self;
 
-    fn add(mut self, rhs: u16) -> Self::Output {
+    fn add(self, rhs: u16) -> Self::Output {
         let mut out = self;
         let Self { repr, row, col } = &mut out;
 
@@ -648,10 +750,6 @@ repr! {
 }
 
 impl Mode {
-    fn new(repr: ModeRepr) -> Self {
-        Self { repr }
-    }
-
     pub(crate) fn interpret(&self, event: RawUserEvent) -> Option<UserEvent> {
         match (self.kind(), event.kind()) {
             // Insert mode
@@ -739,10 +837,6 @@ repr! {
 }
 
 impl UserEvent {
-    fn new(event: UserEventRepr) -> Self {
-        Self { repr: event }
-    }
-
     repr_impl! { UserEventRepr => {
         new_text, is_text, text, text_ref => TextualInput(c: char);
         new_action, is_action, action, action_ref => ModeAction(action: ModeAction);
@@ -830,10 +924,6 @@ repr! {
 }
 
 impl RawUserEvent {
-    fn new(event: RawUserEventRepr) -> Self {
-        Self { repr: event }
-    }
-
     repr_impl! { RawUserEventRepr => {
         new_space, is_space, space, space_ref => Space;
         new_text, is_text, text, text_ref => PlainText(c: char);
@@ -844,46 +934,118 @@ impl RawUserEvent {
     }}
 }
 
-pub(crate) static SYNC_BUF: LazyLock<Mutex<Stdout>> = LazyLock::new(|| Mutex::new(io::stdout()));
+// NOTE: this wrapper type is used for the purposes of driving async execution
+// within non-async contexts, like an impl of `std::io::Write`. More
+// specifically, this type is geared towards allowing `tokio::io` utilities to
+// be used alongside `crossterm` command execution, which requires writers from
+// `std::io::Write`.
+//
+// This type serves as a compatiblity shim so that we can use async stdio
+// streams in sync contexts. Of course, the computation that is driven with the
+// stored runtime is fundamentally equivalent to the same computation in sync
+// code because it awaits the result of the closure passed to the `drive_io`
+// method. The goal is simply to have ascyn writers type check in sync contexts.
+#[derive(Debug)]
+struct AsyncWriter<T: AsyncWrite + Unpin + Send + Sync> {
+    writer: T,
+    rt: Runtime,
+}
+
+impl<T: AsyncWrite + Unpin + Send + Sync> AsRef<T> for AsyncWriter<T> {
+    fn as_ref(&self) -> &T {
+        let Self { writer, .. } = self;
+
+        writer
+    }
+}
+
+impl<T: AsyncWrite + Unpin + Send + Sync> AsMut<T> for AsyncWriter<T> {
+    fn as_mut(&mut self) -> &mut T {
+        let Self { writer, .. } = self;
+
+        writer
+    }
+}
+
+impl<T: AsyncWrite + Unpin + Send + Sync> AsyncWriter<T> {
+    fn new(writer: T) -> io::Result<Self> {
+        // NOTE: we set the queue and event intervals to larger values than the default,
+        // because according to the `tokio` docs, tasks that quickly yield in contexts
+        // that don't require fairness may do better with those. Considering the purpose
+        // of this wrapper type, that seems fitting.
+        Builder::new_current_thread()
+            .global_queue_interval(512)
+            .event_interval(512)
+            .enable_io()
+            .build()
+            .map(|rt| Self { writer, rt })
+    }
+
+    fn drive_io<O>(&mut self, mut f: impl AsyncFnMut(&mut T) -> io::Result<O>) -> io::Result<O> {
+        let Self { writer, rt } = self;
+
+        rt.block_on(async move { f(writer).await })
+    }
+}
+
+// NOTE: this impl serves us to get an impl for `crossterm::ExecutableCommand`
+// and `crossterm::QueueableCommand`, because those traits have blanket ipmls
+// for any type implementing `Write`. Implementing directly those types is not
+// possible, because it requires calling into the passed `Command`'s
+// `write_ansi()` method, itself requiring an writer from `std`.
+impl<T: AsyncWrite + Unpin + Send + Sync> Write for AsyncWriter<T> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.drive_io(async |writer| writer.write(buf).await)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.drive_io(async |writer| writer.flush().await)
+    }
+}
+
+// NOTE: this is wrapped in a `Mutex` to get interior mutability, as that is
+// required for the draw handle to be used in both the `prepare_space` routine
+// and in the `draw` method to re-render the screen.
+//
+// It uses the wrapper type we created above so that we can use a
+// `tokio::io::Stdout` instead of a `std::io::Stdout`, as the latter option
+// would require locking the stream prior to entry to the rendering loop. This
+// can then cause some finicky issues with the lock (which internally uses the
+// unstable `ReentrantLock`) being `!Send + !Sync`.
+pub(crate) static SYNC_BUF: LazyLock<Mutex<AsyncWriter<Stdout>>> = LazyLock::new(|| {
+    Mutex::const_new(
+        AsyncWriter::new(tokio::io::stdout())
+            .expect("failed to initialize async buffer for terminal display"),
+    )
+});
 
 pub(crate) async fn render(mut state: State) -> anyhow::Result<()> {
-    let mut stdout = SYNC_BUF.lock().await;
-
     loop {
-        // NOTE: there may be a better way of doing this, as I don't believe constant
-        // moves on every loop iteration are even remotely optimal. The reason why we
-        // have to move everything into the closure is because `tokio` requires
-        // everything that is captured to be captured for `'static`.
-        (state, stdout) = task::spawn_blocking(move || draw_screen(state, stdout)).await??;
+        draw_screen(&mut state).await?;
 
-        if update(&mut state).await.should_terminate() {
+        if update(&mut state).await?.should_terminate() {
             break Ok(());
         }
     }
 }
 
-pub(crate) fn draw_screen(
-    state: State,
-    mut stdout: MutexGuard<'_, Stdout>,
-) -> anyhow::Result<(State, MutexGuard<'_, Stdout>)> {
-    state.draw(&mut *stdout)?;
-
-    Ok((state, stdout))
+pub(crate) async fn draw_screen(state: &mut State) -> anyhow::Result<()> {
+    state.draw(&mut *SYNC_BUF.lock().await)
 }
 
-pub(crate) async fn update(state: &mut State) -> Termination<()> {
+pub(crate) async fn update(state: &mut State) -> anyhow::Result<Termination<()>> {
     let res = state.receive_event();
 
     if res.should_terminate() {
-        return Termination::terminate();
+        return Ok(Termination::terminate());
     }
 
     // NOTE: this won't panic because the inner representation for a state of
     // termination has already been proved to not be a termination state by the
     // above condition.
-    state.update(res.into_inner()).await;
+    state.update(res.into_inner()).await?;
 
-    Termination::keep_going(())
+    Ok(Termination::keep_going(()))
 }
 
 pub(crate) async fn handle_input(channel: UnboundedSender<RawUserEvent>) -> anyhow::Result<()> {
