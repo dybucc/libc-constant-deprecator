@@ -1,12 +1,14 @@
 #![feature(range_bounds_is_empty, range_into_bounds)]
 
 use std::{
+    borrow::{Borrow, BorrowMut},
     cmp::Ordering,
+    collections::HashMap,
     env,
     io::Write,
     ops::{Add, AddAssign, Bound, ControlFlow, IntoBounds, Range, RangeBounds, Sub, SubAssign},
     path::PathBuf,
-    sync::{LazyLock, OnceLock},
+    sync::{Arc, LazyLock, OnceLock},
 };
 
 use clap::Parser;
@@ -155,6 +157,8 @@ macro_rules! repr_impl {
         $(
             #[allow(
                 unused,
+                    renamed_and_removed_lints,
+                    wrong_self_convention,
                 reason = "The macro requires having some type parameters expand to semantically \
                           unignored parameters because I can't think of a way to modify the \
                           provided parameter token trees."
@@ -177,6 +181,8 @@ macro_rules! repr_impl {
             $(
                 #[allow(
                     unused,
+                    renamed_and_removed_lints,
+                    wrong_self_convention,
                     reason = "The macro requires having some type parameters expand to \
                               semantically unignored parameters because I can't think of a way to \
                               modify the provided parameter token trees."
@@ -194,6 +200,8 @@ macro_rules! repr_impl {
 
                 #[allow(
                     unused,
+                    renamed_and_removed_lints,
+                    wrong_self_convention,
                     reason = "The macro requires having some type parameters expand to \
                               semantically unignored parameters because I can't think of a way to \
                               modify the provided parameter token trees."
@@ -213,6 +221,8 @@ macro_rules! repr_impl {
             $(
                 #[allow(
                     unused,
+                    renamed_and_removed_lints,
+                    wrong_self_convention,
                     reason = "The macro requires having some type parameters expand to \
                               semantically unignored parameters because I can't think of a way to \
                               modify the provided parameter token trees."
@@ -230,6 +240,8 @@ macro_rules! repr_impl {
 
                 #[allow(
                     unused,
+                    renamed_and_removed_lints,
+                    wrong_self_convention,
                     reason = "The macro requires having some type parameters expand to \
                               semantically unignored parameters because I can't think of a way to \
                               modify the provided parameter token trees."
@@ -248,6 +260,8 @@ macro_rules! repr_impl {
 
             #[allow(
                 unused,
+                renamed_and_removed_lints,
+                wrong_self_convention,
                 reason = "The macro requires having some type parameters expand to semantically \
                           unignored parameters because I can't think of a way to modify the \
                           provided parameter token trees."
@@ -298,8 +312,7 @@ impl<T> TerminationRepr<T> {
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct State {
+pub(crate) struct State<'a> {
     events: UnboundedReceiver<RawUserEvent>,
     mode: Mode,
     constants: ConstContainer,
@@ -315,6 +328,12 @@ pub(crate) struct State {
     selected: Selection,
     prompt: String,
     pos: Position,
+    mode_info: ModeInfo<'a>,
+}
+
+#[derive(Default)]
+pub(crate) struct ModeInfo<'a> {
+    transition_callback_map: ModeTransitionMap<'a>,
 }
 
 // NOTE: This serves as an extension trait over the functionality already
@@ -353,7 +372,7 @@ pub(crate) struct Selection {
     repr: SelectionRange,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 struct SelectionRange {
     repr: Range<u16>,
 }
@@ -403,6 +422,12 @@ impl SelectionRange {
         &mut repr.end
     }
 
+    // NOTE: the purpose of this routine is to check which one of the `start` or
+    // `end` bounds on the underlying range should be modified, provided the current
+    // internal state. Because the range is never reversed, we can guarantee that
+    // the start and end bounds are either unequal, in which case we must always
+    // increase or decrease (depending on whether the event is an `up` motion or a
+    // `down` motion) the end bound, or strictly decrease the start bound.
     fn bounds_extend(&mut self) -> Bound<&mut u16> {
         let Self {
             repr: Range { start, end },
@@ -420,6 +445,22 @@ impl SelectionRange {
     }
 }
 
+// NOTE: we need to implement `Default` manually because otherwise it uses the
+// `Default` impl of the polymorphic type, which in this case is `u16`. For our
+// invariants to be upkept, we require the selection to always be either empty
+// or non-empty, but never with the same lower and upper bounds.
+impl Default for SelectionRange {
+    fn default() -> Self {
+        Self {
+            repr: Range { start: 0, end: 1 },
+        }
+    }
+}
+
+#[expect(
+    unused,
+    reason = "It's mostly just accessor and mutator methods that exist for symmetry's sake."
+)]
 impl Selection {
     pub(crate) fn new() -> Self {
         Self::default()
@@ -521,7 +562,7 @@ impl Dir {
 
 // NOTE: we will require modifying some of the routines here once we get to
 // implementing scrolling in the 10-row list of constant symbols.
-impl State {
+impl State<'_> {
     pub(crate) fn new(constants: ConstContainer) -> (Self, UnboundedSender<RawUserEvent>) {
         let (tx, rx) = mpsc::unbounded_channel();
 
@@ -538,6 +579,7 @@ impl State {
                 selected: Selection::default(),
                 prompt: String::default(),
                 pos: Position::default(),
+                mode_info: ModeInfo::default(),
             },
             tx,
         )
@@ -575,36 +617,13 @@ impl State {
             // NOTE: this uses `BorrowedSubset` to add another degree of refinement to the set of
             // constants currently under consideration. This only happens in select mode, where the
             // range in `selected` may be non-empty.
-            UserEventKind::Toggle => {
-                let mut selected = filter_buf.select(selected.map(|range| {
-                    let (Bound::Included(start), Bound::Excluded(end)) =
-                        range.range_ref().clone().into_bounds()
-                    else {
-                        unreachable!(
-                            "The range under consideration is always bounded inclusively below \
-                             and exclusively above."
-                        );
-                    };
-
-                    Range {
-                        start: usize::from(start),
-                        end: usize::from(end),
-                    }
-                }));
-
-                if all_deprecated(&selected) {
-                    selected.undeprecate();
-                } else {
-                    selected.deprecate();
-                }
-            }
+            UserEventKind::Toggle => toggle_in_select(filter_buf, selected),
             // TODO: this is the only piece of this routine that forces it to be run in an async
             // context. This should not be the case, and this match arm should instead use a channel
             // to send a message to the async rendering loop, such that while effecting changes
             // there, we can also update the state and provide a minimal report message. I am
             // hesitant to make the main drawing and update routines in the rendering loop be run in
-            // parallel because that would make sequential reaction to events much harder to
-            // implement.
+            // parallel because that would make sequential reaction to events harder to implement.
             UserEventKind::Effect => constants.effect_changes().await?,
             UserEventKind::Clear => {
                 prompt.clear();
@@ -628,16 +647,25 @@ impl State {
                 match action.kind() {
                     ModeActionKind::ModeSwitch => {
                         let new_mode = action.mode();
-
-                        match (mode.kind(), new_mode.kind()) {
-                            (ModeKind::Normal, ModeKind::Insert) => {
+                        let mut callbacks = ModeTransitionMap::default();
+                        callbacks
+                            .add(Mode::new_normal(), Mode::new_insert(), |mode| {
                                 *mode = new_mode;
 
                                 if pos.is_list() {
                                     pos.transition();
                                 }
-                            }
-                            (ModeKind::Insert, ModeKind::Normal) => *mode = new_mode,
+                            })
+                            .add(Mode::new_insert(), Mode::new_normal(), |mode| {
+                                *mode = new_mode;
+                            })
+                            .add(Mode::new_normal(), Mode::new_select(), |mode| {
+                                if pos.is_list() {
+                                    *mode = new_mode;
+                                }
+                            });
+
+                        match (mode.kind(), new_mode.kind()) {
                             (ModeKind::Normal, ModeKind::Select) if pos.is_list() => {
                                 *mode = new_mode;
                             }
@@ -725,6 +753,30 @@ impl State {
         // this drawing call.
 
         stdout.flush().map_err(Into::into)
+    }
+}
+
+fn toggle_in_select(filter_buf: &mut BorrowedContainer, selected: &Selection) {
+    let mut selected = filter_buf.select(selected.map(|range| {
+        let (Bound::Included(start), Bound::Excluded(end)) =
+            range.range_ref().clone().into_bounds()
+        else {
+            unreachable!(
+                "The range under consideration is always bounded inclusively below and \
+                 exclusively above."
+            );
+        };
+
+        Range {
+            start: usize::from(start),
+            end: usize::from(end),
+        }
+    }));
+
+    if all_deprecated(&selected) {
+        selected.undeprecate();
+    } else {
+        selected.deprecate();
     }
 }
 
@@ -919,19 +971,100 @@ impl Default for Position {
 repr! {
     #[derive(Debug, Default, Clone, Copy)]
     ModeKind
-    #[derive(Debug, Default, Clone, Copy)]
+    #[derive(Debug, Default, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
     ModeRepr => {
         Insert,
         #[default]
         Normal,
         Select,
     }
-    #[derive(Debug, Default)]
+    #[derive(Debug, Default, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
     Mode
 }
 
+repr! {
+    #[derive(Debug, Clone, Copy)]
+    ModeTransitionKind
+    #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
+    ModeTransitionRepr => {
+        Insert(Mode),
+        Normal(Mode),
+        Select(Mode),
+    }
+    #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
+    ModeTransition
+}
+
+impl ModeTransition {
+    fn new(src_mode: Mode, dst_mode: Mode) -> Self {
+        match (src_mode.kind(), dst_mode.kind()) {
+            (ModeKind::Insert, ModeKind::Normal) => Self::insert_to(dst_mode),
+            (ModeKind::Normal, ModeKind::Insert | ModeKind::Select) => Self::normal_to(dst_mode),
+            (ModeKind::Select, ModeKind::Insert | ModeKind::Normal) => Self::select_to(dst_mode),
+            _ => unreachable!(
+                "If you hit this case, then either (1) there's a bug in the implementation of \
+                 mode transitioning, or (2) there's been a change in the types of mode \
+                 transitions that we allow and not all relevant state has been updated."
+            ),
+        }
+    }
+
+    repr_impl! { ModeTransitionRepr => {
+        insert_to, is_insert_to, from_insert, from_insert_ref => Insert(m: Mode);
+        normal_to, is_normal_to, from_normal, from_normal_ref => Normal(m: Mode);
+        select_to, is_select_to, from_select, from_select_ref => Select(m: Mode);
+    }}
+}
+
+type CallbackMap<'a> = HashMap<ModeTransition, Arc<dyn FnMut(&mut Mode) + 'a>>;
+
+#[derive(Default)]
+pub(crate) struct ModeTransitionMap<'a> {
+    inner: CallbackMap<'a>,
+}
+
+impl<'a> ModeTransitionMap<'a> {
+    pub(crate) fn add<F>(&mut self, src_mode: Mode, dst_mode: Mode, f: F) -> &mut Self
+    where
+        F: FnMut(&mut Mode) + 'a,
+    {
+        let Self { inner } = self;
+        inner.insert(ModeTransition::new(src_mode, dst_mode), Arc::new(f));
+
+        self
+    }
+}
+
 impl Mode {
-    pub(crate) fn interpret(&self, event: RawUserEvent) -> Option<UserEvent> {
+    pub(crate) fn transition<'a>(
+        &mut self,
+        new_mode: impl Borrow<Self>,
+        mut callbacks: ModeTransitionMap<'a>,
+    ) {
+        let Self { repr } = *self;
+        let Self { repr: orepr } = *new_mode.borrow();
+        let callbacks = callbacks.borrow_mut();
+
+        match (repr, orepr) {
+            (ModeRepr::Insert, ModeRepr::Normal) => todo!(),
+            (ModeRepr::Normal, ModeRepr::Insert) => todo!(),
+            (ModeRepr::Normal, ModeRepr::Select) => todo!(),
+            (ModeRepr::Select, ModeRepr::Insert) => todo!(),
+            (ModeRepr::Select, ModeRepr::Normal) => todo!(),
+
+            // NOTE: other cases include non-sensical transitions between the same one mode. Other
+            // cases to note include:
+            // + Going from normal mode to select mode while navigating the prompt in normal mode.
+            //   This is not possible, because going into select mode requires focus to be in the
+            //   list container.
+            // + Going from insert to select mode, which is not possible because select mode is only
+            //   reachable through normal mode, and more specifically, while focus is on the list
+            //   container.
+            _ => (),
+        }
+    }
+
+    pub(crate) fn interpret(self, event: RawUserEvent) -> Option<UserEvent> {
         match (self.kind(), event.kind()) {
             // Insert mode
             (ModeKind::Insert, RawUserEventKind::PlainText) => UserEvent::new_text(event.text()),
@@ -976,7 +1109,7 @@ impl Mode {
             }
 
             // NOTE: this includes a bunch of cases where input processing shouldn't even be
-            // performed, as the combination of mode/event does not make for a viable event to
+            // performed, as the combination of mode/event does not make for a logical event to
             // process.
             _ => return None,
         }
@@ -1200,7 +1333,7 @@ pub(crate) static SYNC_BUF: LazyLock<Mutex<AsyncWriter<Stdout>>> = LazyLock::new
     )
 });
 
-pub(crate) async fn render(mut state: State) -> anyhow::Result<()> {
+pub(crate) async fn render(mut state: State<'_>) -> anyhow::Result<()> {
     loop {
         draw_screen(&mut state).await?;
 
@@ -1210,11 +1343,11 @@ pub(crate) async fn render(mut state: State) -> anyhow::Result<()> {
     }
 }
 
-pub(crate) async fn draw_screen(state: &mut State) -> anyhow::Result<()> {
+pub(crate) async fn draw_screen(state: &mut State<'_>) -> anyhow::Result<()> {
     state.draw(&mut *SYNC_BUF.lock().await)
 }
 
-pub(crate) async fn update(state: &mut State) -> anyhow::Result<Termination<()>> {
+pub(crate) async fn update(state: &mut State<'_>) -> anyhow::Result<Termination<()>> {
     let res = state.receive_event();
 
     if res.should_terminate() {
