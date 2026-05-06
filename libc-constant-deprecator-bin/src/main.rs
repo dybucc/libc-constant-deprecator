@@ -1,9 +1,10 @@
-#![feature(range_bounds_is_empty)]
+#![feature(range_bounds_is_empty, range_into_bounds)]
 
 use std::{
+    cmp::Ordering,
     env,
-    io::{self, Write},
-    ops::{Add, AddAssign, ControlFlow, Range, RangeBounds, Sub, SubAssign},
+    io::Write,
+    ops::{Add, AddAssign, Bound, ControlFlow, IntoBounds, Range, RangeBounds, Sub, SubAssign},
     path::PathBuf,
     sync::{LazyLock, OnceLock},
 };
@@ -18,7 +19,7 @@ use crossterm::{
 use futures::{StreamExt, future};
 use libc_constant_deprecator_lib::{BorrowedContainer, ConstContainer, Visit};
 use tokio::{
-    io::{AsyncWrite, AsyncWriteExt, Stdout},
+    io::{self, AsyncWrite, AsyncWriteExt, Stdout},
     runtime::{Builder, Runtime},
     sync::{
         Mutex,
@@ -311,15 +312,112 @@ pub(crate) struct State {
     //   empty as it comes from normal mode, but can be extended within select mode. A consequence
     //   of this is that range selection is reset back to an empty range once the user exits out of
     //   select mode.
-    // TODO: transition into the `Selection` type once its interface is done.
-    selected: Range<usize>,
+    selected: Selection,
     prompt: String,
     pos: Position,
 }
 
-#[derive(Debug, Default)]
+// NOTE: This serves as an extension trait over the functionality already
+// offered in `RangeBounds`, only instead of returning an immutable reference
+// within the bound, it returns a mutable reference to the underlying `Idx`
+// type. This can also be accomplished with a `Bound<T>::as_mut()`, but that
+// method appends another level of indirection to the inner `T` if it is a `&T`
+// and not an owned `T` (i.e. you end up with a `Bound<&mut &T>` instead of
+// `Bound<&mut T>` where `T` is owned in this latter case.)
+trait RangeBoundsExt<T> {
+    fn start_bound_mut(&mut self) -> Bound<&mut T>;
+    fn end_bound_mut(&mut self) -> Bound<&mut T>;
+}
+
+macro_rules! range_bounds_impl {
+    (@body => $bound:expr, $bound_id:expr) => {
+        $bound.map(|_| ()).map(|_| $bound_id)
+    };
+    ($t:tt$(<T $(, $it:tt)*>)?) => {
+        impl<T $(, $($it),*)?> RangeBoundsExt<T> for $t$(<T$(, $($it),+)?>)? {
+            fn start_bound_mut(&mut self) -> Bound<&mut T> {
+                range_bounds_impl! { @body => self.start_bound(), &mut self.start}
+            }
+
+            fn end_bound_mut(&mut self) -> Bound<&mut T> {
+                range_bounds_impl! { @body => self.end_bound(), &mut self.end }
+            }
+        }
+    };
+}
+
+range_bounds_impl! { Range<T> }
+
+#[derive(Debug, Default, Clone)]
 pub(crate) struct Selection {
-    repr: Range<usize>,
+    repr: SelectionRange,
+}
+
+#[derive(Debug, Default, Clone)]
+struct SelectionRange {
+    repr: Range<u16>,
+}
+
+#[expect(
+    unused,
+    reason = "It's mostly just accessor and mutator methods that exist for symmetry's sake."
+)]
+impl SelectionRange {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn start_bound_mut(&mut self) -> Bound<&mut u16> {
+        let Self { repr } = self;
+
+        repr.start_bound_mut()
+    }
+
+    fn start_ref(&self) -> &u16 {
+        let Self { repr } = self;
+
+        &repr.start
+    }
+
+    fn start_mut(&mut self) -> &mut u16 {
+        let Self { repr } = self;
+
+        &mut repr.start
+    }
+
+    fn end_bound_mut(&mut self) -> Bound<&mut u16> {
+        let Self { repr } = self;
+
+        repr.start_bound_mut()
+    }
+
+    fn end_ref(&self) -> &u16 {
+        let Self { repr } = self;
+
+        &repr.end
+    }
+
+    fn end_mut(&mut self) -> &mut u16 {
+        let Self { repr } = self;
+
+        &mut repr.end
+    }
+
+    fn bounds_extend(&mut self) -> Bound<&mut u16> {
+        let Self {
+            repr: Range { start, end },
+        } = self.clone();
+        let Self { repr } = self;
+
+        match start.cmp(&end) {
+            Ordering::Equal => repr.start_bound_mut(),
+            Ordering::Greater => repr.end_bound_mut(),
+            Ordering::Less => unreachable!(
+                "If you hit this case, then there's a bug in the input handling logic. Review \
+                 `State::update` and `Mode::interpret`."
+            ),
+        }
+    }
 }
 
 impl Selection {
@@ -327,31 +425,97 @@ impl Selection {
         Self::default()
     }
 
-    pub(crate) fn extend(&mut self, dir: Dir) {
-        todo!()
+    pub(crate) fn map<T>(&self, f: impl FnOnce(&Self) -> T) -> T {
+        f(self)
     }
 
-    pub(crate) fn decrease(&mut self, dir: Dir) {
-        todo!()
+    pub(crate) fn range(self) -> Range<u16> {
+        let Self {
+            repr: SelectionRange { repr },
+        } = self;
+
+        repr
+    }
+
+    pub(crate) fn range_ref(&self) -> &Range<u16> {
+        let Self {
+            repr: SelectionRange { repr },
+        } = self;
+
+        repr
+    }
+
+    pub(crate) fn range_mut(&mut self) -> &mut Range<u16> {
+        let Self {
+            repr: SelectionRange { repr },
+        } = self;
+
+        repr
+    }
+
+    pub(crate) fn extend(&mut self, dir: Dir) {
+        let Self { repr } = self;
+
+        match dir.kind() {
+            // If navigation has gone up, then the selection must either:
+            // (1) Decrease the `end` bound of the underlying range.
+            //     This happens when the selection range is non-empty.
+            // (2) Decrease the `start` bound of the underlying range.
+            //     This happens when the selection range is empty, and so it must be expanded above.
+            DirKind::Up => {
+                // NOTE: there is no way the bound produced is `Unbounded`, as the overarching
+                // `Range` type does not handle that type of range.
+                if let Bound::Included(inner) | Bound::Excluded(inner) = repr.bounds_extend() {
+                    *inner = inner.saturating_sub(1);
+                }
+            }
+            // If navigation browses down, then it holds that the end bound is the only possible
+            // index to be affected. This is because the range is never reversed, so the start bound
+            // always goes up, while the end bound may go up or down.
+            DirKind::Down => {
+                let start = *repr.start_ref();
+                let end = *repr.end_ref();
+
+                *repr.end_mut() = if start + end < 9 { end + 1 } else { 9 };
+            }
+        }
+    }
+}
+
+impl RangeBounds<u16> for Selection {
+    fn start_bound(&self) -> Bound<&u16> {
+        let Self {
+            repr: SelectionRange { repr },
+        } = self;
+
+        repr.start_bound()
+    }
+
+    fn end_bound(&self) -> Bound<&u16> {
+        let Self {
+            repr: SelectionRange { repr },
+        } = self;
+
+        repr.end_bound()
     }
 }
 
 repr! {
-    #[derive(Debug)]
+    #[derive(Debug, Clone, Copy)]
     DirKind
-    #[derive(Debug)]
+    #[derive(Debug, Clone, Copy)]
     DirRepr => {
         Up,
         Down
     }
-    #[derive(Debug)]
+    #[derive(Debug, Clone, Copy)]
     Dir
 }
 
 impl Dir {
     repr_impl! { DirRepr => {
-        new_up, is_up, up, up_ref => Up;
-        new_down, is_down, down, down_ref => Down;
+        new_up, is_up, _d, _d => Up;
+        new_down, is_down, _d, _d => Down;
     }}
 }
 
@@ -371,7 +535,7 @@ impl State {
                 mode: Mode::default(),
                 filter_buf: constants.borrowed(),
                 constants,
-                selected: Range::default(),
+                selected: Selection::default(),
                 prompt: String::default(),
                 pos: Position::default(),
             },
@@ -401,7 +565,7 @@ impl State {
             UserEventKind::Search => constants.filter_with(&prompt, filter_buf)?,
             // NOTE: toggles all constants because we are either (1) outside select mode, or (2)
             // within it but without a selection ranging beyond a single row.
-            UserEventKind::Toggle if <Range<usize> as RangeBounds<usize>>::is_empty(selected) => {
+            UserEventKind::Toggle if selected.is_empty() => {
                 if all_deprecated(filter_buf) {
                     filter_buf.undeprecate();
                 } else {
@@ -412,7 +576,21 @@ impl State {
             // constants currently under consideration. This only happens in select mode, where the
             // range in `selected` may be non-empty.
             UserEventKind::Toggle => {
-                let mut selected = filter_buf.select(selected);
+                let mut selected = filter_buf.select(selected.map(|range| {
+                    let (Bound::Included(start), Bound::Excluded(end)) =
+                        range.range_ref().clone().into_bounds()
+                    else {
+                        unreachable!(
+                            "The range under consideration is always bounded inclusively below \
+                             and exclusively above."
+                        );
+                    };
+
+                    Range {
+                        start: usize::from(start),
+                        end: usize::from(end),
+                    }
+                }));
 
                 if all_deprecated(&selected) {
                     selected.undeprecate();
@@ -440,7 +618,7 @@ impl State {
                 ModeKind::Normal => pos.transition(),
                 ModeKind::Select => {
                     *mode = Mode::new_normal();
-                    *selected = Range::default();
+                    *selected = Selection::default();
                     pos.transition();
                 }
             },
@@ -465,12 +643,12 @@ impl State {
                             }
                             (ModeKind::Select, ModeKind::Insert) => {
                                 *mode = new_mode;
-                                *selected = Range::default();
+                                *selected = Selection::default();
                                 pos.transition();
                             }
                             (ModeKind::Select, ModeKind::Normal) => {
                                 *mode = new_mode;
-                                *selected = Range::default();
+                                *selected = Selection::default();
                             }
 
                             // NOTE: other cases include non-sensical transitions between the same
@@ -488,6 +666,9 @@ impl State {
                     // NOTE: which one of the row or column should be modified is already handled in
                     // the corresponding impl of `Add` and `Sub` for `Position`. This allows us to
                     // converge events into two basic operations over an x-axis and a y-axis.
+                    // TODO: handle updating the `start` and `end` bounds on underlying range of
+                    // `selected` whenever it is that we move across list items, irrespective of
+                    // active mode.
                     ModeActionKind::GoLeft | ModeActionKind::GoUp => {
                         *pos -= 1;
 
@@ -616,12 +797,12 @@ impl Position {
     // offset `row`.
     repr_impl! { PositionRepr => {
         new_prompt {
-            row: PROMPT_START.get().unwrap().1,
+            row: PROMPT_COORD.get().unwrap().1,
             col,
         },
         is_prompt, prompt, prompt_ref => Prompt(col: u16);
         new_list {
-            row: PROMPT_START.get().unwrap().1 + 1 + row,
+            row: PROMPT_COORD.get().unwrap().1 + 1 + row,
             col: u16::default(),
         },
         is_list, list, list_ref => List(row: u16);
@@ -1014,7 +1195,7 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Write for AsyncWriter<T> {
 // unstable `ReentrantLock`) being `!Send + !Sync`.
 pub(crate) static SYNC_BUF: LazyLock<Mutex<AsyncWriter<Stdout>>> = LazyLock::new(|| {
     Mutex::const_new(
-        AsyncWriter::new(tokio::io::stdout())
+        AsyncWriter::new(io::stdout())
             .expect("failed to initialize async buffer for terminal display"),
     )
 });
@@ -1114,7 +1295,7 @@ pub(crate) async fn handle_input(channel: UnboundedSender<RawUserEvent>) -> anyh
 // changing their terminal emulator size, which we don't handle just yet, this
 // should be constant beyond its point of initialization in `prepare_space()`.
 // That is why, at the moment, we use `OnceLock`.
-static PROMPT_START: OnceLock<(u16, u16)> = OnceLock::new();
+static PROMPT_COORD: OnceLock<(u16, u16)> = OnceLock::new();
 
 pub(crate) async fn prepare_space() -> anyhow::Result<()> {
     let (_, rows) = terminal::size()?;
@@ -1139,9 +1320,9 @@ pub(crate) async fn prepare_space() -> anyhow::Result<()> {
 
         // NOTE: we `unwrap` here because there's no point in assumming that the static
         // got initialized already, and that's the only point of failure. At the time of
-        // writing, this flow of execution when entering this routine is fully
-        // sequential (of course, only in appearance.)
-        PROMPT_START.set(cursor::position()?).unwrap();
+        // writing, the flow of execution when entering this routine is fully sequential
+        // (of course, only in appearance.)
+        PROMPT_COORD.set(cursor::position()?).unwrap();
     }
 
     stdout.flush()?;
