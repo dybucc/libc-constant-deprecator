@@ -3,12 +3,11 @@
 use std::{
     borrow::{Borrow, BorrowMut},
     cmp::Ordering,
-    collections::HashMap,
     env,
     io::Write,
     ops::{Add, AddAssign, Bound, ControlFlow, IntoBounds, Range, RangeBounds, Sub, SubAssign},
     path::PathBuf,
-    sync::{Arc, LazyLock, OnceLock},
+    sync::{LazyLock, OnceLock},
 };
 
 use clap::Parser;
@@ -293,26 +292,12 @@ repr! {
 impl<T> Termination<T> {
     repr_impl! { TerminationRepr => {
         terminate, should_terminate, _d, _d => Termination;
-        keep_going, should_unterminate, non_terminate, non_terminate_ref => NonTermination(t: T);
+        keep_going, should_unterminate, into_inner, non_terminate => NonTermination(t: T);
     }}
-
-    #[track_caller]
-    pub(crate) fn into_inner(self) -> T {
-        self.repr.unwrap()
-    }
 }
 
-impl<T> TerminationRepr<T> {
-    #[track_caller]
-    pub(crate) fn unwrap(self) -> T {
-        match self {
-            Self::Termination => panic!(),
-            Self::NonTermination(val) => val,
-        }
-    }
-}
-
-pub(crate) struct State<'a> {
+#[derive(Debug)]
+pub(crate) struct State {
     events: UnboundedReceiver<RawUserEvent>,
     mode: Mode,
     constants: ConstContainer,
@@ -328,12 +313,6 @@ pub(crate) struct State<'a> {
     selected: Selection,
     prompt: String,
     pos: Position,
-    mode_info: ModeInfo<'a>,
-}
-
-#[derive(Default)]
-pub(crate) struct ModeInfo<'a> {
-    transition_callback_map: ModeTransitionMap<'a>,
 }
 
 // NOTE: This serves as an extension trait over the functionality already
@@ -392,7 +371,7 @@ impl SelectionRange {
         repr.start_bound_mut()
     }
 
-    fn start_ref(&self) -> &u16 {
+    fn start(&self) -> &u16 {
         let Self { repr } = self;
 
         &repr.start
@@ -410,7 +389,7 @@ impl SelectionRange {
         repr.start_bound_mut()
     }
 
-    fn end_ref(&self) -> &u16 {
+    fn end(&self) -> &u16 {
         let Self { repr } = self;
 
         &repr.end
@@ -422,13 +401,31 @@ impl SelectionRange {
         &mut repr.end
     }
 
+    fn into_inner(self) -> Range<u16> {
+        let Self { repr } = self;
+
+        repr
+    }
+
+    fn inner(&self) -> &Range<u16> {
+        let Self { repr } = self;
+
+        repr
+    }
+
+    fn inner_mut(&mut self) -> &mut Range<u16> {
+        let Self { repr } = self;
+
+        repr
+    }
+
     // NOTE: the purpose of this routine is to check which one of the `start` or
     // `end` bounds on the underlying range should be modified, provided the current
     // internal state. Because the range is never reversed, we can guarantee that
     // the start and end bounds are either unequal, in which case we must always
     // increase or decrease (depending on whether the event is an `up` motion or a
     // `down` motion) the end bound, or strictly decrease the start bound.
-    fn bounds_extend(&mut self) -> Bound<&mut u16> {
+    fn bound_to_extend(&mut self) -> Bound<&mut u16> {
         let Self {
             repr: Range { start, end },
         } = self.clone();
@@ -436,8 +433,8 @@ impl SelectionRange {
 
         match start.cmp(&end) {
             Ordering::Equal => repr.start_bound_mut(),
-            Ordering::Greater => repr.end_bound_mut(),
-            Ordering::Less => unreachable!(
+            Ordering::Less => repr.end_bound_mut(),
+            Ordering::Greater => unreachable!(
                 "If you hit this case, then there's a bug in the input handling logic. Review \
                  `State::update` and `Mode::interpret`."
             ),
@@ -494,8 +491,15 @@ impl Selection {
         repr
     }
 
-    pub(crate) fn extend(&mut self, dir: Dir) {
+    // FIXME: the selection needs to record some form of pivot cursor position when
+    // entering select mode, such that we may use that to further determine whether
+    // the selection should move up by changing the underlying `start` bound and
+    // keeping the `end` bound fixed, or if it should instead decrease the selection
+    // by decreasing the `end` bound. This will likely involve a larger refactor of
+    // the `Selection` type.
+    pub(crate) fn extend(&mut self, dir: Dir, pos: impl Borrow<Position>) {
         let Self { repr } = self;
+        let pos = pos.borrow();
 
         match dir.kind() {
             // If navigation has gone up, then the selection must either:
@@ -504,9 +508,9 @@ impl Selection {
             // (2) Decrease the `start` bound of the underlying range.
             //     This happens when the selection range is empty, and so it must be expanded above.
             DirKind::Up => {
-                // NOTE: there is no way the bound produced is `Unbounded`, as the overarching
-                // `Range` type does not handle that type of range.
-                if let Bound::Included(inner) | Bound::Excluded(inner) = repr.bounds_extend() {
+                // NOTE: there is no way the bound produced is `Bound::Unbounded`, as the
+                // overarching `Range` type does not handle that variant.
+                if let Bound::Included(inner) | Bound::Excluded(inner) = repr.bound_to_extend() {
                     *inner = inner.saturating_sub(1);
                 }
             }
@@ -514,8 +518,8 @@ impl Selection {
             // index to be affected. This is because the range is never reversed, so the start bound
             // always goes up, while the end bound may go up or down.
             DirKind::Down => {
-                let start = *repr.start_ref();
-                let end = *repr.end_ref();
+                let start = *repr.start();
+                let end = *repr.end();
 
                 *repr.end_mut() = if start + end < 9 { end + 1 } else { 9 };
             }
@@ -525,11 +529,9 @@ impl Selection {
 
 impl RangeBounds<u16> for Selection {
     fn start_bound(&self) -> Bound<&u16> {
-        let Self {
-            repr: SelectionRange { repr },
-        } = self;
+        let Self { repr } = self;
 
-        repr.start_bound()
+        repr.repr.start_bound()
     }
 
     fn end_bound(&self) -> Bound<&u16> {
@@ -562,7 +564,7 @@ impl Dir {
 
 // NOTE: we will require modifying some of the routines here once we get to
 // implementing scrolling in the 10-row list of constant symbols.
-impl State<'_> {
+impl State {
     pub(crate) fn new(constants: ConstContainer) -> (Self, UnboundedSender<RawUserEvent>) {
         let (tx, rx) = mpsc::unbounded_channel();
 
@@ -579,7 +581,6 @@ impl State<'_> {
                 selected: Selection::default(),
                 prompt: String::default(),
                 pos: Position::default(),
-                mode_info: ModeInfo::default(),
             },
             tx,
         )
@@ -603,7 +604,7 @@ impl State<'_> {
         match event.kind() {
             // NOTE: this is not quite as ergonomic as getting the event payload directly from the
             // internal representation, but it gets the job done just fine.
-            UserEventKind::TextualInput => prompt.push(event.text()),
+            UserEventKind::TextualInput => prompt.push(event.into_text()),
             UserEventKind::Search => constants.filter_with(&prompt, filter_buf)?,
             // NOTE: toggles all constants because we are either (1) outside select mode, or (2)
             // within it but without a selection ranging beyond a single row.
@@ -642,36 +643,42 @@ impl State<'_> {
                 }
             },
             UserEventKind::ModeAction => {
-                let action = event.action();
+                let action = event.into_action();
 
                 match action.kind() {
                     ModeActionKind::ModeSwitch => {
-                        let new_mode = action.mode();
-                        let mut callbacks = ModeTransitionMap::default();
-                        callbacks
-                            .add(Mode::new_normal(), Mode::new_insert(), |mode| {
+                        let new_mode = action.into_mode();
+
+                        match (mode.kind(), new_mode.kind()) {
+                            // Insert to normal mode.
+                            (ModeKind::Insert, ModeKind::Normal) => *mode = new_mode,
+
+                            // Normal mode to other all other modes.
+                            (ModeKind::Normal, ModeKind::Insert) => {
                                 *mode = new_mode;
 
+                                // NOTE: because normal mode can be used in both the prompt and the
+                                // list, but insert mode can only be used in prompt, we require
+                                // switching over the current cursor position to prompt if we're
+                                // currently in the list of filtered symbols.
                                 if pos.is_list() {
                                     pos.transition();
                                 }
-                            })
-                            .add(Mode::new_insert(), Mode::new_normal(), |mode| {
-                                *mode = new_mode;
-                            })
-                            .add(Mode::new_normal(), Mode::new_select(), |mode| {
-                                if pos.is_list() {
-                                    *mode = new_mode;
-                                }
-                            });
-
-                        match (mode.kind(), new_mode.kind()) {
+                            }
                             (ModeKind::Normal, ModeKind::Select) if pos.is_list() => {
                                 *mode = new_mode;
                             }
+
+                            // Select mode to other modes.
                             (ModeKind::Select, ModeKind::Insert) => {
                                 *mode = new_mode;
                                 *selected = Selection::default();
+
+                                // NOTE: Select mode can only be used in the list of filtered
+                                // symbols, and itself can only be accessed when the cursor is
+                                // currently navigating the list, so going into insert mode, which
+                                // can only be used in the prompt, always requires transitioning the
+                                // cursor position.
                                 pos.transition();
                             }
                             (ModeKind::Select, ModeKind::Normal) => {
@@ -694,23 +701,24 @@ impl State<'_> {
                     // NOTE: which one of the row or column should be modified is already handled in
                     // the corresponding impl of `Add` and `Sub` for `Position`. This allows us to
                     // converge events into two basic operations over an x-axis and a y-axis.
-                    // TODO: handle updating the `start` and `end` bounds on underlying range of
-                    // `selected` whenever it is that we move across list items, irrespective of
-                    // active mode.
-                    ModeActionKind::GoLeft | ModeActionKind::GoUp => {
-                        *pos -= 1;
-
-                        if pos.is_list() && mode.is_select() {
-                            todo!();
-                        }
-                    }
-                    ModeActionKind::GoRight | ModeActionKind::GoDown => {
+                    //
+                    // We need only handle a special case when in select mode, as that mode requires
+                    // further manipulating the currently active selection.
+                    ModeActionKind::GoLeft | ModeActionKind::GoUp if mode.is_normal() => *pos -= 1,
+                    ModeActionKind::GoRight | ModeActionKind::GoDown if mode.is_normal() => {
                         *pos += 1;
-
-                        if pos.is_list() && mode.is_select() {
-                            todo!();
-                        }
                     }
+                    ModeActionKind::GoUp if mode.is_select() => {
+                        *pos -= 1;
+                        selected.extend(Dir::new_up(), pos);
+                    }
+                    ModeActionKind::GoDown if mode.is_select() => {
+                        *pos += 1;
+                        selected.extend(Dir::new_down(), pos);
+                    }
+
+                    // NOTE: ignored cases include mode actions that are not part of
+                    _ => (),
                 }
             }
         }
@@ -834,10 +842,10 @@ impl Position {
     }
 
     // NOTE: when constructing a new instance of a position within any one of the
-    // layout container we use as a list, or the prompt, we always require the raw
+    // layout containers we use as a list, or the prompt, we always require the raw
     // row to be fetched externally because out of the 2-dimensional pieces of state
     // we keep, the row index is the one that is not in sync with the higher-level
-    // abstraction that is kept in the `repr` field. This abstraction only takes
+    // abstraction that are kept in the `repr` field. This abstraction only takes
     // into consideration the offsets into the corresponding layout containers
     // (which for the prompt is only made up of column index offsets, and for the
     // list of symbols is only made up of row index offsets.)
@@ -852,12 +860,12 @@ impl Position {
             row: PROMPT_COORD.get().unwrap().1,
             col,
         },
-        is_prompt, prompt, prompt_ref => Prompt(col: u16);
+        is_prompt, into_prompt, prompt => Prompt(col: u16);
         new_list {
             row: PROMPT_COORD.get().unwrap().1 + 1 + row,
             col: u16::default(),
         },
-        is_list, list, list_ref => List(row: u16);
+        is_list, into_list, list => List(row: u16);
     }}
 }
 
@@ -982,102 +990,23 @@ repr! {
     Mode
 }
 
-repr! {
-    #[derive(Debug, Clone, Copy)]
-    ModeTransitionKind
-    #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
-    ModeTransitionRepr => {
-        Insert(Mode),
-        Normal(Mode),
-        Select(Mode),
-    }
-    #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
-    ModeTransition
-}
-
-impl ModeTransition {
-    fn new(src_mode: Mode, dst_mode: Mode) -> Self {
-        match (src_mode.kind(), dst_mode.kind()) {
-            (ModeKind::Insert, ModeKind::Normal) => Self::insert_to(dst_mode),
-            (ModeKind::Normal, ModeKind::Insert | ModeKind::Select) => Self::normal_to(dst_mode),
-            (ModeKind::Select, ModeKind::Insert | ModeKind::Normal) => Self::select_to(dst_mode),
-            _ => unreachable!(
-                "If you hit this case, then either (1) there's a bug in the implementation of \
-                 mode transitioning, or (2) there's been a change in the types of mode \
-                 transitions that we allow and not all relevant state has been updated."
-            ),
-        }
-    }
-
-    repr_impl! { ModeTransitionRepr => {
-        insert_to, is_insert_to, from_insert, from_insert_ref => Insert(m: Mode);
-        normal_to, is_normal_to, from_normal, from_normal_ref => Normal(m: Mode);
-        select_to, is_select_to, from_select, from_select_ref => Select(m: Mode);
-    }}
-}
-
-type CallbackMap<'a> = HashMap<ModeTransition, Arc<dyn FnMut(&mut Mode) + 'a>>;
-
-#[derive(Default)]
-pub(crate) struct ModeTransitionMap<'a> {
-    inner: CallbackMap<'a>,
-}
-
-impl<'a> ModeTransitionMap<'a> {
-    pub(crate) fn add<F>(&mut self, src_mode: Mode, dst_mode: Mode, f: F) -> &mut Self
-    where
-        F: FnMut(&mut Mode) + 'a,
-    {
-        let Self { inner } = self;
-        inner.insert(ModeTransition::new(src_mode, dst_mode), Arc::new(f));
-
-        self
-    }
-}
-
 impl Mode {
-    pub(crate) fn transition<'a>(
-        &mut self,
-        new_mode: impl Borrow<Self>,
-        mut callbacks: ModeTransitionMap<'a>,
-    ) {
-        let Self { repr } = *self;
-        let Self { repr: orepr } = *new_mode.borrow();
-        let callbacks = callbacks.borrow_mut();
-
-        match (repr, orepr) {
-            (ModeRepr::Insert, ModeRepr::Normal) => todo!(),
-            (ModeRepr::Normal, ModeRepr::Insert) => todo!(),
-            (ModeRepr::Normal, ModeRepr::Select) => todo!(),
-            (ModeRepr::Select, ModeRepr::Insert) => todo!(),
-            (ModeRepr::Select, ModeRepr::Normal) => todo!(),
-
-            // NOTE: other cases include non-sensical transitions between the same one mode. Other
-            // cases to note include:
-            // + Going from normal mode to select mode while navigating the prompt in normal mode.
-            //   This is not possible, because going into select mode requires focus to be in the
-            //   list container.
-            // + Going from insert to select mode, which is not possible because select mode is only
-            //   reachable through normal mode, and more specifically, while focus is on the list
-            //   container.
-            _ => (),
-        }
-    }
-
     pub(crate) fn interpret(self, event: RawUserEvent) -> Option<UserEvent> {
         match (self.kind(), event.kind()) {
             // Insert mode
-            (ModeKind::Insert, RawUserEventKind::PlainText) => UserEvent::new_text(event.text()),
+            (ModeKind::Insert, RawUserEventKind::PlainText) => {
+                UserEvent::new_text(event.into_text())
+            }
             (ModeKind::Insert, RawUserEventKind::Space) => UserEvent::new_text(' '),
 
             // Normal mode.
             (ModeKind::Normal, RawUserEventKind::PlainText)
-                if let Some(action) = ModeAction::is_navigation(*event.text_ref()) =>
+                if let Some(action) = ModeAction::is_navigation(*event.text()) =>
             {
                 UserEvent::new_action(action)
             }
             (ModeKind::Normal, RawUserEventKind::PlainText)
-                if let Some(action) = ModeAction::is_mode_transition(*event.text_ref()) =>
+                if let Some(action) = ModeAction::is_mode_transition(*event.text()) =>
             {
                 UserEvent::new_action(action)
             }
@@ -1086,7 +1015,7 @@ impl Mode {
 
             // Select mode.
             (ModeKind::Select, RawUserEventKind::PlainText)
-                if let Some(action) = ModeAction::is_navigation(event.text()) =>
+                if let Some(action) = ModeAction::is_navigation(event.into_text()) =>
             {
                 UserEvent::new_action(action)
             }
@@ -1152,13 +1081,13 @@ repr! {
 
 impl UserEvent {
     repr_impl! { UserEventRepr => {
-        new_text, is_text, text, text_ref => TextualInput(c: char);
-        new_action, is_action, action, action_ref => ModeAction(action: ModeAction);
-        new_search, is_search, search, search_ref => Search;
-        new_toggle, is_toggle, toggle, toggle_ref => Toggle;
-        new_effect, is_effect, effect, effect_ref => Effect;
-        new_clear, is_clear, clear, clear_ref => Clear;
-        new_switch, is_switch, switch, switch_ref => Switch;
+        new_text, is_text, into_text, text => TextualInput(c: char);
+        new_action, is_action, into_action, action => ModeAction(action: ModeAction);
+        new_search, is_search, _d, _d => Search;
+        new_toggle, is_toggle, _d, _d => Toggle;
+        new_effect, is_effect, _d, _d => Effect;
+        new_clear, is_clear, _d, _d => Clear;
+        new_switch, is_switch, _d, _d => Switch;
     }}
 }
 
@@ -1191,11 +1120,11 @@ impl ModeAction {
     }
 
     repr_impl! { ModeActionRepr => {
-        switch_modes, is_mode, mode, mode_ref => ModeSwitch(mode: Mode);
-        new_left, is_left, left, left_ref => GoLeft;
-        new_right, is_right, right, right_ref => GoRight;
-        new_up, is_up, up, up_ref => GoUp;
-        new_down, is_down, down, down_ref => GoDown;
+        switch_modes, is_mode, into_mode, mode => ModeSwitch(mode: Mode);
+        new_left, is_left, _d, _d => GoLeft;
+        new_right, is_right, _d, _d => GoRight;
+        new_up, is_up, _d, _d => GoUp;
+        new_down, is_down, _d, _d => GoDown;
     }}
 
     pub(crate) fn is_mode_transition(c: char) -> Option<Self> {
@@ -1239,12 +1168,12 @@ repr! {
 
 impl RawUserEvent {
     repr_impl! { RawUserEventRepr => {
-        new_space, is_space, space, space_ref => Space;
-        new_text, is_text, text, text_ref => PlainText(c: char);
-        new_ret, is_ret, ret, ret_ref => Return;
-        new_sret, is_sret, sret, sret_ref => ShiftReturn;
-        new_esc, is_esc, esc, esc_ref => Escape;
-        new_tab, is_tab, tab, tab_ref => Tab;
+        new_space, is_space, _d, _d => Space;
+        new_text, is_text, into_text, text => PlainText(c: char);
+        new_ret, is_ret, _d, _d => Return;
+        new_sret, is_sret, _d, _d => ShiftReturn;
+        new_esc, is_esc, _d, _d => Escape;
+        new_tab, is_tab, _d, _d => Tab;
     }}
 }
 
@@ -1263,6 +1192,22 @@ impl RawUserEvent {
 struct AsyncWriter<T: AsyncWrite + Unpin + Send + Sync> {
     writer: T,
     rt: Runtime,
+}
+
+impl<T: AsyncWrite + Unpin + Send + Sync> Borrow<T> for AsyncWriter<T> {
+    fn borrow(&self) -> &T {
+        let Self { writer, .. } = self;
+
+        writer
+    }
+}
+
+impl<T: AsyncWrite + Unpin + Send + Sync> BorrowMut<T> for AsyncWriter<T> {
+    fn borrow_mut(&mut self) -> &mut T {
+        let Self { writer, .. } = self;
+
+        writer
+    }
 }
 
 impl<T: AsyncWrite + Unpin + Send + Sync> AsRef<T> for AsyncWriter<T> {
@@ -1333,7 +1278,7 @@ pub(crate) static SYNC_BUF: LazyLock<Mutex<AsyncWriter<Stdout>>> = LazyLock::new
     )
 });
 
-pub(crate) async fn render(mut state: State<'_>) -> anyhow::Result<()> {
+pub(crate) async fn render(mut state: State) -> anyhow::Result<()> {
     loop {
         draw_screen(&mut state).await?;
 
@@ -1343,20 +1288,17 @@ pub(crate) async fn render(mut state: State<'_>) -> anyhow::Result<()> {
     }
 }
 
-pub(crate) async fn draw_screen(state: &mut State<'_>) -> anyhow::Result<()> {
+pub(crate) async fn draw_screen(state: &mut State) -> anyhow::Result<()> {
     state.draw(&mut *SYNC_BUF.lock().await)
 }
 
-pub(crate) async fn update(state: &mut State<'_>) -> anyhow::Result<Termination<()>> {
+pub(crate) async fn update(state: &mut State) -> anyhow::Result<Termination<()>> {
     let res = state.receive_event();
 
     if res.should_terminate() {
         return Ok(Termination::terminate());
     }
 
-    // NOTE: this won't panic because the inner representation for a state of
-    // termination has already been proved to not be a termination state by the
-    // above condition.
     state.update(res.into_inner()).await?;
 
     Ok(Termination::keep_going(()))
