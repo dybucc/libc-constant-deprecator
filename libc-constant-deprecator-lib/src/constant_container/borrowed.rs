@@ -120,20 +120,24 @@ pub trait Visit {
     /// This is akin to a far less powerful version of iteration that gates the
     /// actual iterator, and only provides a temporary, in-place view with a
     /// closure that can capture callsite state.
-    fn visit(&self, visitor: impl FnMut(&Const) -> ControlFlow<()>);
+    fn visit<B>(&self, visitor: impl FnMut(&Const) -> ControlFlow<B, ()>) -> Option<B>;
 }
 
 macro_rules! visit_impl {
     (@body) => {
-        fn visit(&self, visitor: impl FnMut(&Const) -> ControlFlow<()>) {
+        fn visit<B>(&self, visitor: impl FnMut(&Const) -> ControlFlow<B, ()>) -> Option<B> {
             let Self { source, .. } = self;
 
-            source
+            if let ControlFlow::Break(b) = source
                 .iter()
                 .map(Weak::upgrade)
                 .filter_map(|ptr| ptr.map(|ptr| unsafe { &Arc::as_ptr(&ptr).as_ref_unchecked().0 }))
                 .try_for_each(visitor)
-                .into_value();
+            {
+                b.into()
+            } else {
+                None
+            }
         }
     };
     () => {

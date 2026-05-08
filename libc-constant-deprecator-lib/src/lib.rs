@@ -3,7 +3,7 @@
 //!
 //! It is most useful when paired with the accompanying binary.
 
-#![feature(iter_collect_into, control_flow_into_value)]
+#![feature(iter_collect_into)]
 
 mod constant;
 mod constant_container;

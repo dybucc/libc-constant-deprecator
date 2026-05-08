@@ -52,7 +52,7 @@ macro_rules! filter_impl {
         let re = $crate::constant_container::probe_re($re, re_cache)?;
         $iter = inner
             .iter()
-            .filter(|ptr| re.is_match(ptr.0.ident.to_string().as_bytes()));
+            .filter(|ptr| re.is_match(ptr.0.ident().to_string().as_bytes()));
     };
     (@filter_with => $iter:expr, $borrowed:expr) => {
         _ = $iter.map(Arc::downgrade).collect_into($borrowed.buffer())
@@ -199,11 +199,11 @@ impl ConstContainer {
             task_pool.spawn(async move {
                 // NOTE: we only extract `source` from `constant` because other fields are
                 // `!Send` and we prefer to keep that from going across await points.
-                let source = unsafe { &constant.as_ref_unchecked().source };
+                let source = unsafe { &constant.as_ref_unchecked().source() };
 
                 let contents = fs::read_to_string(source).await.map_err(|inner| {
                     MakeChangesErrorRepr::IoBound(IoBoundChanges {
-                        origin: ChangesSrc::FetchOp(source.clone()),
+                        origin: ChangesSrc::FetchOp((*source).clone()),
                         inner,
                     })
                 })?;
@@ -212,22 +212,20 @@ impl ConstContainer {
                 // `!Send` types.
                 let modified_file = {
                     let mut file = syn::parse_file(&contents)
-                        .map_err(|_| MakeChangesErrorRepr::Parse(source.clone().into()))?;
+                        .map_err(|_| MakeChangesErrorRepr::Parse((*source).into()))?;
 
-                    let Const {
-                        ident: ref_ident,
-                        deprecated,
-                        span: ref_span,
-                        ..
-                    } = unsafe { constant.as_ref_unchecked() };
+                    let constant = unsafe { constant.as_ref_unchecked() };
+                    let ref_ident = constant.ident();
+                    let deprecated = constant.is_deprecated();
+                    let ref_span = constant.span();
 
                     file.items
                         .iter_mut()
                         .filter_map(|item| {
-                            if item.span().start() == *ref_span
+                            if item.span().start() == ref_span
                                 && let Item::Const(ItemConst { attrs, ident, .. }) = item
                                 && ident == ref_ident
-                                && *deprecated
+                                && deprecated
                             {
                                 Some(attrs)
                             } else {
@@ -243,7 +241,7 @@ impl ConstContainer {
 
                 fs::write(source, modified_file).await.map_err(|inner| {
                     MakeChangesErrorRepr::IoBound(IoBoundChanges {
-                        origin: ChangesSrc::SaveOp(source.clone()),
+                        origin: ChangesSrc::SaveOp((*source).clone()),
                         inner,
                     })
                 })?;

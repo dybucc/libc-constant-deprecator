@@ -17,10 +17,10 @@ use syn::{Attribute, Ident, ItemConst, spanned::Spanned};
 /// [`ConstContainer`]: `crate::ConstContainer`
 #[derive(Debug, Clone)]
 pub struct Const {
-    pub(crate) ident: Ident,
-    pub(crate) deprecated: bool,
-    pub(crate) span: LineColumn,
-    pub(crate) source: PathBuf,
+    ident: Ident,
+    deprecated: bool,
+    span: LineColumn,
+    source: PathBuf,
 }
 
 macro_rules! impl_doc {
@@ -56,6 +56,23 @@ impl Const {
     )]
     pub fn is_deprecated(&self) -> bool {
         self.deprecated
+    }
+
+    /// Fetches the identifier of the constant symbol.
+    #[expect(
+        clippy::must_use_candidate,
+        reason = "It's not a bug not to use the result of this routine."
+    )]
+    pub fn ident(&self) -> &Ident {
+        &self.ident
+    }
+
+    pub(crate) fn span(&self) -> LineColumn {
+        self.span
+    }
+
+    pub(crate) fn source(&self) -> &PathBuf {
+        &self.source
     }
 }
 

@@ -1,4 +1,4 @@
-#![feature(range_bounds_is_empty, range_into_bounds)]
+#![feature(range_bounds_is_empty, range_into_bounds, try_blocks)]
 
 use std::{
     borrow::{Borrow, BorrowMut},
@@ -12,16 +12,19 @@ use std::{
 
 use clap::Parser;
 use crossterm::{
-    cursor::{self, MoveToNextLine, MoveToRow, SetCursorStyle},
+    cursor::{
+        self, Hide, MoveToNextLine, MoveToRow, RestorePosition, SavePosition, SetCursorStyle,
+    },
     event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers},
     style::Print,
     terminal::{self, Clear, ClearType, DisableLineWrap},
 };
 use futures::{StreamExt, future};
 use libc_constant_deprecator_lib::{BorrowedContainer, ConstContainer, Visit};
+use tester_impl::defer_drm;
 use tokio::{
     io::{self, AsyncWrite, AsyncWriteExt, Stdout},
-    runtime::{Builder, Runtime},
+    runtime::Handle,
     sync::{
         Mutex,
         mpsc::{self, UnboundedReceiver, UnboundedSender, error::TryRecvError},
@@ -156,8 +159,6 @@ macro_rules! repr_impl {
         $(
             #[allow(
                 unused,
-                    renamed_and_removed_lints,
-                    wrong_self_convention,
                 reason = "The macro requires having some type parameters expand to semantically \
                           unignored parameters because I can't think of a way to modify the \
                           provided parameter token trees."
@@ -180,8 +181,6 @@ macro_rules! repr_impl {
             $(
                 #[allow(
                     unused,
-                    renamed_and_removed_lints,
-                    wrong_self_convention,
                     reason = "The macro requires having some type parameters expand to \
                               semantically unignored parameters because I can't think of a way to \
                               modify the provided parameter token trees."
@@ -199,8 +198,6 @@ macro_rules! repr_impl {
 
                 #[allow(
                     unused,
-                    renamed_and_removed_lints,
-                    wrong_self_convention,
                     reason = "The macro requires having some type parameters expand to \
                               semantically unignored parameters because I can't think of a way to \
                               modify the provided parameter token trees."
@@ -220,8 +217,6 @@ macro_rules! repr_impl {
             $(
                 #[allow(
                     unused,
-                    renamed_and_removed_lints,
-                    wrong_self_convention,
                     reason = "The macro requires having some type parameters expand to \
                               semantically unignored parameters because I can't think of a way to \
                               modify the provided parameter token trees."
@@ -239,8 +234,6 @@ macro_rules! repr_impl {
 
                 #[allow(
                     unused,
-                    renamed_and_removed_lints,
-                    wrong_self_convention,
                     reason = "The macro requires having some type parameters expand to \
                               semantically unignored parameters because I can't think of a way to \
                               modify the provided parameter token trees."
@@ -259,8 +252,6 @@ macro_rules! repr_impl {
 
             #[allow(
                 unused,
-                renamed_and_removed_lints,
-                wrong_self_convention,
                 reason = "The macro requires having some type parameters expand to semantically \
                           unignored parameters because I can't think of a way to modify the \
                           provided parameter token trees."
@@ -743,7 +734,6 @@ impl State {
     #[expect(unused, reason = "WIP.")]
     pub(crate) fn draw(&self, mut stdout: impl Write) -> anyhow::Result<()> {
         let Self {
-            events,
             mode,
             filter_buf,
             selected,
@@ -751,14 +741,43 @@ impl State {
             ..
         } = self;
 
-        crossterm::queue!(stdout, Print("> "))?;
+        crossterm::queue!(stdout, Hide)?;
+        crossterm::queue!(stdout, RestorePosition)?;
 
-        // TODO: finish drawing the ten-row table with the constant symbols, those which
-        // are currently selected if inside select mode, and those marked deprecated.
-        // The mark for deprecation is something specific to each constant that is
-        // already kept track of within the borrowed view into the set of constants. The
-        // selection status is kept track of by the instance of `State` that is handling
-        // this drawing call.
+        crossterm::queue!(stdout, Print("> "))?;
+        crossterm::queue!(stdout, MoveToNextLine(1))?;
+
+        let mut line_counter = 0;
+
+        if let Some(err) = filter_buf
+            .visit(|constant| {
+                line_counter += 1;
+
+                if line_counter > 10 {
+                    return ControlFlow::Break(None);
+                }
+
+                match try {
+                    crossterm::queue!(stdout, Print("["))?;
+
+                    if constant.is_deprecated() {
+                        crossterm::queue!(stdout, Print("x"))?;
+                        crossterm::queue!(stdout, Print("] "))?;
+                    } else {
+                        crossterm::queue!(stdout, Print("] "))?;
+                    }
+
+                    crossterm::queue!(stdout, Print(constant.ident()))?;
+                    crossterm::queue!(stdout, MoveToNextLine(1))?;
+                } {
+                    Ok(()) => ControlFlow::Continue(()),
+                    Err(err) => ControlFlow::Break(err.into()),
+                }
+            })
+            .flatten()
+        {
+            return Err(Into::into(err));
+        }
 
         stdout.flush().map_err(Into::into)
     }
@@ -844,11 +863,13 @@ impl Position {
     // NOTE: when constructing a new instance of a position within any one of the
     // layout containers we use as a list, or the prompt, we always require the raw
     // row to be fetched externally because out of the 2-dimensional pieces of state
-    // we keep, the row index is the one that is not in sync with the higher-level
-    // abstraction that are kept in the `repr` field. This abstraction only takes
-    // into consideration the offsets into the corresponding layout containers
-    // (which for the prompt is only made up of column index offsets, and for the
-    // list of symbols is only made up of row index offsets.)
+    // we keep, the row index is the one most not in sync with the higher-level
+    // abstraction that is kept in the `repr` field. We speak of "most not in sync"
+    // because the raw column index is neither in sync with the high-level
+    // abstraction; The former, when focus is on the regex prompt, is always offset
+    // by 2 to account for the visual identifiers we add to the prompt. When focus
+    // is on the list of filtered symbols, it is offset by 4 to account for the
+    // deprecation checkbox we add at the start of each list item.
     //
     // When creatingn a new view into the list of filtered constants with a given
     // starting offset, the raw position in the terminal grid must be set to the
@@ -858,7 +879,7 @@ impl Position {
     repr_impl! { PositionRepr => {
         new_prompt {
             row: PROMPT_COORD.get().unwrap().1,
-            col,
+            col: col + 2,
         },
         is_prompt, into_prompt, prompt => Prompt(col: u16);
         new_list {
@@ -1191,7 +1212,7 @@ impl RawUserEvent {
 #[derive(Debug)]
 struct AsyncWriter<T: AsyncWrite + Unpin + Send + Sync> {
     writer: T,
-    rt: Runtime,
+    rt: Handle,
 }
 
 impl<T: AsyncWrite + Unpin + Send + Sync> Borrow<T> for AsyncWriter<T> {
@@ -1227,19 +1248,15 @@ impl<T: AsyncWrite + Unpin + Send + Sync> AsMut<T> for AsyncWriter<T> {
 }
 
 impl<T: AsyncWrite + Unpin + Send + Sync> AsyncWriter<T> {
-    fn new(writer: T) -> io::Result<Self> {
-        // NOTE: we set the queue and event intervals to larger values than the default,
-        // because according to the `tokio` docs, tasks that quickly yield in contexts
-        // that don't require fairness may do better with those. Considering the purpose
-        // of this wrapper type, that seems fitting.
-        Builder::new_current_thread()
-            .global_queue_interval(512)
-            .event_interval(512)
-            .enable_io()
-            .build()
-            .map(|rt| Self { writer, rt })
+    fn new(writer: T) -> Self {
+        Self {
+            writer,
+            rt: Handle::current(),
+        }
     }
 
+    // FIXME: find a fix to drive I/O synchronously for an async writer. The
+    // `Handle` can't block because this is already called from an async context.
     fn drive_io<O>(&mut self, mut f: impl AsyncFnMut(&mut T) -> io::Result<O>) -> io::Result<O> {
         let Self { writer, rt } = self;
 
@@ -1271,12 +1288,8 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Write for AsyncWriter<T> {
 // would require locking the stream prior to entry to the rendering loop. This
 // can then cause some finicky issues with the lock (which internally uses the
 // unstable `ReentrantLock`) being `!Send + !Sync`.
-pub(crate) static SYNC_BUF: LazyLock<Mutex<AsyncWriter<Stdout>>> = LazyLock::new(|| {
-    Mutex::const_new(
-        AsyncWriter::new(io::stdout())
-            .expect("failed to initialize async buffer for terminal display"),
-    )
-});
+pub(crate) static SYNC_BUF: LazyLock<Mutex<AsyncWriter<Stdout>>> =
+    LazyLock::new(|| Mutex::const_new(AsyncWriter::new(io::stdout())));
 
 pub(crate) async fn render(mut state: State) -> anyhow::Result<()> {
     loop {
@@ -1392,6 +1405,7 @@ pub(crate) async fn prepare_space() -> anyhow::Result<()> {
         crossterm::queue!(stdout, MoveToRow(current_row - 11))?;
         crossterm::queue!(stdout, Clear(ClearType::FromCursorDown))?;
         crossterm::queue!(stdout, MoveToNextLine(1))?;
+        crossterm::queue!(stdout, SavePosition)?;
 
         // NOTE: we `unwrap` here because there's no point in assumming that the static
         // got initialized already, and that's the only point of failure. At the time of
@@ -1405,11 +1419,8 @@ pub(crate) async fn prepare_space() -> anyhow::Result<()> {
     Ok(())
 }
 
-// FIXME: disable raw mode on fallible expressions beyond those that come before
-// it's enabled and while enabling it. This could benefit from the `defer_drm`
-// proc-macro that we developed in the `tester-impl` crate for `tester`.
-
 #[tokio::main]
+#[defer_drm]
 async fn main() -> anyhow::Result<()> {
     let files = if let Some(path) = Args::parse().path {
         libc_constant_deprecator_lib::scan_files(PathBuf::from(path)).await?
@@ -1418,11 +1429,10 @@ async fn main() -> anyhow::Result<()> {
     };
 
     task::spawn_blocking(terminal::enable_raw_mode).await??;
+    prepare_space().await?;
 
     let parsed_constants = libc_constant_deprecator_lib::parse_constants(&files);
     let (state, events_tx) = State::new(parsed_constants);
-
-    prepare_space().await?;
 
     let input_handler = task::spawn(handle_input(events_tx));
     let renderer = task::spawn(render(state));
