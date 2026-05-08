@@ -172,7 +172,7 @@ macro_rules! deprecate_impl {
             }))
             .zip(init_state)
             .for_each(|((constant, modified), init_modified)| {
-                constant.deprecated(deprecate_impl!(body @$op));
+                constant.deprecate(deprecate_impl!(body @$op));
 
                 *modified = *init_modified == *modified;
             });

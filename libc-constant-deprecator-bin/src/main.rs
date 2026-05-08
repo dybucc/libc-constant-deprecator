@@ -1,13 +1,15 @@
 #![feature(range_bounds_is_empty, range_into_bounds, try_blocks)]
 
 use std::{
-    borrow::{Borrow, BorrowMut},
+    borrow::Borrow,
     cmp::Ordering,
     env,
-    io::Write,
+    fmt::{self, Display, Formatter},
+    fs::File,
+    io::{self as std_io, BufWriter as StdBufWriter, Stdout, Write},
     ops::{Add, AddAssign, Bound, ControlFlow, IntoBounds, Range, RangeBounds, Sub, SubAssign},
     path::PathBuf,
-    sync::{LazyLock, OnceLock},
+    sync::{LazyLock, Mutex as StdMutex, OnceLock},
 };
 
 use clap::Parser;
@@ -20,14 +22,14 @@ use crossterm::{
     terminal::{self, Clear, ClearType, DisableLineWrap},
 };
 use futures::{StreamExt, future};
-use libc_constant_deprecator_lib::{BorrowedContainer, ConstContainer, Visit};
+use libc_constant_deprecator_lib::{BorrowedContainer, ConstContainer, SourceFile, Visit};
 use tester_impl::defer_drm;
 use tokio::{
-    io::{self, AsyncWrite, AsyncWriteExt, Stdout},
-    runtime::Handle,
+    io::{self, AsyncWriteExt, BufWriter},
     sync::{
         Mutex,
         mpsc::{self, UnboundedReceiver, UnboundedSender, error::TryRecvError},
+        oneshot::{self, TryRecvError as OneshotTryRecvError},
     },
     task,
 };
@@ -265,6 +267,7 @@ macro_rules! repr_impl {
 
 #[derive(Debug, Parser)]
 pub(crate) struct Args {
+    /// Path to the `libc` repo. Leavy empty to clone it to the pwd.
     path: Option<String>,
 }
 
@@ -556,6 +559,7 @@ impl Dir {
 // NOTE: we will require modifying some of the routines here once we get to
 // implementing scrolling in the 10-row list of constant symbols.
 impl State {
+    #[tracing::instrument(ret)]
     pub(crate) fn new(constants: ConstContainer) -> (Self, UnboundedSender<RawUserEvent>) {
         let (tx, rx) = mpsc::unbounded_channel();
 
@@ -577,6 +581,7 @@ impl State {
         )
     }
 
+    #[tracing::instrument(skip_all)]
     pub(crate) async fn update(&mut self, event: Option<UserEvent>) -> anyhow::Result<()> {
         let Self {
             filter_buf,
@@ -732,6 +737,7 @@ impl State {
     }
 
     #[expect(unused, reason = "WIP.")]
+    #[tracing::instrument(skip_all)]
     pub(crate) fn draw(&self, mut stdout: impl Write) -> anyhow::Result<()> {
         let Self {
             mode,
@@ -1012,6 +1018,7 @@ repr! {
 }
 
 impl Mode {
+    #[tracing::instrument(ret)]
     pub(crate) fn interpret(self, event: RawUserEvent) -> Option<UserEvent> {
         match (self.kind(), event.kind()) {
             // Insert mode
@@ -1198,99 +1205,13 @@ impl RawUserEvent {
     }}
 }
 
-// NOTE: this wrapper type is used for the purposes of driving async execution
-// within non-async contexts, like an impl of `std::io::Write`. More
-// specifically, this type is geared towards allowing `tokio::io` utilities to
-// be used alongside `crossterm` command execution, which requires writers from
-// `std::io::Write`.
-//
-// This type serves as a compatiblity shim so that we can use async stdio
-// streams in sync contexts. Of course, the computation that is driven with the
-// stored runtime is fundamentally equivalent to the same computation in sync
-// code because it awaits the result of the closure passed to the `drive_io`
-// method. The goal is simply to have ascyn writers type check in sync contexts.
-#[derive(Debug)]
-struct AsyncWriter<T: AsyncWrite + Unpin + Send + Sync> {
-    writer: T,
-    rt: Handle,
-}
-
-impl<T: AsyncWrite + Unpin + Send + Sync> Borrow<T> for AsyncWriter<T> {
-    fn borrow(&self) -> &T {
-        let Self { writer, .. } = self;
-
-        writer
-    }
-}
-
-impl<T: AsyncWrite + Unpin + Send + Sync> BorrowMut<T> for AsyncWriter<T> {
-    fn borrow_mut(&mut self) -> &mut T {
-        let Self { writer, .. } = self;
-
-        writer
-    }
-}
-
-impl<T: AsyncWrite + Unpin + Send + Sync> AsRef<T> for AsyncWriter<T> {
-    fn as_ref(&self) -> &T {
-        let Self { writer, .. } = self;
-
-        writer
-    }
-}
-
-impl<T: AsyncWrite + Unpin + Send + Sync> AsMut<T> for AsyncWriter<T> {
-    fn as_mut(&mut self) -> &mut T {
-        let Self { writer, .. } = self;
-
-        writer
-    }
-}
-
-impl<T: AsyncWrite + Unpin + Send + Sync> AsyncWriter<T> {
-    fn new(writer: T) -> Self {
-        Self {
-            writer,
-            rt: Handle::current(),
-        }
-    }
-
-    // FIXME: find a fix to drive I/O synchronously for an async writer. The
-    // `Handle` can't block because this is already called from an async context.
-    fn drive_io<O>(&mut self, mut f: impl AsyncFnMut(&mut T) -> io::Result<O>) -> io::Result<O> {
-        let Self { writer, rt } = self;
-
-        rt.block_on(async move { f(writer).await })
-    }
-}
-
-// NOTE: this impl serves us to get an impl for `crossterm::ExecutableCommand`
-// and `crossterm::QueueableCommand`, because those traits have blanket ipmls
-// for any type implementing `Write`. Implementing directly those types is not
-// possible, because it requires calling into the passed `Command`'s
-// `write_ansi()` method, itself requiring an writer from `std`.
-impl<T: AsyncWrite + Unpin + Send + Sync> Write for AsyncWriter<T> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.drive_io(async |writer| writer.write(buf).await)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.drive_io(async |writer| writer.flush().await)
-    }
-}
-
 // NOTE: this is wrapped in a `Mutex` to get interior mutability, as that is
 // required for the draw handle to be used in both the `prepare_space` routine
 // and in the `draw` method to re-render the screen.
-//
-// It uses the wrapper type we created above so that we can use a
-// `tokio::io::Stdout` instead of a `std::io::Stdout`, as the latter option
-// would require locking the stream prior to entry to the rendering loop. This
-// can then cause some finicky issues with the lock (which internally uses the
-// unstable `ReentrantLock`) being `!Send + !Sync`.
-pub(crate) static SYNC_BUF: LazyLock<Mutex<AsyncWriter<Stdout>>> =
-    LazyLock::new(|| Mutex::const_new(AsyncWriter::new(io::stdout())));
+pub(crate) static SYNC_BUF: LazyLock<Mutex<StdBufWriter<Stdout>>> =
+    LazyLock::new(|| Mutex::new(StdBufWriter::new(std_io::stdout())));
 
+#[tracing::instrument(skip_all)]
 pub(crate) async fn render(mut state: State) -> anyhow::Result<()> {
     loop {
         draw_screen(&mut state).await?;
@@ -1301,10 +1222,12 @@ pub(crate) async fn render(mut state: State) -> anyhow::Result<()> {
     }
 }
 
+#[tracing::instrument(skip_all)]
 pub(crate) async fn draw_screen(state: &mut State) -> anyhow::Result<()> {
     state.draw(&mut *SYNC_BUF.lock().await)
 }
 
+#[tracing::instrument(skip_all, ret, err(level = "info"))]
 pub(crate) async fn update(state: &mut State) -> anyhow::Result<Termination<()>> {
     let res = state.receive_event();
 
@@ -1317,6 +1240,7 @@ pub(crate) async fn update(state: &mut State) -> anyhow::Result<Termination<()>>
     Ok(Termination::keep_going(()))
 }
 
+#[tracing::instrument(skip_all)]
 pub(crate) async fn handle_input(channel: UnboundedSender<RawUserEvent>) -> anyhow::Result<()> {
     let mut event_stream = EventStream::new().fuse();
 
@@ -1385,6 +1309,7 @@ pub(crate) async fn handle_input(channel: UnboundedSender<RawUserEvent>) -> anyh
 // That is why, at the moment, we use `OnceLock`.
 static PROMPT_COORD: OnceLock<(u16, u16)> = OnceLock::new();
 
+#[tracing::instrument(skip_all)]
 pub(crate) async fn prepare_space() -> anyhow::Result<()> {
     let (_, rows) = terminal::size()?;
     let (_, current_row) = cursor::position()?;
@@ -1419,14 +1344,109 @@ pub(crate) async fn prepare_space() -> anyhow::Result<()> {
     Ok(())
 }
 
+pub(crate) async fn init() -> anyhow::Result<Vec<SourceFile>> {
+    #[derive(Debug, Default, Clone, Copy)]
+    struct Spinner {
+        repr: SpinnerRepr,
+    }
+
+    impl Spinner {
+        fn transition(&mut self) -> Self {
+            match self.repr {
+                SpinnerRepr::Vert => self.repr = SpinnerRepr::Left,
+                SpinnerRepr::Left => self.repr = SpinnerRepr::Hor,
+                SpinnerRepr::Hor => self.repr = SpinnerRepr::Right,
+                SpinnerRepr::Right => self.repr = SpinnerRepr::Vert,
+            }
+
+            *self
+        }
+    }
+
+    impl Display for Spinner {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            match self.repr {
+                SpinnerRepr::Vert => write!(f, "|"),
+                SpinnerRepr::Left => write!(f, "/"),
+                SpinnerRepr::Hor => write!(f, "-"),
+                SpinnerRepr::Right => write!(f, "\\"),
+            }
+        }
+    }
+
+    #[derive(Debug, Default, Clone, Copy)]
+    enum SpinnerRepr {
+        #[default]
+        Vert,
+        Left,
+        Hor,
+        Right,
+    }
+
+    let (tx, rx) = oneshot::channel();
+
+    let spinner = async move {
+        let spinner = Spinner::default();
+        let mut stdout = SYNC_BUF.lock().await;
+
+        crossterm::execute!(stdout, Hide, SavePosition);
+
+        loop {
+            match rx.try_recv() {
+                Ok(()) => break,
+                Err(OneshotTryRecvError::Empty) => {
+                    crossterm::queue!(
+                        stdout,
+                        Print(spinner.to_string()),
+                        Print(" Parsing `libc repo`"),
+                        RestorePosition,
+                    );
+
+                    stdout.flush()?;
+                }
+                Err(OneshotTryRecvError::Closed) => break,
+            }
+        }
+
+        anyhow::Ok(())
+    };
+
+    let worker = async move {
+        libc_constant_deprecator_lib::scan_files(if let Some(path) = Args::parse().path {
+            PathBuf::from(path)
+        } else {
+            env::current_dir().unwrap()
+        })
+        .await
+        .map_err(Into::into)
+    };
+
+    future::try_join(task::spawn(spinner), task::spawn(worker))
+        .await
+        .map(|(res1, res2)| res1.and(res2))?
+}
+
 #[tokio::main]
 #[defer_drm]
+#[tracing::instrument(skip_all)]
 async fn main() -> anyhow::Result<()> {
-    let files = if let Some(path) = Args::parse().path {
-        libc_constant_deprecator_lib::scan_files(PathBuf::from(path)).await?
-    } else {
-        libc_constant_deprecator_lib::scan_files(env::current_dir()?).await?
-    };
+    if cfg!(debug_assertions) {
+        tracing_subscriber::fmt()
+            .with_level(true)
+            .with_file(true)
+            .with_ansi(false)
+            .with_line_number(true)
+            .pretty()
+            .with_writer(StdMutex::new(
+                File::create_new(env::current_dir().map(|pwd| pwd.join("debug.log")).unwrap())
+                    .unwrap(),
+            ))
+            .init();
+    }
+
+    // TODO: make a join call here between two tasks that both report to the
+    // terminal that constants are being fetched/read, and that actually gets the
+    // deed done.
 
     task::spawn_blocking(terminal::enable_raw_mode).await??;
     prepare_space().await?;

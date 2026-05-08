@@ -1,4 +1,5 @@
 use std::{
+    fmt::Debug,
     path::{Path, PathBuf},
     sync::atomic::AtomicBool,
 };
@@ -35,7 +36,10 @@ pub(crate) const LIBC_REPO: &str = "https://github.com/rust-lang/libc.git";
 ///
 /// The function may fail if it fails to discover/clone the repo on the given
 /// path and, when dealing with an existing path, its ancestors.
-pub async fn scan_files(libc_path: impl AsRef<Path>) -> Result<Vec<SourceFile>, ScanFilesError> {
+#[tracing::instrument(ret, err(level = "info"))]
+pub async fn scan_files(
+    libc_path: impl AsRef<Path> + Debug,
+) -> Result<Vec<SourceFile>, ScanFilesError> {
     // NOTE: it's more intuitive to have the routine name be the token tree we
     // accept for recursive munching, but that way the recursive macro invocation
     // would have to replace the start of the path of the enum variant, which seems

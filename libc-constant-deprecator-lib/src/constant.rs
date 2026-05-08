@@ -90,7 +90,7 @@ impl Const {
         }
     }
 
-    pub(crate) fn deprecated(&mut self, yes: bool) {
+    pub(crate) fn deprecate(&mut self, yes: bool) {
         self.deprecated = yes;
     }
 }

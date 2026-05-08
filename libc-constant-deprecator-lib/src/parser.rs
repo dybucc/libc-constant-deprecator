@@ -16,10 +16,7 @@ pub(crate) mod macro_parser;
 /// `libc`.)
 ///
 /// [`scan_files()`]: `crate::scan_files()`
-#[expect(
-    clippy::must_use_candidate,
-    reason = "It's not a bug not to use the result of this routine."
-)]
+#[tracing::instrument(skip_all, ret)]
 pub fn parse_constants(files: &[SourceFile]) -> ConstContainer {
     macro_rules! cast {
         ($iter:expr) => {{ Box::new($iter) as Box<dyn Iterator<Item = Const>> }};
