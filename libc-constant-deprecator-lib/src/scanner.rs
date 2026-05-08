@@ -65,6 +65,7 @@ pub async fn scan_files(
         .await
         .map_err(ScanFilesErrorRepr::IoBound)?
     {
+        ensure_libc().await?;
         handle_result!(DiscoverRepoError);
     } else {
         handle_result!(CloneRepoError);
@@ -87,6 +88,12 @@ pub async fn scan_files(
             FetchParseError::Other(err) => Err(ScanFilesErrorRepr::Other(err).into()),
         },
     }
+}
+
+// TODO: implement a routine to ensure that the path we got passed, if it
+// exists, is `libc`'s.
+async fn ensure_libc() -> Result<(), ()> {
+    todo!()
 }
 
 pub(crate) async fn discover_repo(path: PathBuf) -> Result<(), DiscoverRepoError> {

@@ -22,27 +22,34 @@ pub fn parse_constants(files: &[SourceFile]) -> ConstContainer {
         ($iter:expr) => {{ Box::new($iter) as Box<dyn Iterator<Item = Const>> }};
     }
 
-    ConstContainer::new(files.iter().fold(
-        Vec::new(),
-        |mut parsed_constants, SourceFile { inner, source }| {
-            parsed_constants.extend(
-                inner
-                    .items
-                    .iter()
-                    .filter_map(|item| match item {
-                        Item::Const(constant) => cast!(process_constant(constant, source)).into(),
-                        Item::Macro(ItemMacro {
-                            mac: mac @ Macro { path, .. },
-                            ..
-                        }) if path.is_ident("cfg_if") => cast!(process_macro(mac, source)).into(),
-                        _ => None,
-                    })
-                    .flatten(),
-            );
+    ConstContainer::new(
+        files
+            .iter()
+            .fold(Vec::new(), |mut parsed_constants, source| {
+                let file = source.parsed_file();
+                let path = source.path();
 
-            parsed_constants
-        },
-    ))
+                parsed_constants.extend(
+                    file.items
+                        .iter()
+                        .filter_map(|item| match item {
+                            Item::Const(constant) => {
+                                cast!(process_constant(constant, &path)).into()
+                            }
+                            Item::Macro(ItemMacro {
+                                mac: mac @ Macro { path: mac_path, .. },
+                                ..
+                            }) if mac_path.is_ident("cfg_if") => {
+                                cast!(process_macro(mac, &path)).into()
+                            }
+                            _ => None,
+                        })
+                        .flatten(),
+                );
+
+                parsed_constants
+            }),
+    )
 }
 
 pub(crate) fn process_constant(

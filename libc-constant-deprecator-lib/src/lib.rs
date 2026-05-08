@@ -8,18 +8,10 @@
 mod constant;
 mod constant_container;
 mod errors;
-#[macro_use]
-mod macros;
 mod parser;
 mod scanner;
 mod source_file;
 mod support;
-
-#[expect(
-    clippy::single_component_path_imports,
-    reason = "The macro is reexported at the crate level but is not part of the public API."
-)]
-pub(crate) use deprecate;
 
 #[cfg_attr(
     not(test),
@@ -42,3 +34,17 @@ pub use crate::{
     scanner::scan_files,
     source_file::SourceFile,
 };
+
+#[macro_use]
+mod macros;
+
+#[expect(
+    clippy::single_component_path_imports,
+    reason = "The macro is reexported at the crate level but is not part of the public API."
+)]
+pub(crate) use deprecate;
+#[expect(
+    clippy::single_component_path_imports,
+    reason = "The macro is reexported at the crate level but is not part of the public API."
+)]
+pub(crate) use send_sync_impl;

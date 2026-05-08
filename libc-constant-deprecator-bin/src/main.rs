@@ -1,4 +1,4 @@
-#![feature(range_bounds_is_empty, range_into_bounds, try_blocks)]
+#![feature(range_bounds_is_empty, range_into_bounds, try_blocks, file_buffered)]
 
 use std::{
     borrow::Borrow,
@@ -10,6 +10,7 @@ use std::{
     ops::{Add, AddAssign, Bound, ControlFlow, IntoBounds, Range, RangeBounds, Sub, SubAssign},
     path::PathBuf,
     sync::{LazyLock, Mutex as StdMutex, OnceLock},
+    time::Duration,
 };
 
 use clap::Parser;
@@ -25,14 +26,14 @@ use futures::{StreamExt, future};
 use libc_constant_deprecator_lib::{BorrowedContainer, ConstContainer, SourceFile, Visit};
 use tester_impl::defer_drm;
 use tokio::{
-    io::{self, AsyncWriteExt, BufWriter},
     sync::{
         Mutex,
         mpsc::{self, UnboundedReceiver, UnboundedSender, error::TryRecvError},
-        oneshot::{self, TryRecvError as OneshotTryRecvError},
+        oneshot::{self, error::TryRecvError as OneshotTryRecvError},
     },
-    task,
+    task, time,
 };
+use tracing::info;
 
 // NOTE: this is used for the purposes of easing declaration of two sets of
 // enums from the same variants. This then allows to implement internal
@@ -81,9 +82,10 @@ macro_rules! repr {
             )+
         }
 
-        // NOTE: the impl for the internal representation is verbosily repeated for both the public
-        // type implementing the kind and the internal type denoting the variants because its body
-        // requires metavariable expansion at multiple levels of depth.
+        // NOTE: the impl for the internal representation is verbosily repeated
+        // for both the public type implementing the kind and the internal type
+        // denoting the variants because its body requires metavariable
+        // expansion at multiple levels of depth.
         #[allow(
             unused,
             reason = "The macro requires having some type parameters expand to semantically \
@@ -1344,81 +1346,96 @@ pub(crate) async fn prepare_space() -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(crate) async fn init() -> anyhow::Result<Vec<SourceFile>> {
-    #[derive(Debug, Default, Clone, Copy)]
-    struct Spinner {
-        repr: SpinnerRepr,
+async fn init() -> anyhow::Result<Vec<SourceFile>> {
+    repr! {
+        #[derive(Debug, Default, Clone, Copy)]
+        SpinnerKind
+        #[derive(Debug, Default, Clone, Copy)]
+        SpinnerRepr => {
+            #[default]
+            Vert,
+            Left,
+            Hor,
+            Right,
+        }
+        #[derive(Debug, Default, Clone, Copy)]
+        Spinner
+    }
+
+    impl Display for Spinner {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            self.repr.fmt(f)
+        }
     }
 
     impl Spinner {
         fn transition(&mut self) -> Self {
-            match self.repr {
-                SpinnerRepr::Vert => self.repr = SpinnerRepr::Left,
-                SpinnerRepr::Left => self.repr = SpinnerRepr::Hor,
-                SpinnerRepr::Hor => self.repr = SpinnerRepr::Right,
-                SpinnerRepr::Right => self.repr = SpinnerRepr::Vert,
-            }
+            self.repr.transition();
 
             *self
         }
     }
 
-    impl Display for Spinner {
+    impl Display for SpinnerRepr {
         fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-            match self.repr {
-                SpinnerRepr::Vert => write!(f, "|"),
-                SpinnerRepr::Left => write!(f, "/"),
-                SpinnerRepr::Hor => write!(f, "-"),
-                SpinnerRepr::Right => write!(f, "\\"),
+            match self {
+                Self::Vert => write!(f, "|"),
+                Self::Left => write!(f, "/"),
+                Self::Hor => write!(f, "-"),
+                Self::Right => write!(f, r"\"),
             }
         }
     }
 
-    #[derive(Debug, Default, Clone, Copy)]
-    enum SpinnerRepr {
-        #[default]
-        Vert,
-        Left,
-        Hor,
-        Right,
+    impl SpinnerRepr {
+        fn transition(&mut self) {
+            *self = match self {
+                Self::Vert => Self::Left,
+                Self::Left => Self::Hor,
+                Self::Hor => Self::Right,
+                Self::Right => Self::Vert,
+            }
+        }
     }
 
-    let (tx, rx) = oneshot::channel();
+    let (tx, mut rx) = oneshot::channel();
 
     let spinner = async move {
-        let spinner = Spinner::default();
+        let mut spinner = Spinner::default();
         let mut stdout = SYNC_BUF.lock().await;
 
-        crossterm::execute!(stdout, Hide, SavePosition);
+        task::block_in_place(|| crossterm::execute!(stdout, Hide, SavePosition))?;
 
-        loop {
-            match rx.try_recv() {
-                Ok(()) => break,
-                Err(OneshotTryRecvError::Empty) => {
-                    crossterm::queue!(
-                        stdout,
-                        Print(spinner.to_string()),
-                        Print(" Parsing `libc repo`"),
-                        RestorePosition,
-                    );
+        while let Err(OneshotTryRecvError::Empty) = rx.try_recv() {
+            crossterm::queue!(
+                stdout,
+                Print(spinner),
+                Print(" Parsing `libc repo`"),
+                RestorePosition,
+            )?;
 
-                    stdout.flush()?;
-                }
-                Err(OneshotTryRecvError::Closed) => break,
-            }
+            spinner.transition();
+            task::block_in_place(|| stdout.flush())?;
+
+            time::sleep(Duration::from_millis(256)).await;
         }
 
         anyhow::Ok(())
     };
 
     let worker = async move {
-        libc_constant_deprecator_lib::scan_files(if let Some(path) = Args::parse().path {
-            PathBuf::from(path)
-        } else {
-            env::current_dir().unwrap()
-        })
-        .await
-        .map_err(Into::into)
+        let res =
+            libc_constant_deprecator_lib::scan_files(if let Some(path) = Args::parse().path {
+                PathBuf::from(path)
+            } else {
+                env::current_dir().unwrap()
+            })
+            .await
+            .map_err(Into::into);
+
+        tx.send(()).unwrap();
+
+        res
     };
 
     future::try_join(task::spawn(spinner), task::spawn(worker))
@@ -1438,21 +1455,25 @@ async fn main() -> anyhow::Result<()> {
             .with_line_number(true)
             .pretty()
             .with_writer(StdMutex::new(
-                File::create_new(env::current_dir().map(|pwd| pwd.join("debug.log")).unwrap())
+                File::create_buffered(env::current_dir().map(|pwd| pwd.join("debug.log")).unwrap())
                     .unwrap(),
             ))
             .init();
     }
 
-    // TODO: make a join call here between two tasks that both report to the
-    // terminal that constants are being fetched/read, and that actually gets the
-    // deed done.
+    let files = init().await?;
+    info!(parsed_files = ?files);
 
     task::spawn_blocking(terminal::enable_raw_mode).await??;
+
     prepare_space().await?;
+    info!(prompt_coordinates = ?PROMPT_COORD);
 
     let parsed_constants = libc_constant_deprecator_lib::parse_constants(&files);
+    info!(parsed_constants = ?parsed_constants);
+
     let (state, events_tx) = State::new(parsed_constants);
+    info!(initial_state = ?state);
 
     let input_handler = task::spawn(handle_input(events_tx));
     let renderer = task::spawn(render(state));

@@ -1,6 +1,8 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use syn::File;
+
+use crate::send_sync_impl;
 
 /// Represents an intermediate representation between a parsed file from the
 /// `libc` codebase, and the [`ConstContainer`] type.
@@ -18,8 +20,23 @@ use syn::File;
 /// [`parse_constants()`]: `crate::parse_constants()`
 #[derive(Debug)]
 pub struct SourceFile {
-    pub(crate) inner: File,
-    pub(crate) source: PathBuf,
+    inner: File,
+    source: PathBuf,
+}
+
+send_sync_impl! { for SourceFile;
+    /// This impl is necessary because the `File` that this type wraps is
+    /// assumed `!Send + !Sync`, even though that only holds when used in the
+    /// context of a proc-macro. Types in `syn` use types from `proc-macro2`,
+    /// which itself has fallback implementations when not running in the
+    /// context of a proc-macro. These fallback implementations are thread-safe.
+    Send
+    /// This impl is necessary because the `File` that this type wraps is
+    /// assumed `!Send + !Sync`, even though that only holds when used in the
+    /// context of a proc-macro. Types in `syn` use types from `proc-macro2`,
+    /// which itself has fallback implementations when not running in the
+    /// context of a proc-macro. These fallback implementations are thread-safe.
+    Sync
 }
 
 impl SourceFile {
@@ -28,5 +45,17 @@ impl SourceFile {
             inner: contents,
             source,
         }
+    }
+
+    pub(crate) fn parsed_file(&self) -> &File {
+        let Self { inner, .. } = self;
+
+        inner
+    }
+
+    pub(crate) fn path(&self) -> impl AsRef<Path> {
+        let Self { source, .. } = self;
+
+        source
     }
 }
