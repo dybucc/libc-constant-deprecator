@@ -31,6 +31,8 @@ pub(crate) enum ScanFilesErrorRepr {
     ParseError(PathBuf),
     #[error("internal io error: `{0}`")]
     IoBound(io::Error),
+    #[error("path was not libc repo")]
+    NotLibcRepo,
     #[error(transparent)]
     Other(Box<dyn Error + Send + Sync>),
 }

@@ -4,6 +4,7 @@ use std::{
     sync::atomic::AtomicBool,
 };
 
+use cargo_metadata::MetadataCommand;
 use futures::future;
 use gix::{
     clone::{self, PrepareCheckout, PrepareFetch, fetch},
@@ -17,6 +18,7 @@ use gix::{
 use syn::File;
 use tokio::{
     fs,
+    process::Command,
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
     task::{self, JoinSet},
 };
@@ -64,8 +66,8 @@ pub async fn scan_files(
     if fs::try_exists(&libc_path)
         .await
         .map_err(ScanFilesErrorRepr::IoBound)?
+        && ensure_libc(&libc_path).await.is_ok()
     {
-        ensure_libc().await?;
         handle_result!(DiscoverRepoError);
     } else {
         handle_result!(CloneRepoError);
@@ -81,22 +83,44 @@ pub async fn scan_files(
     {
         Ok(((), res)) => Ok(res),
         Err(err) => match err {
-            FetchParseError::ParsingFailed(path) => {
-                Err(ScanFilesErrorRepr::ParseError(path).into())
-            }
-            FetchParseError::IoBound(err) => Err(ScanFilesErrorRepr::IoBound(err).into()),
-            FetchParseError::Other(err) => Err(ScanFilesErrorRepr::Other(err).into()),
-        },
+            FetchParseError::ParsingFailed(path) => Err(ScanFilesErrorRepr::ParseError(path)),
+            FetchParseError::IoBound(err) => Err(ScanFilesErrorRepr::IoBound(err)),
+            FetchParseError::Other(err) => Err(ScanFilesErrorRepr::Other(err)),
+        }
+        .map_err(Into::into),
     }
 }
 
-// TODO: implement a routine to ensure that the path we got passed, if it
-// exists, is `libc`'s.
-async fn ensure_libc() -> Result<(), ()> {
-    todo!()
+async fn ensure_libc(path: impl AsRef<Path>) -> Result<(), ScanFilesError> {
+    let metadata = MetadataCommand::parse(
+        str::from_utf8(
+            Command::new("cargo")
+                .args(["metadata", "--format-version=1", "--no-deps"])
+                .current_dir(path)
+                .output()
+                .await
+                .map_err(ScanFilesErrorRepr::IoBound)?
+                .stdout
+                .as_slice(),
+        )
+        .map_err(Into::into)
+        .map_err(ScanFilesErrorRepr::Other)?,
+    )
+    .map_err(Into::into)
+    .map_err(ScanFilesErrorRepr::Other)?;
+
+    let libc_potential_pkg = metadata
+        .root_package()
+        .ok_or("repo does not contain `libc` crate as root pkg")
+        .map_err(Into::into)
+        .map_err(ScanFilesErrorRepr::Other)?;
+
+    (libc_potential_pkg.name == "libc")
+        .ok_or(ScanFilesErrorRepr::NotLibcRepo)
+        .map_err(Into::into)
 }
 
-pub(crate) async fn discover_repo(path: PathBuf) -> Result<(), DiscoverRepoError> {
+async fn discover_repo(path: PathBuf) -> Result<(), DiscoverRepoError> {
     task::spawn_blocking(|| {
         gix::discover(&path)
             .map_err(|err| match err {
@@ -160,7 +184,7 @@ pub(crate) async fn discover_repo(path: PathBuf) -> Result<(), DiscoverRepoError
     .map_err(DiscoverRepoError::Error)
 }
 
-pub(crate) async fn clone_repo(path: PathBuf) -> Result<(), CloneRepoError> {
+async fn clone_repo(path: PathBuf) -> Result<(), CloneRepoError> {
     task::spawn_blocking(|| {
         fetch_repo(path.clone(), prepare_clone(path.clone())?)?
             .main_worktree(Discard, &AtomicBool::new(false))
@@ -176,7 +200,7 @@ pub(crate) async fn clone_repo(path: PathBuf) -> Result<(), CloneRepoError> {
     .map_err(CloneRepoError::Task)?
 }
 
-pub(crate) fn prepare_clone(path: PathBuf) -> Result<PrepareFetch, CloneRepoError> {
+fn prepare_clone(path: PathBuf) -> Result<PrepareFetch, CloneRepoError> {
     gix::prepare_clone(LIBC_REPO, &path)
         .map_err(|err| match err {
             clone::Error::Init(err) => match err {
@@ -253,7 +277,7 @@ pub(crate) fn prepare_clone(path: PathBuf) -> Result<PrepareFetch, CloneRepoErro
         .map_err(CloneRepoError::Error)
 }
 
-pub(crate) fn fetch_repo(
+fn fetch_repo(
     path: PathBuf,
     mut clone_handle: PrepareFetch,
 ) -> Result<PrepareCheckout, CloneRepoError> {
@@ -344,7 +368,7 @@ pub(crate) fn fetch_repo(
         .map(|(out, _)| out)
 }
 
-pub(crate) async fn fetch_details(
+async fn fetch_details(
     mut path: PathBuf,
     tx: UnboundedSender<PathBuf>,
 ) -> Result<(), FetchParseError> {
@@ -373,11 +397,18 @@ pub(crate) async fn fetch_details(
     .map_err(FetchParseError::Other)
 }
 
-pub(crate) async fn parse_files(
+async fn parse_files(
     mut rx: UnboundedReceiver<PathBuf>,
 ) -> Result<Vec<SourceFile>, FetchParseError> {
     // NOTE: this is necessary to have `syn::File` be `Send`, as otherwise we can't
-    // have any degree of parallelism/concurrency.
+    // have any degree of parallelism/concurrency. The reason why this is sound is
+    // that `File` is `!Send + !Sync` because the compiler-provided `proc-macro`
+    // types that are used when in the context of a proc-macro are not thread-safe.
+    // Outside of a proc-macro, the `proc-macro2` crate has a fallback
+    // implementation that is thread-safe, but for each of the types that support
+    // this, the choice of implementation is encoded in an `enum`, which does not
+    // conditionally compile its variants, and thus makes any type containing it be
+    // `!Send + !Sync`.
     #[repr(transparent)]
     struct ThreadedFile(File);
 

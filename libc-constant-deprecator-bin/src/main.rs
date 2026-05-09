@@ -715,7 +715,7 @@ impl State {
                         selected.extend(Dir::new_down(), pos);
                     }
 
-                    // NOTE: ignored cases include mode actions that are not part of
+                    // NOTE: ignored cases include ...TODO
                     _ => (),
                 }
             }
@@ -728,11 +728,7 @@ impl State {
         let Self { events, mode, .. } = self;
 
         match events.try_recv() {
-            Ok(event) => mode
-                .interpret(event)
-                .map_or_else(Termination::terminate, |event| {
-                    Termination::keep_going(event.into())
-                }),
+            Ok(event) => Termination::keep_going(mode.interpret(event)),
             Err(TryRecvError::Disconnected) => Termination::terminate(),
             _ => Termination::keep_going(None),
         }
@@ -1341,11 +1337,14 @@ pub(crate) async fn prepare_space() -> anyhow::Result<()> {
         PROMPT_COORD.set(cursor::position()?).unwrap();
     }
 
-    stdout.flush()?;
+    task::block_in_place(|| stdout.flush())?;
 
     Ok(())
 }
 
+// TODO: if time allows, get the part of `main` that enables raw mode to also
+// run here, as well as `prepare_space`. Possibly use a channel to update the
+// messages that would get reported on each of the tasks.
 async fn init() -> anyhow::Result<Vec<SourceFile>> {
     repr! {
         #[derive(Debug, Default, Clone, Copy)]
@@ -1453,7 +1452,7 @@ async fn main() -> anyhow::Result<()> {
             .with_file(true)
             .with_ansi(false)
             .with_line_number(true)
-            .pretty()
+            .compact()
             .with_writer(StdMutex::new(
                 File::create_buffered(env::current_dir().map(|pwd| pwd.join("debug.log")).unwrap())
                     .unwrap(),
@@ -1464,7 +1463,7 @@ async fn main() -> anyhow::Result<()> {
     let files = init().await?;
     info!(parsed_files = ?files);
 
-    task::spawn_blocking(terminal::enable_raw_mode).await??;
+    task::block_in_place(terminal::enable_raw_mode)?;
 
     prepare_space().await?;
     info!(prompt_coordinates = ?PROMPT_COORD);
