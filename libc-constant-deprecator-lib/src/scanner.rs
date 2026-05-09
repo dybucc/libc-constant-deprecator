@@ -15,18 +15,19 @@ use gix::{
     progress::Discard,
     remote::{self, connect},
 };
-use syn::File;
 use tokio::{
     fs,
     process::Command,
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
     task::{self, JoinSet},
 };
+use tracing::info;
 use walkdir::WalkDir;
 
 use crate::{
-    CloneErrorKind, CloneRepoError, DiscoverErrorKind, DiscoverRepoError, FetchParseError,
-    RepoErrorRepr, ScanFilesError, ScanFilesErrorRepr, SourceFile,
+    CloneErrorKind, CloneRepoError, ConstContainer, DiscoverErrorKind, DiscoverRepoError,
+    FetchParseError, IrContainer, RepoErrorRepr, ScanFilesError, ScanFilesErrorRepr, SourceFile,
+    parser::parse_constants,
 };
 
 pub(crate) const LIBC_REPO: &str = "https://github.com/rust-lang/libc.git";
@@ -38,10 +39,8 @@ pub(crate) const LIBC_REPO: &str = "https://github.com/rust-lang/libc.git";
 ///
 /// The function may fail if it fails to discover/clone the repo on the given
 /// path and, when dealing with an existing path, its ancestors.
-#[tracing::instrument(ret, err(level = "info"))]
-pub async fn scan_files(
-    libc_path: impl AsRef<Path> + Debug,
-) -> Result<Vec<SourceFile>, ScanFilesError> {
+#[tracing::instrument(err(level = "info"))]
+pub async fn scan(libc_path: impl AsRef<Path> + Debug) -> Result<ConstContainer, ScanFilesError> {
     // NOTE: it's more intuitive to have the routine name be the token tree we
     // accept for recursive munching, but that way the recursive macro invocation
     // would have to replace the start of the path of the enum variant, which seems
@@ -63,9 +62,9 @@ pub async fn scan_files(
         }};
     }
 
-    if fs::try_exists(&libc_path)
-        .await
-        .map_err(ScanFilesErrorRepr::IoBound)?
+    info!("starting `scan_files` routine");
+
+    if let Ok(libc_path) = fs::canonicalize(&libc_path).await
         && ensure_libc(&libc_path).await.is_ok()
     {
         handle_result!(DiscoverRepoError);
@@ -375,7 +374,7 @@ async fn fetch_details(
     // NOTE: we don't implement manual directory traversal with something like
     // `tokio`'s `fs` functions because those use the same `std` blocking functions
     // only on a separate, "blocking-friendly" thread, so we may as well keep
-    // `walkdir` but run it also in a separate thread.
+    // `walkdir` but run it also in such separate "type" of thread.
     task::spawn_blocking(move || {
         path.push("src");
 
@@ -399,29 +398,15 @@ async fn fetch_details(
 
 async fn parse_files(
     mut rx: UnboundedReceiver<PathBuf>,
-) -> Result<Vec<SourceFile>, FetchParseError> {
-    // NOTE: this is necessary to have `syn::File` be `Send`, as otherwise we can't
-    // have any degree of parallelism/concurrency. The reason why this is sound is
-    // that `File` is `!Send + !Sync` because the compiler-provided `proc-macro`
-    // types that are used when in the context of a proc-macro are not thread-safe.
-    // Outside of a proc-macro, the `proc-macro2` crate has a fallback
-    // implementation that is thread-safe, but for each of the types that support
-    // this, the choice of implementation is encoded in an `enum`, which does not
-    // conditionally compile its variants, and thus makes any type containing it be
-    // `!Send + !Sync`.
-    #[repr(transparent)]
-    struct ThreadedFile(File);
-
-    unsafe impl Send for ThreadedFile {}
-
+) -> Result<ConstContainer, FetchParseError> {
     let mut task_pool = JoinSet::new();
     let (inner_tx, mut inner_rx) = mpsc::unbounded_channel();
 
     let gatherer = task::spawn(async move {
-        let mut out = Vec::new();
+        let mut out = IrContainer::new();
 
         while let Some(res) = inner_rx.recv().await {
-            out.push(res);
+            out.extend(res);
         }
 
         out
@@ -432,19 +417,18 @@ async fn parse_files(
 
         task_pool.spawn(async move {
             inner_tx
-                .send((
-                    ThreadedFile(
-                        syn::parse_file(
-                            &fs::read_to_string(&path)
-                                .await
-                                .map_err(FetchParseError::IoBound)?,
-                        )
-                        .map_err(|_| path.clone())
-                        .map_err(FetchParseError::ParsingFailed)?,
-                    ),
+                .send(parse_constants(&SourceFile::new(
+                    syn::parse_file(
+                        &fs::read_to_string(&path)
+                            .await
+                            .map_err(FetchParseError::IoBound)?,
+                    )
+                    .map_err(|_| path.clone())
+                    .map_err(FetchParseError::ParsingFailed)?,
                     path,
-                ))
+                )))
                 .map_err(|_| FetchParseError::Other("synchronization error".into()))?;
+
             Ok::<_, FetchParseError>(())
         });
     }
@@ -458,11 +442,7 @@ async fn parse_files(
 
     gatherer
         .await
-        .map(|out| {
-            out.into_iter()
-                .map(|(ThreadedFile(file), path)| SourceFile::new(file, path))
-                .collect()
-        })
+        .map(IrContainer::into_const_container)
         .map_err(Into::into)
         .map_err(FetchParseError::Other)
 }

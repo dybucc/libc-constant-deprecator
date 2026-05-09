@@ -8,7 +8,7 @@ use syn::{
 use crate::Const;
 
 #[derive(Debug)]
-pub(crate) struct MacroParser(pub(crate) Vec<ItemConst>);
+pub(crate) struct MacroParser(Vec<ItemConst>);
 
 impl MacroParser {
     pub(crate) fn into_iter(self, source: PathBuf) -> impl Iterator<Item = Const> {
@@ -29,7 +29,7 @@ impl Parse for MacroParser {
     }
 }
 
-pub(crate) fn parse(buf: &mut Vec<ItemConst>, input: ParseStream) -> syn::Result<()> {
+fn parse(buf: &mut Vec<ItemConst>, input: ParseStream) -> syn::Result<()> {
     // NOTE: if at some point we find that a `cfg_if` macro invocation contains
     // another `cfg_if` macro invocation nested within it, this should be fairly
     // simple to fix. Currently, we assume that upon entering the macro invocation,
@@ -43,7 +43,7 @@ pub(crate) fn parse(buf: &mut Vec<ItemConst>, input: ParseStream) -> syn::Result
                 .into_iter()
                 .filter_map(|stmt| {
                     if let Stmt::Item(Item::Const(constant)) = stmt {
-                        Some(constant)
+                        constant.into()
                     } else {
                         None
                     }

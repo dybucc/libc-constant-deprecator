@@ -1,9 +1,11 @@
-use std::{iter, path::Path};
+use std::{iter, path::PathBuf};
 
 use syn::{Item, ItemConst, ItemMacro, Macro};
+use tracing::info;
 
-use crate::{Const, ConstContainer, MacroParser, SourceFile};
+use crate::{Const, IrContainer, MacroParser, SourceFile};
 
+pub(crate) mod ir_container;
 pub(crate) mod macro_parser;
 
 /// Parses constants provided a collection of [`SourceFile`]s yield from
@@ -16,54 +18,46 @@ pub(crate) mod macro_parser;
 /// `libc`.)
 ///
 /// [`scan_files()`]: `crate::scan_files()`
-#[tracing::instrument(skip_all, ret)]
-pub fn parse_constants(files: &[SourceFile]) -> ConstContainer {
+#[tracing::instrument(skip_all)]
+pub(crate) fn parse_constants(file: &SourceFile) -> IrContainer {
     macro_rules! cast {
         ($iter:expr) => {{ Box::new($iter) as Box<dyn Iterator<Item = Const>> }};
     }
 
-    ConstContainer::new(
-        files
-            .iter()
-            .fold(Vec::new(), |mut parsed_constants, source| {
-                let file = source.parsed_file();
-                let path = source.path();
+    let syn_file = file.parsed_file();
+    let path = file.path();
 
-                parsed_constants.extend(
-                    file.items
-                        .iter()
-                        .filter_map(|item| match item {
-                            Item::Const(constant) => {
-                                cast!(process_constant(constant, &path)).into()
-                            }
-                            Item::Macro(ItemMacro {
-                                mac: mac @ Macro { path: mac_path, .. },
-                                ..
-                            }) if mac_path.is_ident("cfg_if") => {
-                                cast!(process_macro(mac, &path)).into()
-                            }
-                            _ => None,
-                        })
-                        .flatten(),
-                );
+    info!(file_to_parse = %path.as_ref().display());
 
-                parsed_constants
-            }),
-    )
+    syn_file
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Const(constant) => {
+                info!("found constant symbol");
+
+                cast!(process_constant(constant.clone(), path.as_ref().to_owned())).into()
+            }
+            Item::Macro(ItemMacro {
+                mac: mac @ Macro { path: mac_path, .. },
+                ..
+            }) if mac_path.is_ident("cfg_if") => {
+                info!("found macro");
+
+                cast!(process_macro(mac, path.as_ref().to_owned())).into()
+            }
+            _ => None,
+        })
+        .flatten()
+        .collect()
 }
 
-pub(crate) fn process_constant(
-    constant: &ItemConst,
-    source: impl AsRef<Path>,
-) -> impl Iterator<Item = Const> {
-    iter::once(Const::from_item(
-        constant.clone(),
-        source.as_ref().to_owned(),
-    ))
+fn process_constant(constant: ItemConst, source: PathBuf) -> impl Iterator<Item = Const> {
+    iter::once(Const::from_item(constant, source))
 }
 
-pub(crate) fn process_macro(mac: &Macro, source: impl AsRef<Path>) -> impl Iterator<Item = Const> {
+fn process_macro(mac: &Macro, source: PathBuf) -> impl Iterator<Item = Const> {
     mac.parse_body::<MacroParser>()
         .expect("macro body couldn't be parsed correctly; time to check the implementation")
-        .into_iter(source.as_ref().to_owned())
+        .into_iter(source)
 }

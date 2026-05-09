@@ -13,6 +13,8 @@ mod scanner;
 mod source_file;
 mod support;
 
+// Private reexports.
+
 #[cfg_attr(
     not(test),
     expect(
@@ -21,7 +23,11 @@ mod support;
     )
 )]
 pub(crate) use crate::errors::*;
-pub(crate) use crate::parser::macro_parser::MacroParser;
+pub(crate) use crate::parser::{ir_container::IrContainer, macro_parser::MacroParser};
+
+// Public reexports.
+
+#[rustfmt::skip]
 #[doc(inline)]
 pub use crate::{
     constant::Const,
@@ -30,10 +36,12 @@ pub use crate::{
         borrowed::{BorrowedContainer, BorrowedSubset, Visit},
     },
     errors::{FilterError, MakeChangesError, ScanFilesError},
-    parser::parse_constants,
-    scanner::scan_files,
+    scanner::scan,
     source_file::SourceFile,
 };
+
+// Macro reexports; left last to force all other crate modules to import the
+// macros as items and not just have them immediately available.
 
 #[macro_use]
 mod macros;

@@ -1,4 +1,4 @@
-#![feature(range_bounds_is_empty, range_into_bounds, try_blocks, file_buffered)]
+#![feature(range_bounds_is_empty, range_into_bounds, try_blocks)]
 
 use std::{
     borrow::Borrow,
@@ -23,7 +23,7 @@ use crossterm::{
     terminal::{self, Clear, ClearType, DisableLineWrap},
 };
 use futures::{StreamExt, future};
-use libc_constant_deprecator_lib::{BorrowedContainer, ConstContainer, SourceFile, Visit};
+use libc_constant_deprecator_lib::{BorrowedContainer, ConstContainer, Visit};
 use tester_impl::defer_drm;
 use tokio::{
     sync::{
@@ -1315,8 +1315,7 @@ pub(crate) async fn prepare_space() -> anyhow::Result<()> {
     let mut stdout = SYNC_BUF.lock().await;
 
     // NOTE: the initial cursor is meant to reflect the shape of normal mode, which
-    // should allow navigation throughout both the set of constants on display and
-    // the prompt.
+    // should allow left-right navigation in the prompt.
     crossterm::queue!(stdout, SetCursorStyle::SteadyBlock, DisableLineWrap)?;
 
     // NOTE: we must make space for one row for the prompt, and ten rows for the
@@ -1325,10 +1324,13 @@ pub(crate) async fn prepare_space() -> anyhow::Result<()> {
     // due to the fact `rows` is 1-indexed, while `current_row` and `MoveToRow` are
     // 0-indexed.
     if rows - current_row < 12 {
-        crossterm::queue!(stdout, MoveToRow(current_row - 11))?;
-        crossterm::queue!(stdout, Clear(ClearType::FromCursorDown))?;
-        crossterm::queue!(stdout, MoveToNextLine(1))?;
-        crossterm::queue!(stdout, SavePosition)?;
+        crossterm::queue!(
+            stdout,
+            MoveToRow(current_row - 11),
+            Clear(ClearType::FromCursorDown),
+            MoveToNextLine(1),
+            SavePosition
+        )?;
 
         // NOTE: we `unwrap` here because there's no point in assumming that the static
         // got initialized already, and that's the only point of failure. At the time of
@@ -1345,7 +1347,8 @@ pub(crate) async fn prepare_space() -> anyhow::Result<()> {
 // TODO: if time allows, get the part of `main` that enables raw mode to also
 // run here, as well as `prepare_space`. Possibly use a channel to update the
 // messages that would get reported on each of the tasks.
-async fn init() -> anyhow::Result<Vec<SourceFile>> {
+#[tracing::instrument(skip_all, err(level = "info"))]
+async fn init() -> anyhow::Result<ConstContainer> {
     repr! {
         #[derive(Debug, Default, Clone, Copy)]
         SpinnerKind
@@ -1397,6 +1400,8 @@ async fn init() -> anyhow::Result<Vec<SourceFile>> {
         }
     }
 
+    info!("starting init routine");
+
     let (tx, mut rx) = oneshot::channel();
 
     let spinner = async move {
@@ -1416,30 +1421,37 @@ async fn init() -> anyhow::Result<Vec<SourceFile>> {
             spinner.transition();
             task::block_in_place(|| stdout.flush())?;
 
-            time::sleep(Duration::from_millis(512)).await;
+            time::sleep(Duration::from_millis(128)).await;
         }
+
+        info!("finished spinner task");
 
         anyhow::Ok(())
     };
 
     let worker = async move {
-        let res =
-            libc_constant_deprecator_lib::scan_files(if let Some(path) = Args::parse().path {
-                PathBuf::from(path).canonicalize().unwrap()
-            } else {
-                env::current_dir().unwrap()
-            })
-            .await
-            .map_err(Into::into);
+        libc_constant_deprecator_lib::scan(if let Some(path) = Args::parse().path {
+            PathBuf::from(path)
+        } else {
+            env::current_dir().unwrap()
+        })
+        .await
+        .map_err(|err| {
+            info!("resolved file parsing");
 
-        tx.send(()).unwrap();
+            tx.send(()).unwrap();
 
-        res
+            err.into()
+        })
     };
 
     future::try_join(task::spawn(spinner), task::spawn(worker))
         .await
-        .map(|(res1, res2)| res1.and(res2))?
+        .map(|(res1, res2)| {
+            info!("finished init routine");
+
+            res1.and(res2)
+        })?
 }
 
 #[tokio::main]
@@ -1452,27 +1464,22 @@ async fn main() -> anyhow::Result<()> {
             .with_file(true)
             .with_ansi(false)
             .with_line_number(true)
-            .compact()
             .with_writer(StdMutex::new(
-                File::create_buffered(env::current_dir().map(|pwd| pwd.join("debug.log")).unwrap())
-                    .unwrap(),
+                File::create(env::current_dir().map(|pwd| pwd.join("debug.log")).unwrap()).unwrap(),
             ))
             .init();
     }
 
-    let files = init().await?;
-    info!(parsed_files = ?files);
+    let parsed_constants = init().await?;
+    info!("finished parsing codebase");
 
     task::block_in_place(terminal::enable_raw_mode)?;
-
     prepare_space().await?;
-    info!(prompt_coordinates = ?PROMPT_COORD);
 
-    let parsed_constants = libc_constant_deprecator_lib::parse_constants(&files);
-    info!(parsed_constants = ?parsed_constants);
+    info!(prompt_coordinates = ?PROMPT_COORD.get().unwrap());
 
     let (state, events_tx) = State::new(parsed_constants);
-    info!(initial_state = ?state);
+    info!("finished initializing state");
 
     let input_handler = task::spawn(handle_input(events_tx));
     let renderer = task::spawn(render(state));
