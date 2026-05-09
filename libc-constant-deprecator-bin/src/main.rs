@@ -28,7 +28,7 @@ use tester_impl::defer_drm;
 use tokio::{
     sync::{
         Mutex,
-        mpsc::{self, UnboundedReceiver, UnboundedSender, error::TryRecvError},
+        mpsc::{self, UnboundedReceiver, UnboundedSender},
         oneshot::{self, error::TryRecvError as OneshotTryRecvError},
     },
     task, time,
@@ -288,7 +288,7 @@ repr! {
 impl<T> Termination<T> {
     repr_impl! { TerminationRepr => {
         terminate, should_terminate, _d, _d => Termination;
-        keep_going, should_unterminate, into_inner, non_terminate => NonTermination(t: T);
+        keep_going, shant_terminate, into_inner, inner => NonTermination(t: T);
     }}
 }
 
@@ -600,19 +600,14 @@ impl State {
         };
 
         match event.kind() {
-            // NOTE: this is not quite as ergonomic as getting the event payload directly from the
-            // internal representation, but it gets the job done just fine.
             UserEventKind::TextualInput => prompt.push(event.into_text()),
             UserEventKind::Search => constants.filter_with(&prompt, filter_buf)?,
             // NOTE: toggles all constants because we are either (1) outside select mode, or (2)
             // within it but without a selection ranging beyond a single row.
-            UserEventKind::Toggle if selected.is_empty() => {
-                if all_deprecated(filter_buf) {
-                    filter_buf.undeprecate();
-                } else {
-                    filter_buf.deprecate();
-                }
+            UserEventKind::Toggle if selected.is_empty() && all_deprecated(filter_buf) => {
+                filter_buf.undeprecate();
             }
+            UserEventKind::Toggle if selected.is_empty() => filter_buf.deprecate(),
             // NOTE: this uses `BorrowedSubset` to add another degree of refinement to the set of
             // constants currently under consideration. This only happens in select mode, where the
             // range in `selected` may be non-empty.
@@ -656,8 +651,8 @@ impl State {
                                 *mode = new_mode;
 
                                 // NOTE: because normal mode can be used in both the prompt and the
-                                // list, but insert mode can only be used in prompt, we require
-                                // switching over the current cursor position to prompt if we're
+                                // list, but insert mode can only be used in the prompt, we require
+                                // switching over the current cursor position to the prompt if we're
                                 // currently in the list of filtered symbols.
                                 if pos.is_list() {
                                     pos.transition();
@@ -724,13 +719,16 @@ impl State {
         Ok(())
     }
 
-    pub(crate) fn receive_event(&mut self) -> Termination<Option<UserEvent>> {
+    pub(crate) async fn receive_event(&mut self) -> Termination<Option<UserEvent>> {
         let Self { events, mode, .. } = self;
 
-        match events.try_recv() {
-            Ok(event) => Termination::keep_going(mode.interpret(event)),
-            Err(TryRecvError::Disconnected) => Termination::terminate(),
-            _ => Termination::keep_going(None),
+        // NOTE: the point here is to sleep until a new event is made available, such
+        // that the `tokio` executor can just keep everything on hold, or otherwise
+        // yield to the input handler, which is the only other task that it can switch
+        // to once this `.await` point reaches the topmost "task gathering point."
+        match events.recv().await {
+            Some(event) => Termination::keep_going(mode.interpret(event)),
+            None => Termination::terminate(),
         }
     }
 
@@ -745,11 +743,13 @@ impl State {
             ..
         } = self;
 
-        crossterm::queue!(stdout, Hide)?;
-        crossterm::queue!(stdout, RestorePosition)?;
-
-        crossterm::queue!(stdout, Print("> "))?;
-        crossterm::queue!(stdout, MoveToNextLine(1))?;
+        crossterm::queue!(
+            stdout,
+            Hide,
+            RestorePosition,
+            Print("> "),
+            MoveToNextLine(1)
+        )?;
 
         let mut line_counter = 0;
 
@@ -765,14 +765,12 @@ impl State {
                     crossterm::queue!(stdout, Print("["))?;
 
                     if constant.is_deprecated() {
-                        crossterm::queue!(stdout, Print("x"))?;
-                        crossterm::queue!(stdout, Print("] "))?;
+                        crossterm::queue!(stdout, Print("x] "))?;
                     } else {
                         crossterm::queue!(stdout, Print("] "))?;
                     }
 
-                    crossterm::queue!(stdout, Print(constant.ident()))?;
-                    crossterm::queue!(stdout, MoveToNextLine(1))?;
+                    crossterm::queue!(stdout, Print(constant.ident()), MoveToNextLine(1))?;
                 } {
                     Ok(()) => ControlFlow::Continue(()),
                     Err(err) => ControlFlow::Break(err.into()),
@@ -1222,12 +1220,14 @@ pub(crate) async fn render(mut state: State) -> anyhow::Result<()> {
 
 #[tracing::instrument(skip_all)]
 pub(crate) async fn draw_screen(state: &mut State) -> anyhow::Result<()> {
-    state.draw(&mut *SYNC_BUF.lock().await)
+    let stdout = &mut *SYNC_BUF.lock().await;
+
+    task::block_in_place(|| state.draw(stdout))
 }
 
 #[tracing::instrument(skip_all, ret, err(level = "info"))]
 pub(crate) async fn update(state: &mut State) -> anyhow::Result<Termination<()>> {
-    let res = state.receive_event();
+    let res = state.receive_event().await;
 
     if res.should_terminate() {
         return Ok(Termination::terminate());
@@ -1416,7 +1416,7 @@ async fn init() -> anyhow::Result<Vec<SourceFile>> {
             spinner.transition();
             task::block_in_place(|| stdout.flush())?;
 
-            time::sleep(Duration::from_millis(256)).await;
+            time::sleep(Duration::from_millis(512)).await;
         }
 
         anyhow::Ok(())
@@ -1425,7 +1425,7 @@ async fn init() -> anyhow::Result<Vec<SourceFile>> {
     let worker = async move {
         let res =
             libc_constant_deprecator_lib::scan_files(if let Some(path) = Args::parse().path {
-                PathBuf::from(path)
+                PathBuf::from(path).canonicalize().unwrap()
             } else {
                 env::current_dir().unwrap()
             })
