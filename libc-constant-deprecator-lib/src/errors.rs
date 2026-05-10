@@ -5,23 +5,27 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use either::Either;
 use thiserror::Error;
 
 use crate::ConstContainer;
 
-/// Represents an error condition while parsing the codebase with
-/// [`scan_files()`].
+/// Represents an error condition while parsing the codebase with [`scan()`].
 ///
 /// The error is produced when something git-related fails, or if the constants
 /// fail to parse. Otherwise the error is deemed to be an I/O-bound
 /// [`io::Error`] or a task-bound [`JoinError`] error.
 ///
-/// [`scan_files()`]: `crate::scan_files()`
+/// Note no external errors are exposed, and so `tokio` task-bound errors are
+/// type erased on construction.
+///
+/// [`scan()`]: `crate::scan()`
+/// [`io::Error`]: `std::io::Error`
 /// [`JoinError`]: `tokio::task::JoinError`
 #[derive(Debug, Error)]
 #[repr(transparent)]
 #[error(transparent)]
-pub struct ScanFilesError(#[from] pub(crate) ScanFilesErrorRepr);
+pub struct ScanFilesError(#[from] ScanFilesErrorRepr);
 
 #[derive(Debug, Error)]
 pub(crate) enum ScanFilesErrorRepr {
@@ -37,9 +41,6 @@ pub(crate) enum ScanFilesErrorRepr {
     Other(Box<dyn Error + Send + Sync>),
 }
 
-// NOTE: the error variants in this enum may seem like they suffer from
-// fragmentation in that task errors can also be gathered by `RepoErrorRepr`. We
-// separate them into two different variants for the purposes of unit testing.
 #[derive(Debug)]
 pub(crate) enum DiscoverRepoError {
     Error(RepoErrorRepr),
@@ -143,12 +144,17 @@ pub(crate) enum FetchParseError {
 ///
 /// The only two possible error conditions correspond with those currently in
 /// the [`regex`] crate.
+///
+/// [`ConstContainer::filter()`]: `crate::ConstContainer::filter`
+/// [`regex`]: `regex`
 #[derive(Debug, Error)]
 #[repr(transparent)]
 #[error(transparent)]
-pub struct FilterError(#[from] pub(crate) FilterErrorRepr);
+pub struct FilterError(#[from] FilterErrorRepr);
 
 impl FilterError {
+    /// Fetches the source regex with which the error was produced and returns a
+    /// reference to the underlying string slice.
     #[expect(
         clippy::must_use_candidate,
         reason = "It's not a bug not to use the result of this routine."
@@ -176,19 +182,25 @@ impl FilterErrorRepr {
 
 /// Represents errors that have taken place as part of effecting changes to disk
 /// in [`ConstContainer::effect_changes()`].
+///
+/// [`ConstContainer::effect_changes()`]: `crate::ConstContainer::effect_changes`
 #[derive(Debug, Error)]
 #[repr(transparent)]
 #[error(transparent)]
-pub struct MakeChangesError(#[from] pub(crate) MakeChangesErrorRepr);
+pub struct MakeChangesError(#[from] MakeChangesErrorRepr);
 
 impl MakeChangesError {
     /// Returns the source path where an underlying [`io::Error`] took place if
     /// the underlying error is, indeed, an `io::Error`.
+    ///
+    /// Returns `None` if the underlying error is not an `io::Error`.
+    ///
+    /// [`io::Error`]: `std::io::Error`
     #[expect(
         clippy::must_use_candidate,
         reason = "It's not a bug not to use the result of this routine."
     )]
-    pub fn io_source(&self) -> Option<&Path> {
+    pub fn io_source(&self) -> Option<impl AsRef<Path>> {
         if let MakeChangesErrorRepr::IoBound(ref ch) = self.0 {
             ch.source_path().into()
         } else {
@@ -199,7 +211,7 @@ impl MakeChangesError {
 
 #[derive(Debug, Error)]
 pub(crate) enum MakeChangesErrorRepr {
-    #[error("io error while {}: `{}`", .0.error(), .0.inner)]
+    #[error("io error while {}: `{}`", .0.error(), .0.source_io())]
     IoBound(IoBoundChanges),
     #[error("failed to parse file: {0}")]
     Parse(Cow<'static, Path>),
@@ -209,31 +221,132 @@ pub(crate) enum MakeChangesErrorRepr {
 
 #[derive(Debug)]
 pub(crate) struct IoBoundChanges {
-    pub(crate) origin: ChangesSrc,
-    pub(crate) inner: io::Error,
+    origin: ChangesSrc,
+    inner: io::Error,
 }
 
 impl IoBoundChanges {
+    pub(crate) fn new(path: impl AsRef<Path>, inner: io::Error, kind: ChangesKind) -> Self {
+        Self {
+            origin: ChangesSrc::new(kind, path.as_ref().to_owned()),
+            inner,
+        }
+    }
+
+    pub(crate) fn source_io(&self) -> &io::Error {
+        &self.inner
+    }
+
     pub(crate) fn error(&self) -> String {
-        match self.origin {
-            ChangesSrc::FetchOp(ref erred_path) => {
-                format!("fetching file {}", erred_path.display())
-            }
-            ChangesSrc::SaveOp(ref erred_path) => format!("saving file {}", erred_path.display()),
+        self.origin
+            .with_path(
+                |path| format!("fetching file {}", path.display()),
+                |path| format!("saving fle {}", path.display()),
+            )
+            .into_inner()
+    }
+
+    pub(crate) fn source_path<'a>(&'a self) -> impl AsRef<Path> + use<'a> {
+        self.origin.path()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ChangesKind {
+    repr: ChangesKindRepr,
+}
+
+impl ChangesKind {
+    fn to_changes_src(&self, path: PathBuf) -> ChangesSrc {
+        match self.repr {
+            ChangesKindRepr::FetchOp => ChangesSrc::fetch(path),
+            ChangesKindRepr::SaveOp => ChangesSrc::save(path),
+        }
+    }
+
+    pub(crate) fn fetch() -> Self {
+        Self {
+            repr: ChangesKindRepr::FetchOp,
+        }
+    }
+
+    pub(crate) fn save() -> Self {
+        Self {
+            repr: ChangesKindRepr::SaveOp,
         }
     }
 }
 
-impl IoBoundChanges {
-    pub(crate) fn source_path(&self) -> &Path {
-        match self.origin {
-            ChangesSrc::FetchOp(ref path) | ChangesSrc::SaveOp(ref path) => path,
+#[derive(Debug, Clone, Copy)]
+enum ChangesKindRepr {
+    FetchOp,
+    SaveOp,
+}
+
+#[derive(Debug, Clone)]
+struct ChangesSrc {
+    repr: ChangesSrcRepr,
+}
+
+impl ChangesSrc {
+    fn new(kind: ChangesKind, path: PathBuf) -> Self {
+        kind.to_changes_src(path)
+    }
+
+    fn path<'a>(&'a self) -> impl AsRef<Path> + use<'a> {
+        self.repr.path()
+    }
+
+    fn with_path<T, U>(
+        &self,
+        fetch: impl FnOnce(&Path) -> T,
+        save: impl FnOnce(&Path) -> U,
+    ) -> Either<T, U> {
+        self.repr.visit(fetch, save)
+    }
+
+    fn fetch(path: PathBuf) -> Self {
+        Self {
+            repr: ChangesSrcRepr::fetch(path),
+        }
+    }
+
+    fn save(path: PathBuf) -> Self {
+        Self {
+            repr: ChangesSrcRepr::save(path),
         }
     }
 }
 
-#[derive(Debug)]
-pub(crate) enum ChangesSrc {
+#[derive(Debug, Clone)]
+enum ChangesSrcRepr {
     FetchOp(PathBuf),
     SaveOp(PathBuf),
+}
+
+impl ChangesSrcRepr {
+    fn visit<T, U>(
+        &self,
+        fetch: impl FnOnce(&Path) -> T,
+        save: impl FnOnce(&Path) -> U,
+    ) -> Either<T, U> {
+        match self {
+            Self::FetchOp(path) => Either::Left(fetch(path.as_path())),
+            Self::SaveOp(path) => Either::Right(save(path.as_path())),
+        }
+    }
+
+    fn path<'a>(&'a self) -> impl AsRef<Path> + use<'a> {
+        match self {
+            Self::FetchOp(path) | Self::SaveOp(path) => path,
+        }
+    }
+
+    fn fetch(path: PathBuf) -> Self {
+        Self::FetchOp(path)
+    }
+
+    fn save(path: PathBuf) -> Self {
+        Self::SaveOp(path)
+    }
 }

@@ -3,20 +3,18 @@ use std::path::PathBuf;
 use proc_macro2::LineColumn;
 use syn::{Attribute, Ident, ItemConst, spanned::Spanned};
 
-use crate::send_sync_impl;
-
 // TODO(perf): instead of only storing the identifier of the constant, it may be
 // a better idea to store an enumeration akin to `std::Cow`, where the
 // identifier is the base type, and if at some point we require converting one
 // of them into strings, it starts storing them as strings instead.
-/// In-memory representation of parsed constants produced as part of
-/// [`parse_constants()`], within [`ConstContainer`]s.
+/// In-memory representation of parsed constants within [`ConstContainer`]s
+/// produced as part of [`scan()`].
 ///
 /// This type contains additional information on the file span, and on whether
 /// the constant item has been marked deprecated.
 ///
-/// [`parse_constants()`]: `crate::parse_constants()`
 /// [`ConstContainer`]: `crate::ConstContainer`
+/// [`scan()`]: `crate::scan()`
 #[derive(Debug, Clone)]
 pub struct Const {
     ident: Ident,
@@ -25,28 +23,22 @@ pub struct Const {
     source: PathBuf,
 }
 
-send_sync_impl! { for Const;
-    /// These are necessary for some async stuff that has collections of `Const`s
-    /// passed between threads. The reason why this is sound is that the backing
-    /// `Ident` in the `ident` field (which is the one causing
-    /// `Const: !Send + !Sync`) is actually the `fallback::Ident` in `proc_macro2`,
-    /// which itself is thread-safe. This isn't a public implementation detail, but
-    /// it is the way that crate handles the `Ident` type when outside the context
-    /// of a proc-macro. This crate is not a proc-macro, so we can trust the `Ident`
-    /// type is _not_ the thread-unsafe variant in the `proc_macro`
-    /// compiler-provided crate.
-    Send
-    /// These are necessary for some async stuff that has collections of `Const`s
-    /// passed between threads. The reason why this is sound is that the backing
-    /// `Ident` in the `ident` field (which is the one causing
-    /// `Const: !Send + !Sync`) is actually the `fallback::Ident` in `proc_macro2`,
-    /// which itself is thread-safe. This isn't a public implementation detail, but
-    /// it is the way that crate handles the `Ident` type when outside the context
-    /// of a proc-macro. This crate is not a proc-macro, so we can trust the `Ident`
-    /// type is _not_ the thread-unsafe variant in the `proc_macro`
-    /// compiler-provided crate.
-    Sync
-}
+// NOTE: these are necessary for some async stuff that has collections of
+// `Const`s passed between threads. The reason why this is sound is that the
+// backing `Ident` in the `ident` field (which is the one causing `Const: !Send
+// + !Sync`) is actually the `fallback::Ident` in `proc_macro2`, which itself is
+// thread-safe. This isn't a public implementation detail, but it is the way
+// that crate handles the `Ident` type when outside the context of a proc-macro.
+// This crate is not a proc-macro, so we can trust the `Ident` type is _not_ the
+// thread-unsafe variant in the `proc_macro` compiler-provided crate. The only
+// other source of issues for use on this crate would be span information, which
+// `proc-macro2` saves in TLS. This is mitigated by storing inline the span
+// information, itself fetched in-place in the same thread where the file we
+// source it from is being parsed (and having its TLS source map written to.)
+
+unsafe impl Send for Const {}
+
+unsafe impl Sync for Const {}
 
 impl Const {
     /// Checks if the constant is marked deprecated or not.

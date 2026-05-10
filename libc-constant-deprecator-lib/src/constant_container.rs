@@ -9,7 +9,7 @@ use syn::{Item, ItemConst, spanned::Spanned};
 use tokio::{fs, task::JoinSet};
 
 use crate::{
-    BorrowedContainer, ChangesSrc, Const, FilterError, FilterErrorRepr, IoBoundChanges,
+    BorrowedContainer, ChangesKind, Const, FilterError, FilterErrorRepr, IoBoundChanges,
     MakeChangesError, MakeChangesErrorRepr, deprecate,
 };
 
@@ -120,13 +120,12 @@ impl ConstContainer {
     /// The reason why there's two and not just one of these filtering routines
     /// is that there's a tradeoff in allocations and potential allocations.
     /// `filter_with()` requires a borrowed container, which may be obtained
-    /// through either one of `filter()`'s allocated container, or
-    /// `borrowed_container()`. If sourced from the former, the container may
-    /// reallocate if some future filtering operation requires resolving a
-    /// larger amount of constants. If sourced from the latter, the container is
-    /// guaranteed to never reallocate as it will always have a capacity
-    /// equivalent to that of a borrowed container returned by a filtering
-    /// operation with an input regex `.*`.
+    /// through either one of `filter()`'s allocated container, or `borrowed()`.
+    /// If sourced from the former, the container may reallocate if some future
+    /// filtering operation requires resolving a larger amount of constants. If
+    /// sourced from the latter, the container is guaranteed to never reallocate
+    /// as it will always have a capacity equivalent to that of a borrowed
+    /// container returned by a filtering operation with an input regex `.*`.
     ///
     /// [`filter_with()`]: `crate::ConstContainer::filter_with()`
     /// [`filter()`]: `crate::ConstContainer::filter()`
@@ -145,7 +144,7 @@ impl ConstContainer {
     ///
     /// This is a no-op if no constants have been changed, as the implementation
     /// will only write to disk whichever constants have had their deprecation
-    /// status modified.
+    /// status modified from the time they were loaded into memory.
     ///
     /// Note this makes changes to the current codebase, and attempts to keep
     /// the rewritten files fairly well-behaved when it comes to formatting
@@ -162,10 +161,8 @@ impl ConstContainer {
         // `Const`. It just so happens that `tokio`'s tasks require a `'static` lifetime
         // on the futures they run, but we have invariant references to `'static'`. This
         // is solved by way of raw pointers, which themselves require an unsafe impl to
-        // be accepted as thread-safe. It is sound to do this because the tasks are only
-        // accessed from the thread in which they are runnning. On the lifetime side, it
-        // is also sound for the moved newtype in the future not to be `'static` because
-        // all of the tasks spawned here are awaited before the function returns.
+        // be accepted as thread-safe. It is sound to do this because all of the tasks
+        // spawned here are awaited before the function returns.
         #[repr(transparent)]
         struct ThreadedPtr<T>(*const T);
 
@@ -203,10 +200,11 @@ impl ConstContainer {
                 let source = unsafe { &constant.as_ref_unchecked().source() };
 
                 let contents = fs::read_to_string(source).await.map_err(|inner| {
-                    MakeChangesErrorRepr::IoBound(IoBoundChanges {
-                        origin: ChangesSrc::FetchOp((*source).clone()),
+                    MakeChangesErrorRepr::IoBound(IoBoundChanges::new(
+                        (*source).clone(),
                         inner,
-                    })
+                        ChangesKind::fetch(),
+                    ))
                 })?;
 
                 // NOTE: this is purposefully sandwiched between await points because it handles
@@ -215,10 +213,11 @@ impl ConstContainer {
                     let mut file = syn::parse_file(&contents)
                         .map_err(|_| MakeChangesErrorRepr::Parse((*source).into()))?;
 
-                    let constant = unsafe { constant.as_ref_unchecked() };
-                    let ref_ident = constant.ident();
-                    let deprecated = constant.is_deprecated();
-                    let ref_span = constant.span();
+                    let (ref_ident, deprecated, ref_span) = {
+                        let constant = unsafe { constant.as_ref_unchecked() };
+
+                        (constant.ident(), constant.is_deprecated(), constant.span())
+                    };
 
                     file.items
                         .iter_mut()
@@ -234,17 +233,18 @@ impl ConstContainer {
                             }
                         })
                         .for_each(|attrs| {
-                            attrs.push(deprecate!(ConstContainer::DEPRECATION_NOTICE));
+                            attrs.push(deprecate!(Self::DEPRECATION_NOTICE));
                         });
 
                     prettyplease::unparse(&file)
                 };
 
                 fs::write(source, modified_file).await.map_err(|inner| {
-                    MakeChangesErrorRepr::IoBound(IoBoundChanges {
-                        origin: ChangesSrc::SaveOp((*source).clone()),
+                    MakeChangesErrorRepr::IoBound(IoBoundChanges::new(
+                        (*source).clone(),
                         inner,
-                    })
+                        ChangesKind::save(),
+                    ))
                 })?;
 
                 Ok::<_, MakeChangesError>(())
@@ -255,14 +255,18 @@ impl ConstContainer {
         // the task pool drop because we're handling the FS in each task, and it's best
         // to be safe than to be sorry.
         while let Some(res) = task_pool.join_next().await {
-            if let Err(err) | Ok(Err(err)) = res
-                .map_err(Into::into)
-                .map_err(MakeChangesErrorRepr::Other)
-                .map_err(Into::into)
-            {
-                task_pool.shutdown().await;
+            match res {
+                Ok(Err(err)) => {
+                    task_pool.shutdown().await;
 
-                return Err(err);
+                    return Err(err);
+                }
+                Err(err) => {
+                    task_pool.shutdown().await;
+
+                    return Err(MakeChangesErrorRepr::Other(err.into()).into());
+                }
+                _ => (),
             }
         }
 
@@ -274,7 +278,7 @@ fn probe_re(
     re: impl AsRef<str>,
     cache: &mut HashMap<String, Regex>,
 ) -> Result<&Regex, FilterError> {
-    // NOTE: Yes, this is ugly and could be made into an `if-let`, but borrowck
+    // NOTE: yes, this is ugly and could be made into an `if-let`, but borrowck
     // complains that the shared reference we get in the condition with
     // `cache.get()` makes it impossible to fetch an exclusive reference in the
     // `else` branch.

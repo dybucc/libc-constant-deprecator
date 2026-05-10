@@ -23,10 +23,15 @@ mod support;
     )
 )]
 pub(crate) use crate::errors::*;
-pub(crate) use crate::parser::{ir_container::IrContainer, macro_parser::MacroParser};
+pub(crate) use crate::{
+    parser::{ir_container::IrContainer, macro_parser::MacroParser},
+    source_file::SourceFile,
+};
 
 // Public reexports.
 
+// NOTE: we skip reformatting here to avoid `rustfmt` from removing separataion
+// whitespace with the above private reexports.
 #[rustfmt::skip]
 #[doc(inline)]
 pub use crate::{
@@ -37,7 +42,6 @@ pub use crate::{
     },
     errors::{FilterError, MakeChangesError, ScanFilesError},
     scanner::scan,
-    source_file::SourceFile,
 };
 
 // Macro reexports; left last to force all other crate modules to import the
@@ -46,13 +50,13 @@ pub use crate::{
 #[macro_use]
 mod macros;
 
-#[expect(
-    clippy::single_component_path_imports,
-    reason = "The macro is reexported at the crate level but is not part of the public API."
-)]
-pub(crate) use deprecate;
-#[expect(
-    clippy::single_component_path_imports,
-    reason = "The macro is reexported at the crate level but is not part of the public API."
-)]
-pub(crate) use send_sync_impl;
+// NOTE: we reexport the macros through another macro to avoid getting the
+// `clippy::single_component_path_imports` lint and thus to avoid having to
+// `#[expect]` twice.
+macro_rules! decl {
+    ($(use $id:ident;)+) => { $(pub(crate) use $id;)+ };
+}
+
+decl! {
+    use deprecate;
+}

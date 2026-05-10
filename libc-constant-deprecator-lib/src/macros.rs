@@ -7,9 +7,3 @@ macro_rules! deprecate {
         }
     }};
 }
-
-macro_rules! send_sync_impl {
-    (for $t:ty; $($($(#[$doc:meta])+)? $it:ident)+) => {
-        $($($(#[$doc])+)? unsafe impl $it for $t {})+
-    };
-}
