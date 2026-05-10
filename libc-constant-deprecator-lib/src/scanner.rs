@@ -1,5 +1,6 @@
+#[cfg(debug_assertions)]
+use std::fmt::Debug;
 use std::{
-    fmt::Debug,
     path::{Path, PathBuf},
     sync::atomic::AtomicBool,
 };
@@ -21,26 +22,39 @@ use tokio::{
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
     task::{self, JoinSet},
 };
-use tracing::info;
 use walkdir::WalkDir;
 
 use crate::{
-    CloneErrorKind, CloneRepoError, ConstContainer, DiscoverErrorKind, DiscoverRepoError,
-    FetchParseError, IrContainer, RepoErrorRepr, ScanFilesError, ScanFilesErrorRepr, SourceFile,
-    parser::parse_constants,
+    CloneErrorKind, CloneRepoError, ConstContainer, ConstContainerBuilder, DiscoverErrorKind,
+    DiscoverRepoError, FetchParseError, RepoErrorRepr, ScanFilesError, ScanFilesErrorRepr,
+    SourceFile, parser::parse_constants,
 };
 
 pub(crate) const LIBC_REPO: &str = "https://github.com/rust-lang/libc.git";
 
-/// Scans the `libc` codebase in the provided path, cloning it from upstream if
-/// the path does not exist.
+/// Scans the `libc` codebase for constants in the provided path, cloning it
+/// from upstream if the path does not exist.
+///
+/// This routine will walk the entire codebase and return a [`ConstContainer`]
+/// with the parsed [`Const`]s. Note file parsing will not only consider in-line
+/// constants, but also constants declared within the `cfg_if` macro body. Other
+/// macros from `libc` are not processed as they do not contain constant items
+/// relevant for deprecation (`c_enum` declares constants but those are only for
+/// auxiliary purposes and do not reflect constants from target implementations
+/// of the standard C library.)
 ///
 /// # Errors
 ///
 /// The function may fail if it fails to discover/clone the repo on the given
 /// path and, when dealing with an existing path, its ancestors.
-#[tracing::instrument(err(level = "info"))]
-pub async fn scan(libc_path: impl AsRef<Path> + Debug) -> Result<ConstContainer, ScanFilesError> {
+///
+/// [`ConstContainer`]: crate::ConstContainer
+/// [`Const`]: crate::Const
+#[cfg_attr(debug_assertions, tracing::instrument(err, level = "info"))]
+pub async fn scan(
+    #[cfg(all(not(doc), debug_assertions))] libc_path: impl AsRef<Path> + Debug,
+    #[cfg(any(doc, not(debug_assertions)))] libc_path: impl AsRef<Path>,
+) -> Result<ConstContainer, ScanFilesError> {
     // NOTE: it's more intuitive to have the routine name be the token tree we
     // accept for recursive munching, but that way the recursive macro invocation
     // would have to replace the start of the path of the enum variant, which seems
@@ -61,8 +75,6 @@ pub async fn scan(libc_path: impl AsRef<Path> + Debug) -> Result<ConstContainer,
                 })?
         }};
     }
-
-    info!("starting `scan_files` routine");
 
     if let Ok(libc_path) = fs::canonicalize(&libc_path).await
         && ensure_libc(&libc_path).await.is_ok()
@@ -403,7 +415,7 @@ async fn parse_files(
     let (inner_tx, mut inner_rx) = mpsc::unbounded_channel();
 
     let gatherer = task::spawn(async move {
-        let mut out = IrContainer::new();
+        let mut out = ConstContainerBuilder::new();
 
         while let Some(res) = inner_rx.recv().await {
             out.extend(res);
@@ -442,7 +454,7 @@ async fn parse_files(
 
     gatherer
         .await
-        .map(IrContainer::into_const_container)
+        .map(ConstContainerBuilder::finish)
         .map_err(Into::into)
         .map_err(FetchParseError::Other)
 }

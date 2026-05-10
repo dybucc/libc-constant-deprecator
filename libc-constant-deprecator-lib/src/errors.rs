@@ -233,10 +233,6 @@ impl IoBoundChanges {
         }
     }
 
-    pub(crate) fn source_io(&self) -> &io::Error {
-        &self.inner
-    }
-
     pub(crate) fn error(&self) -> String {
         self.origin
             .with_path(
@@ -246,7 +242,11 @@ impl IoBoundChanges {
             .into_inner()
     }
 
-    pub(crate) fn source_path<'a>(&'a self) -> impl AsRef<Path> + use<'a> {
+    pub(crate) fn source_io(&self) -> &io::Error {
+        &self.inner
+    }
+
+    pub(crate) fn source_path(&self) -> impl AsRef<Path> {
         self.origin.path()
     }
 }
@@ -257,7 +257,7 @@ pub(crate) struct ChangesKind {
 }
 
 impl ChangesKind {
-    fn to_changes_src(&self, path: PathBuf) -> ChangesSrc {
+    fn to_changes_src(self, path: PathBuf) -> ChangesSrc {
         match self.repr {
             ChangesKindRepr::FetchOp => ChangesSrc::fetch(path),
             ChangesKindRepr::SaveOp => ChangesSrc::save(path),
@@ -293,7 +293,7 @@ impl ChangesSrc {
         kind.to_changes_src(path)
     }
 
-    fn path<'a>(&'a self) -> impl AsRef<Path> + use<'a> {
+    fn path(&self) -> impl AsRef<Path> {
         self.repr.path()
     }
 
@@ -336,10 +336,10 @@ impl ChangesSrcRepr {
         }
     }
 
-    fn path<'a>(&'a self) -> impl AsRef<Path> + use<'a> {
-        match self {
-            Self::FetchOp(path) | Self::SaveOp(path) => path,
-        }
+    fn path(&self) -> impl AsRef<Path> {
+        let (Self::FetchOp(path) | Self::SaveOp(path)) = self;
+
+        path
     }
 
     fn fetch(path: PathBuf) -> Self {

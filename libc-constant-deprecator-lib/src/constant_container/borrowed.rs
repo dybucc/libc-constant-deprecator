@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, Weak},
 };
 
-use crate::Const;
+use crate::{Const, Sealed};
 
 /// Represents a borrowed view into multiple segments of a [`ConstContainer`] as
 /// a single, contiguous container of its own.
@@ -113,7 +113,12 @@ impl BorrowedContainer {
 ///
 /// This is implemented for both [`BorrowedContainer`] and [`BorrowedSubset`],
 /// such that in-place (weaker) iteration through the constants is possible.
-pub trait Visit {
+#[expect(
+    private_bounds,
+    reason = "The whole point of the `Sealed` pattern is to not allow public implementations of \
+              it."
+)]
+pub trait Visit: Sealed {
     /// Provides an immutable traversal throughout gathered constants that can
     /// be put on halt.
     ///
@@ -122,6 +127,9 @@ pub trait Visit {
     /// closure that can capture callsite state.
     fn visit<B>(&self, visitor: impl FnMut(&Const) -> ControlFlow<B, ()>) -> Option<B>;
 }
+
+impl Sealed for BorrowedSubset<'_> {}
+impl Sealed for BorrowedContainer {}
 
 macro_rules! visit_impl {
     (@body) => {

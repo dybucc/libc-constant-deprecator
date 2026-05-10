@@ -155,7 +155,7 @@ impl ConstContainer {
     /// Fails if some I/O-bound operation fails while writing to disk, or if any
     /// one of (1) parsing the existing file from the codebase, or (2)
     /// formatting that file once the changes are made, fails.
-    #[tracing::instrument(skip_all)]
+    #[cfg_attr(debug_assertions, tracing::instrument(skip_all))]
     pub async fn effect_changes(&self) -> Result<(), MakeChangesError> {
         // NOTE: the pointer here is actually meant to hold a reference into a given
         // `Const`. It just so happens that `tokio`'s tasks require a `'static` lifetime

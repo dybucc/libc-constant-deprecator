@@ -12,6 +12,9 @@ mod parser;
 mod scanner;
 mod source_file;
 mod support;
+mod private {
+    pub(crate) trait Sealed {}
+}
 
 // Private reexports.
 
@@ -24,7 +27,8 @@ mod support;
 )]
 pub(crate) use crate::errors::*;
 pub(crate) use crate::{
-    parser::{ir_container::IrContainer, macro_parser::MacroParser},
+    parser::{const_container_builder::ConstContainerBuilder, macro_parser::MacroParser},
+    private::Sealed,
     source_file::SourceFile,
 };
 
