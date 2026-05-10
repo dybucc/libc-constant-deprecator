@@ -15,9 +15,7 @@ use std::{
 
 use clap::Parser;
 use crossterm::{
-    cursor::{
-        self, Hide, MoveToNextLine, MoveToRow, RestorePosition, SavePosition, SetCursorStyle,
-    },
+    cursor::{self, Hide, MoveToNextLine, RestorePosition, SavePosition},
     event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers},
     style::Print,
     terminal::{self, Clear, ClearType, DisableLineWrap},
@@ -561,8 +559,8 @@ impl Dir {
 // NOTE: we will require modifying some of the routines here once we get to
 // implementing scrolling in the 10-row list of constant symbols.
 impl State {
-    #[tracing::instrument(ret)]
-    pub(crate) fn new(constants: ConstContainer) -> (Self, UnboundedSender<RawUserEvent>) {
+    #[tracing::instrument(skip_all)]
+    fn new(constants: ConstContainer) -> (Self, UnboundedSender<RawUserEvent>) {
         let (tx, rx) = mpsc::unbounded_channel();
 
         // NOTE: it could be that the `Default` impl of `Range` does not produce an
@@ -734,7 +732,7 @@ impl State {
 
     #[expect(unused, reason = "WIP.")]
     #[tracing::instrument(skip_all)]
-    pub(crate) fn draw(&self, mut stdout: impl Write) -> anyhow::Result<()> {
+    fn draw(&self, mut stdout: impl Write) -> anyhow::Result<()> {
         let Self {
             mode,
             filter_buf,
@@ -770,7 +768,11 @@ impl State {
                         crossterm::queue!(stdout, Print("] "))?;
                     }
 
-                    crossterm::queue!(stdout, Print(constant.ident()), MoveToNextLine(1))?;
+                    crossterm::queue!(stdout, Print(constant.ident()))?;
+
+                    if line_counter != 10 {
+                        crossterm::queue!(stdout, MoveToNextLine(1))?;
+                    }
                 } {
                     Ok(()) => ControlFlow::Continue(()),
                     Err(err) => ControlFlow::Break(err.into()),
@@ -1208,7 +1210,7 @@ pub(crate) static SYNC_BUF: LazyLock<Mutex<StdBufWriter<Stdout>>> =
     LazyLock::new(|| Mutex::new(StdBufWriter::new(std_io::stdout())));
 
 #[tracing::instrument(skip_all)]
-pub(crate) async fn render(mut state: State) -> anyhow::Result<()> {
+async fn render(mut state: State) -> anyhow::Result<()> {
     loop {
         draw_screen(&mut state).await?;
 
@@ -1219,14 +1221,14 @@ pub(crate) async fn render(mut state: State) -> anyhow::Result<()> {
 }
 
 #[tracing::instrument(skip_all)]
-pub(crate) async fn draw_screen(state: &mut State) -> anyhow::Result<()> {
+async fn draw_screen(state: &mut State) -> anyhow::Result<()> {
     let stdout = &mut *SYNC_BUF.lock().await;
 
     task::block_in_place(|| state.draw(stdout))
 }
 
 #[tracing::instrument(skip_all, ret, err(level = "info"))]
-pub(crate) async fn update(state: &mut State) -> anyhow::Result<Termination<()>> {
+async fn update(state: &mut State) -> anyhow::Result<Termination<()>> {
     let res = state.receive_event().await;
 
     if res.should_terminate() {
@@ -1239,7 +1241,7 @@ pub(crate) async fn update(state: &mut State) -> anyhow::Result<Termination<()>>
 }
 
 #[tracing::instrument(skip_all)]
-pub(crate) async fn handle_input(channel: UnboundedSender<RawUserEvent>) -> anyhow::Result<()> {
+async fn handle_input(channel: UnboundedSender<RawUserEvent>) -> anyhow::Result<()> {
     let mut event_stream = EventStream::new().fuse();
 
     while let Some(event) = event_stream.next().await {
@@ -1307,37 +1309,18 @@ pub(crate) async fn handle_input(channel: UnboundedSender<RawUserEvent>) -> anyh
 // That is why, at the moment, we use `OnceLock`.
 static PROMPT_COORD: OnceLock<(u16, u16)> = OnceLock::new();
 
-#[tracing::instrument(skip_all)]
-pub(crate) async fn prepare_space() -> anyhow::Result<()> {
-    let (_, rows) = terminal::size()?;
-    let (_, current_row) = cursor::position()?;
-
+#[tracing::instrument(skip_all, err(level = "info"))]
+async fn prepare_space() -> anyhow::Result<()> {
     let mut stdout = SYNC_BUF.lock().await;
 
-    // NOTE: the initial cursor is meant to reflect the shape of normal mode, which
-    // should allow left-right navigation in the prompt.
-    crossterm::queue!(stdout, SetCursorStyle::SteadyBlock, DisableLineWrap)?;
+    crossterm::queue!(stdout, DisableLineWrap)?;
+    PROMPT_COORD.set(cursor::position()?).unwrap();
 
-    // NOTE: we must make space for one row for the prompt, and ten rows for the
-    // list of constants currently being displayed. The reason why we use one more
-    // unit in the result of the difference than in the command to set the row is
-    // due to the fact `rows` is 1-indexed, while `current_row` and `MoveToRow` are
-    // 0-indexed.
-    if rows - current_row < 12 {
-        crossterm::queue!(
-            stdout,
-            MoveToRow(current_row - 11),
-            Clear(ClearType::FromCursorDown),
-            MoveToNextLine(1),
-            SavePosition
-        )?;
-
-        // NOTE: we `unwrap` here because there's no point in assumming that the static
-        // got initialized already, and that's the only point of failure. At the time of
-        // writing, the flow of execution when entering this routine is fully sequential
-        // (of course, only in appearance.)
-        PROMPT_COORD.set(cursor::position()?).unwrap();
-    }
+    crossterm::queue!(
+        stdout,
+        Print(fmt::from_fn(|f| (0..10).try_for_each(|_| writeln!(f)))),
+        RestorePosition,
+    )?;
 
     task::block_in_place(|| stdout.flush())?;
 
@@ -1411,18 +1394,21 @@ async fn init() -> anyhow::Result<ConstContainer> {
         task::block_in_place(|| crossterm::execute!(stdout, Hide, SavePosition))?;
 
         while let Err(OneshotTryRecvError::Empty) = rx.try_recv() {
-            crossterm::queue!(
-                stdout,
-                Print(spinner),
-                Print(" Parsing `libc repo`"),
-                RestorePosition,
-            )?;
+            task::block_in_place(|| {
+                crossterm::execute!(
+                    stdout,
+                    Print(fmt::from_fn(|f| write!(f, "{spinner} Parsing `libc repo`"))),
+                    RestorePosition,
+                )
+            })?;
 
             spinner.transition();
-            task::block_in_place(|| stdout.flush())?;
-
             time::sleep(Duration::from_millis(128)).await;
         }
+
+        task::block_in_place(|| {
+            crossterm::execute!(stdout, RestorePosition, Clear(ClearType::FromCursorDown),)
+        })?;
 
         info!("finished spinner task");
 
@@ -1471,20 +1457,18 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let parsed_constants = init().await?;
-    info!("finished parsing codebase");
 
-    task::block_in_place(terminal::enable_raw_mode)?;
     prepare_space().await?;
+    task::block_in_place(terminal::enable_raw_mode)?;
 
     info!(prompt_coordinates = ?PROMPT_COORD.get().unwrap());
 
     let (state, events_tx) = State::new(parsed_constants);
-    info!("finished initializing state");
 
-    let input_handler = task::spawn(handle_input(events_tx));
-    let renderer = task::spawn(render(state));
-
-    future::try_join(input_handler, renderer)
-        .await
-        .map(|(res1, res2)| res1.and(res2))?
+    future::try_join(
+        task::spawn(handle_input(events_tx)),
+        task::spawn(render(state)),
+    )
+    .await
+    .map(|(res1, res2)| res1.and(res2))?
 }
