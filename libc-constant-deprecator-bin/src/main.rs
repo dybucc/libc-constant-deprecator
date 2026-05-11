@@ -15,6 +15,7 @@ use std::{
 
 use clap::Parser;
 use crossterm::{
+    Command,
     cursor::{
         self, Hide, MoveRight, MoveToNextLine, MoveToPreviousLine, RestorePosition, SavePosition,
         SetCursorStyle, Show,
@@ -24,7 +25,8 @@ use crossterm::{
     terminal::{self, Clear, ClearType},
 };
 use futures::{StreamExt, future};
-use libc_constant_deprecator_lib::{BorrowedContainer, ConstContainer, Visit};
+use libc_constant_deprecator_lib::{BorrowedContainer, Const, ConstContainer, Visit};
+use proc_macro2::Ident;
 use tester_impl::defer_drm;
 use tokio::{
     sync::{
@@ -157,7 +159,8 @@ macro_rules! repr_impl {
             })?,
             $fallible_is:ident, // The checker operation to ensure a certain variant is within it.
             $infallible_is:ident, // The infallible operation that unwraps a variant or panics.
-            $infallible_is_ref:ident // The non-consuming version of the infallible operation.
+            $infallible_is_ref:ident, // The non-consuming shared reference getter.
+            $infallible_is_mut:ident // The non-consuming exclusive reference getter.
             => $var:tt $(($($tuple:tt: $tuple_t:ty),*))? $({$($field:tt: $field_t:ty),*})?
         );+ ;
     }) => {
@@ -217,6 +220,23 @@ macro_rules! repr_impl {
                         panic!("variant did not contain {}", err);
                     }
                 }
+
+                #[allow(
+                    unused,
+                    reason = "The macro requires having some type parameters expand to \
+                              semantically unignored parameters because I can't think of a way to \
+                              modify the provided parameter token trees."
+                )]
+                #[track_caller]
+                pub(crate) fn $infallible_is_mut(&mut self) -> ($(&mut $tuple_t),*) {
+                    if let $over_t::$var(res) = &mut self.repr {
+                        res
+                    } else {
+                        let mut err = String::new();
+                        $(err.push_str(stringify!($tuple_t));)*
+                        panic!("variant did not contain {}", err);
+                    }
+                }
             )?
 
             $(
@@ -244,8 +264,25 @@ macro_rules! repr_impl {
                               modify the provided parameter token trees."
                 )]
                 #[track_caller]
-                pub(crate) fn $infallible_is_ref(self) -> ($(&$field),*) {
+                pub(crate) fn $infallible_is_ref(&self) -> ($(&$field),*) {
                     if let $over_t::$var{$($field:tt),*} = &self.repr {
+                        ($($field),*)
+                    } else {
+                        let mut err = String::new();
+                        $(err.push_str(stringify!($field_t));)*
+                        panic!("variant did not contain {}", err);
+                    }
+                }
+
+                #[allow(
+                    unused,
+                    reason = "The macro requires having some type parameters expand to \
+                              semantically unignored parameters because I can't think of a way to \
+                              modify the provided parameter token trees."
+                )]
+                #[track_caller]
+                pub(crate) fn $infallible_is_mut(&mut self) -> ($(&mut $field),*) {
+                    if let $over_t::$var{$($field:tt),*} = &mut self.repr {
                         ($($field),*)
                     } else {
                         let mut err = String::new();
@@ -288,8 +325,8 @@ repr! {
 
 impl<T> Termination<T> {
     repr_impl! { TerminationRepr => {
-        terminate, should_terminate, _d, _d => Termination;
-        keep_going, shant_terminate, into_inner, inner => NonTermination(t: T);
+        terminate, should_terminate, _d, _d, _d => Termination;
+        keep_going, shant_terminate, into_inner, inner, inner_mut => NonTermination(t: T);
     }}
 }
 
@@ -319,6 +356,10 @@ pub(crate) struct State {
 // method appends another level of indirection to the inner `T` if it is a `&T`
 // and not an owned `T` (i.e. you end up with a `Bound<&mut &T>` instead of
 // `Bound<&mut T>` where `T` is owned in this latter case.)
+#[expect(
+    unused,
+    reason = "Some trait methods exist purely for symmetry's sake."
+)]
 trait RangeBoundsExt<T> {
     fn start_bound_mut(&mut self) -> Bound<&mut T>;
     fn end_bound_mut(&mut self) -> Bound<&mut T>;
@@ -346,6 +387,7 @@ range_bounds_impl! { Range<T> }
 #[derive(Debug, Default, Clone)]
 pub(crate) struct Selection {
     repr: SelectionRange,
+    pivot: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -415,28 +457,6 @@ impl SelectionRange {
 
         repr
     }
-
-    // NOTE: the purpose of this routine is to check which one of the `start` or
-    // `end` bounds on the underlying range should be modified, provided the current
-    // internal state. Because the range is never reversed, we can guarantee that
-    // the start and end bounds are either unequal, in which case we must always
-    // increase or decrease (depending on whether the event is an `up` motion or a
-    // `down` motion) the end bound, or strictly decrease the start bound.
-    fn bound_to_extend(&mut self) -> Bound<&mut u16> {
-        let Self {
-            repr: Range { start, end },
-        } = self.clone();
-        let Self { repr } = self;
-
-        match start.cmp(&end) {
-            Ordering::Equal => repr.start_bound_mut(),
-            Ordering::Less => repr.end_bound_mut(),
-            Ordering::Greater => unreachable!(
-                "If you hit this case, then there's a bug in the input handling logic. Review \
-                 `State::update` and `Mode::interpret`."
-            ),
-        }
-    }
 }
 
 // NOTE: we need to implement `Default` manually because otherwise it uses the
@@ -460,13 +480,14 @@ impl Selection {
         Self::default()
     }
 
-    pub(crate) fn map<T>(&self, f: impl FnOnce(&Self) -> T) -> T {
+    pub(crate) fn map_ref<T>(&self, f: impl FnOnce(&Self) -> T) -> T {
         f(self)
     }
 
     pub(crate) fn range(self) -> Range<u16> {
         let Self {
             repr: SelectionRange { repr },
+            ..
         } = self;
 
         repr
@@ -475,6 +496,7 @@ impl Selection {
     pub(crate) fn range_ref(&self) -> &Range<u16> {
         let Self {
             repr: SelectionRange { repr },
+            ..
         } = self;
 
         repr
@@ -483,6 +505,7 @@ impl Selection {
     pub(crate) fn range_mut(&mut self) -> &mut Range<u16> {
         let Self {
             repr: SelectionRange { repr },
+            ..
         } = self;
 
         repr
@@ -495,30 +518,25 @@ impl Selection {
     // by decreasing the `end` bound. This will likely involve a larger refactor of
     // the `Selection` type.
     pub(crate) fn extend(&mut self, dir: Dir, pos: impl Borrow<Position>) {
-        let Self { repr } = self;
+        let Self { repr, pivot } = self;
         let pos = pos.borrow();
 
         match dir.kind() {
-            // If navigation has gone up, then the selection must either:
-            // (1) Decrease the `end` bound of the underlying range.
-            //     This happens when the selection range is non-empty.
-            // (2) Decrease the `start` bound of the underlying range.
-            //     This happens when the selection range is empty, and so it must be expanded above.
-            DirKind::Up => {
-                // NOTE: there is no way the bound produced is `Bound::Unbounded`, as the
-                // overarching `Range` type does not handle that variant.
-                if let Bound::Included(inner) | Bound::Excluded(inner) = repr.bound_to_extend() {
-                    *inner = inner.saturating_sub(1);
-                }
-            }
-            // If navigation browses down, then it holds that the end bound is the only possible
-            // index to be affected. This is because the range is never reversed, so the start bound
-            // always goes up, while the end bound may go up or down.
-            DirKind::Down => {
-                let start = *repr.start();
-                let end = *repr.end();
+            DirKind::Up if pos.list() == pivot => {
+                pivot.saturating_sub(1);
 
-                *repr.end_mut() = if start + end < 9 { end + 1 } else { 9 };
+                todo!()
+            }
+            // NOTE: if the current cusor position is not equal to the index of the pivot, then
+            // surely the it is smaller as otherwise the above case would've caught it and the pivot
+            // would have been adjusted accordingly.
+            DirKind::Up => {
+                let (start, end) = (repr.start_mut(), repr.end_mut());
+
+                todo!()
+            }
+            DirKind::Down => {
+                todo!()
             }
         }
     }
@@ -526,7 +544,7 @@ impl Selection {
 
 impl RangeBounds<u16> for Selection {
     fn start_bound(&self) -> Bound<&u16> {
-        let Self { repr } = self;
+        let Self { repr, .. } = self;
 
         repr.repr.start_bound()
     }
@@ -534,6 +552,7 @@ impl RangeBounds<u16> for Selection {
     fn end_bound(&self) -> Bound<&u16> {
         let Self {
             repr: SelectionRange { repr },
+            ..
         } = self;
 
         repr.end_bound()
@@ -554,8 +573,8 @@ repr! {
 
 impl Dir {
     repr_impl! { DirRepr => {
-        new_up, is_up, _d, _d => Up;
-        new_down, is_down, _d, _d => Down;
+        new_up, is_up, _d, _d, _d => Up;
+        new_down, is_down, _d, _d, _d => Down;
     }}
 }
 
@@ -653,7 +672,10 @@ impl State {
 
                         match (mode.kind(), new_mode.kind()) {
                             // Insert to normal mode.
-                            (ModeKind::Insert, ModeKind::Normal) => *mode = new_mode,
+                            (ModeKind::Insert, ModeKind::Normal) => {
+                                *mode = new_mode;
+                                *pos -= 1;
+                            }
 
                             // Normal mode to other all other modes.
                             (ModeKind::Normal, ModeKind::Insert) => {
@@ -796,8 +818,6 @@ impl State {
         print_prompt(&mut stdout, prompt)?;
         print_list(&mut stdout, filter_buf)?;
 
-        // FIXME: when drawing the highlights, the deprecation mark is being written
-        // over.
         match (mode.kind(), pos.kind()) {
             (ModeKind::Insert, PositionKind::Prompt) => {
                 finalize_insert_prompt(&mut stdout, pos.into_prompt())?;
@@ -840,7 +860,7 @@ fn print_prompt(mut stdout: impl Write, prompt: impl AsRef<str>) -> anyhow::Resu
     .map_err(Into::into)
 }
 
-// TODO: this will need a refactor once scorlling is implemented.
+// TODO: this will need a refactor once scrolling is implemented.
 fn print_list(mut stdout: impl Write, list: &impl Visit) -> anyhow::Result<()> {
     crossterm::queue!(stdout, MoveToNextLine(1))?;
 
@@ -856,14 +876,7 @@ fn print_list(mut stdout: impl Write, list: &impl Visit) -> anyhow::Result<()> {
         if let Err(err) = try {
             crossterm::queue!(
                 stdout,
-                Print(fmt::from_fn(|f| {
-                    write!(
-                        f,
-                        "[{}] {}",
-                        if constant.is_deprecated() { "X" } else { "  " },
-                        constant.ident(),
-                    )
-                })),
+                StylizedSymbol::from_constant(constant).into_command(),
             )?;
 
             if line_counter == 10 {
@@ -883,13 +896,8 @@ fn print_list(mut stdout: impl Write, list: &impl Visit) -> anyhow::Result<()> {
 }
 
 fn finalize_insert_prompt(mut stdout: impl Write, off: u16) -> anyhow::Result<()> {
-    crossterm::queue!(
-        stdout,
-        MoveRight(PROMPT_COORD.get().map(|(col, _)| col + off).unwrap()),
-        SetCursorStyle::BlinkingBar,
-        Show,
-    )
-    .map_err(Into::into)
+    crossterm::queue!(stdout, MoveRight(2 + off), SetCursorStyle::SteadyBar, Show)
+        .map_err(Into::into)
 }
 
 fn finalize_normal_prompt(mut stdout: impl Write, off: u16) -> anyhow::Result<()> {
@@ -903,37 +911,33 @@ fn finalize_normal_prompt(mut stdout: impl Write, off: u16) -> anyhow::Result<()
 }
 
 // TODO: this is going to need a refactor once scrolling is implemented but this
-// particular routine should likely profit from the refactor in the `print_list`
-// routine for the same scrollign purposes.
+// particular routine should likely benefit from the refactor in the
+// `print_list` routine for the same scrollign purposes.
 fn finalize_normal_list(mut stdout: impl Write, off: u16, list: &impl Visit) -> anyhow::Result<()> {
     let mut line_counter = 0;
 
     crossterm::queue!(
         stdout,
         MoveToNextLine(1 + off),
-        PrintStyledContent(StyledContent::new(
-            ContentStyle::new().bold().underlined(),
-            list.visit(|constant| {
-                if line_counter != off {
-                    line_counter += 1;
-                    return ControlFlow::Continue(());
-                }
+        list.visit(|constant| {
+            if line_counter != off {
+                line_counter += 1;
+                return ControlFlow::Continue(());
+            }
 
-                let ident = constant.ident().clone();
-
-                ControlFlow::Break(fmt::from_fn(move |f| write!(f, "{ident}")))
-            })
-            .expect("offset into visual list of symbols was not within bounds of inner list"),
-        )),
-        SetCursorStyle::SteadyBlock,
-        Show
+            ControlFlow::Break(StylizedSymbol::from_constant(constant))
+        })
+        .expect("offset into visual list of symbols was not within bounds of inner list")
+        .bold()
+        .underlined()
+        .into_command(),
     )
     .map_err(Into::into)
 }
 
 // TODO: this is going to need a refactor once scrolling is implemented but this
-// particular routine should likely profit from the refactor in the `print_list`
-// routine for the same scrollign purposes.
+// particular routine should likely benefit from the refactor in the
+// `print_list` routine for the same scrollign purposes.
 fn finalize_select_list(
     mut stdout: impl Write,
     off: u16,
@@ -950,44 +954,106 @@ fn finalize_select_list(
     crossterm::queue!(stdout, MoveToNextLine(1))?;
 
     list.visit(|constant| {
-        if line_counter < start || line_counter == end {
+        if line_counter < start {
             return ControlFlow::Continue(());
+        } else if line_counter == end {
+            return ControlFlow::Break(Ok(()));
         }
+
+        let cmd = StylizedSymbol::from_constant(constant).white().on_green();
 
         match crossterm::queue!(
             stdout,
-            PrintStyledContent(StyledContent::new(
-                if line_counter == off {
-                    ContentStyle::new().bold().underlined().white().on_green()
-                } else {
-                    ContentStyle::new().white().on_green()
-                },
-                constant.ident(),
-            ))
+            if line_counter == off {
+                cmd.bold().underlined()
+            } else {
+                cmd
+            }
+            .into_command(),
         ) {
             Ok(()) => {
                 line_counter += 1;
 
                 ControlFlow::Continue(())
             }
-            Err(err) => ControlFlow::Break(err),
+            Err(err) => ControlFlow::Break(Err(err)),
         }
     })
-    .map(Into::into)
-    .map_or_else(|| anyhow::Ok(()), Err)?;
+    .map_or_else(|| anyhow::Ok(()), |res| res.map_err(Into::into))?;
 
-    crossterm::queue!(
-        stdout,
-        RestorePosition,
-        MoveToNextLine(1 + off),
-        SetCursorStyle::SteadyUnderScore,
-        Show
-    )
-    .map_err(Into::into)
+    crossterm::queue!(stdout, RestorePosition, MoveToNextLine(1 + off),).map_err(Into::into)
 }
 
+#[derive(Debug)]
+struct StylizedSymbol<T: Display> {
+    repr: T,
+    deprecated: bool,
+    style: ContentStyle,
+}
+
+impl StylizedSymbol<Ident> {
+    fn from_constant(value: &Const) -> Self {
+        Self {
+            repr: value.ident().clone(),
+            deprecated: value.is_deprecated(),
+            style: ContentStyle::new(),
+        }
+    }
+}
+
+impl<T: Display> StylizedSymbol<T> {
+    // NOTE: we could implement `crossterm::Command` directly for `Self` and build
+    // up the same `PrintStyledContent` there, but the required method for that
+    // trait takes a shared reference to `Self`, which means we are forced to both
+    // have a mandatory clone and a trait bound on the polymorphic type `T` for
+    // `Clone`.
+    fn into_command(self) -> impl Command {
+        let Self {
+            repr,
+            deprecated,
+            style,
+        } = self;
+
+        PrintStyledContent(StyledContent::new(
+            style,
+            fmt::from_fn(move |f| write!(f, "[{}] {repr}", if deprecated { "X" } else { "  " })),
+        ))
+    }
+}
+
+macro_rules! style_impl {
+    (@body => $self:expr) => {
+        let Self { style, .. } = $self;
+
+        style
+    };
+    () => {
+        impl<T: Display> AsRef<ContentStyle> for StylizedSymbol<T> {
+            fn as_ref(&self) -> &ContentStyle {
+                style_impl! { @body => self }
+            }
+        }
+
+        impl<T: Display> AsMut<ContentStyle> for StylizedSymbol<T> {
+            fn as_mut(&mut self) -> &mut ContentStyle {
+                style_impl! { @body => self }
+            }
+        }
+
+        impl<T: Display> Stylize for StylizedSymbol<T> {
+            type Styled = Self;
+
+            fn stylize(self) -> Self::Styled {
+                self
+            }
+        }
+    };
+}
+
+style_impl!();
+
 fn toggle_in_select(filter_buf: &mut BorrowedContainer, selected: &Selection) {
-    let mut selected = filter_buf.select(selected.map(|range| {
+    let mut selected = filter_buf.select(selected.map_ref(|range| {
         let (Bound::Included(start), Bound::Excluded(end)) =
             range.range_ref().clone().into_bounds()
         else {
@@ -1084,12 +1150,12 @@ impl Position {
             row: PROMPT_COORD.get().unwrap().1,
             col: col + 2,
         },
-        is_prompt, into_prompt, prompt => Prompt(col: u16);
+        is_prompt, into_prompt, prompt, prompt_mut => Prompt(col: u16);
         new_list {
             row: PROMPT_COORD.get().unwrap().1 + 1 + row,
             col: u16::default(),
         },
-        is_list, into_list, list => List(row: u16);
+        is_list, into_list, list, list_mut => List(row: u16);
     }}
 }
 
@@ -1280,9 +1346,9 @@ impl Mode {
     }
 
     repr_impl! { ModeRepr => {
-        new_normal, is_normal, _d, _d => Normal;
-        new_insert, is_insert, _d, _d => Insert;
-        new_select, is_select, _d, _d => Select;
+        new_normal, is_normal, _d, _d, _d => Normal;
+        new_insert, is_insert, _d, _d, _d => Insert;
+        new_select, is_select, _d, _d, _d => Select;
     }}
 }
 
@@ -1315,13 +1381,13 @@ repr! {
 
 impl UserEvent {
     repr_impl! { UserEventRepr => {
-        new_text, is_text, into_text, text => TextualInput(c: char);
-        new_action, is_action, into_action, action => ModeAction(action: ModeAction);
-        new_search, is_search, _d, _d => Search;
-        new_toggle, is_toggle, _d, _d => Toggle;
-        new_effect, is_effect, _d, _d => Effect;
-        new_clear, is_clear, _d, _d => Clear;
-        new_switch, is_switch, _d, _d => Switch;
+        new_text, is_text, into_text, text, text_mut => TextualInput(c: char);
+        new_action, is_action, into_action, action, action_mut => ModeAction(action: ModeAction);
+        new_search, is_search, _d, _d, _d => Search;
+        new_toggle, is_toggle, _d, _d, _d => Toggle;
+        new_effect, is_effect, _d, _d, _d => Effect;
+        new_clear, is_clear, _d, _d, _d => Clear;
+        new_switch, is_switch, _d, _d, _d => Switch;
     }}
 }
 
@@ -1354,11 +1420,11 @@ impl ModeAction {
     }
 
     repr_impl! { ModeActionRepr => {
-        switch_modes, is_mode, into_mode, mode => ModeSwitch(mode: Mode);
-        new_left, is_left, _d, _d => GoLeft;
-        new_right, is_right, _d, _d => GoRight;
-        new_up, is_up, _d, _d => GoUp;
-        new_down, is_down, _d, _d => GoDown;
+        switch_modes, is_mode, into_mode, mode, mode_mut => ModeSwitch(mode: Mode);
+        new_left, is_left, _d, _d, _d => GoLeft;
+        new_right, is_right, _d, _d, _d => GoRight;
+        new_up, is_up, _d, _d, _d => GoUp;
+        new_down, is_down, _d, _d, _d => GoDown;
     }}
 
     pub(crate) fn is_mode_transition(c: char) -> Option<Self> {
@@ -1402,12 +1468,12 @@ repr! {
 
 impl RawUserEvent {
     repr_impl! { RawUserEventRepr => {
-        new_space, is_space, _d, _d => Space;
-        new_text, is_text, into_text, text => PlainText(c: char);
-        new_ret, is_ret, _d, _d => Return;
-        new_sret, is_sret, _d, _d => ShiftReturn;
-        new_esc, is_esc, _d, _d => Escape;
-        new_tab, is_tab, _d, _d => Tab;
+        new_space, is_space, _d, _d, _d => Space;
+        new_text, is_text, into_text, text, text_mut => PlainText(c: char);
+        new_ret, is_ret, _d, _d, _d => Return;
+        new_sret, is_sret, _d, _d, _d => ShiftReturn;
+        new_esc, is_esc, _d, _d, _d => Escape;
+        new_tab, is_tab, _d, _d, _d => Tab;
     }}
 }
 
@@ -1517,9 +1583,6 @@ async fn handle_input(channel: UnboundedSender<RawUserEvent>) -> anyhow::Result<
 // changing their terminal emulator size, which we don't handle just yet, this
 // should be constant beyond its point of initialization in `prepare_space()`.
 // That is why, at the moment, we use `OnceLock`.
-// TODO: possibly get this to use a custom wrapper around `OnceLock` that allows
-// fetching the right position in the terminal buffer provided the offsets we
-// store in the running state.
 static PROMPT_COORD: OnceLock<(u16, u16)> = OnceLock::new();
 
 #[tracing::instrument(skip_all, err(level = "info"))]
