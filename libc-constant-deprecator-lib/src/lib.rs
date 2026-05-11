@@ -44,7 +44,7 @@ pub use crate::{
         ConstContainer,
         borrowed::{BorrowedContainer, BorrowedSubset, Visit},
     },
-    errors::{FilterError, MakeChangesError, ScanFilesError},
+    errors::{FilterError, MakeChangesError, ScanError},
     scanner::scan,
 };
 
@@ -63,4 +63,5 @@ macro_rules! decl {
 
 decl! {
     use deprecate;
+    use sealed_impl;
 }

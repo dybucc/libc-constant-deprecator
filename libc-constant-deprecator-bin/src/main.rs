@@ -15,10 +15,10 @@ use std::{
 
 use clap::Parser;
 use crossterm::{
-    cursor::{self, Hide, MoveToNextLine, RestorePosition, SavePosition},
+    cursor::{self, Hide, MoveToNextLine, MoveToPreviousLine, RestorePosition, SavePosition},
     event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers},
     style::Print,
-    terminal::{self, Clear, ClearType, DisableLineWrap},
+    terminal::{self, Clear, ClearType},
 };
 use futures::{StreamExt, future};
 use libc_constant_deprecator_lib::{BorrowedContainer, ConstContainer, Visit};
@@ -738,16 +738,24 @@ impl State {
             filter_buf,
             selected,
             prompt,
+            pos,
             ..
         } = self;
 
-        crossterm::queue!(
-            stdout,
-            Hide,
-            RestorePosition,
-            Print("> "),
-            MoveToNextLine(1)
-        )?;
+        reset(&mut stdout);
+
+        match mode.kind() {
+            ModeKind::Insert => print_prompt(&mut stdout, prompt, *mode)?,
+            ModeKind::Normal => todo!(),
+            // NOTE: recall we don't check whether we are in the prompt or in the list of constant
+            // symbols because select mode can only be accessed from normal mode once the user is in
+            // the list of constants.
+            ModeKind::Select => todo!(),
+        }
+
+        // TODO: replace the below logic with a simpler logic to determine in which mode
+        // we are in, and then delegate the ground work of actually drawing to the
+        // terminal buffer to different functions to deal with it.
 
         let mut line_counter = 0;
 
@@ -763,12 +771,15 @@ impl State {
                     crossterm::queue!(stdout, Print("["))?;
 
                     if constant.is_deprecated() {
-                        crossterm::queue!(stdout, Print("x] "))?;
+                        crossterm::queue!(stdout, Print("x"))?;
                     } else {
-                        crossterm::queue!(stdout, Print("] "))?;
+                        crossterm::queue!(stdout, Print(" "))?;
                     }
 
-                    crossterm::queue!(stdout, Print(constant.ident()))?;
+                    crossterm::queue!(
+                        stdout,
+                        Print(fmt::from_fn(|f| { write!(f, "] {}", constant.ident()) }))
+                    )?;
 
                     if line_counter != 10 {
                         crossterm::queue!(stdout, MoveToNextLine(1))?;
@@ -780,11 +791,28 @@ impl State {
             })
             .flatten()
         {
-            return Err(Into::into(err));
+            return Err(err.into());
         }
 
         stdout.flush().map_err(Into::into)
     }
+}
+
+fn reset(mut stdout: impl Write) -> anyhow::Result<()> {
+    crossterm::queue!(
+        stdout,
+        Hide,
+        RestorePosition,
+        Clear(ClearType::FromCursorDown)
+    )
+    .map_err(Into::into)
+}
+
+#[expect(unused, reason = "WIP.")]
+fn print_prompt(mut stdout: impl Write, prompt: impl AsRef<str>, mode: Mode) -> anyhow::Result<()> {
+    crossterm::queue!(stdout, Print(fmt::from_fn(|f| { write!(f, "") })))?;
+
+    Ok(())
 }
 
 fn toggle_in_select(filter_buf: &mut BorrowedContainer, selected: &Selection) {
@@ -1313,14 +1341,18 @@ static PROMPT_COORD: OnceLock<(u16, u16)> = OnceLock::new();
 async fn prepare_space() -> anyhow::Result<()> {
     let mut stdout = SYNC_BUF.lock().await;
 
-    crossterm::queue!(stdout, DisableLineWrap)?;
-    PROMPT_COORD.set(cursor::position()?).unwrap();
-
     crossterm::queue!(
         stdout,
         Print(fmt::from_fn(|f| (0..10).try_for_each(|_| writeln!(f)))),
-        RestorePosition,
     )?;
+
+    info!(position_pre_saving = ?cursor::position().unwrap());
+
+    crossterm::queue!(stdout, MoveToPreviousLine(10), SavePosition)?;
+
+    info!(position_post_saving = ?cursor::position().unwrap());
+
+    PROMPT_COORD.set(cursor::position()?).unwrap();
 
     task::block_in_place(|| stdout.flush())?;
 
@@ -1440,8 +1472,8 @@ async fn init() -> anyhow::Result<ConstContainer> {
         })?
 }
 
-#[tokio::main]
 #[defer_drm]
+#[tokio::main]
 #[tracing::instrument(skip_all)]
 async fn main() -> anyhow::Result<()> {
     if cfg!(debug_assertions) {
@@ -1470,5 +1502,13 @@ async fn main() -> anyhow::Result<()> {
         task::spawn(render(state)),
     )
     .await
-    .map(|(res1, res2)| res1.and(res2))?
+    .map(|(res1, res2)| res1.and(res2))??;
+
+    let mut stdout = SYNC_BUF.lock().await;
+
+    task::block_in_place(|| {
+        crossterm::execute!(stdout, RestorePosition, Clear(ClearType::FromCursorDown))
+    })?;
+
+    Ok(())
 }

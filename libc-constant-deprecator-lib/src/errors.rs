@@ -25,10 +25,10 @@ use crate::ConstContainer;
 #[derive(Debug, Error)]
 #[repr(transparent)]
 #[error(transparent)]
-pub struct ScanFilesError(#[from] ScanFilesErrorRepr);
+pub struct ScanError(#[from] ScanErrorRepr);
 
 #[derive(Debug, Error)]
-pub(crate) enum ScanFilesErrorRepr {
+pub(crate) enum ScanErrorRepr {
     #[error("{}", .0.error())]
     RepoError(RepoErrorRepr),
     #[error("failed parsing rust source file `{0}`")]
@@ -41,16 +41,36 @@ pub(crate) enum ScanFilesErrorRepr {
     Other(Box<dyn Error + Send + Sync>),
 }
 
+macro_rules! repo_error_impl {
+    (for $($t:ty),+ ;) => {
+        $(
+            impl $t {
+                pub(crate) fn into_inner(self) -> RepoErrorRepr {
+                    let Self { repr } = self;
+
+                    repr
+                }
+            }
+
+            impl From<RepoErrorRepr> for $t {
+                fn from(value: RepoErrorRepr) -> Self {
+                    Self { repr: value }
+                }
+            }
+        )+
+    };
+}
+
+repo_error_impl! { for DiscoverRepoError, CloneRepoError; }
+
 #[derive(Debug)]
-pub(crate) enum DiscoverRepoError {
-    Error(RepoErrorRepr),
-    Task(Box<dyn Error + Send + Sync>),
+pub(crate) struct DiscoverRepoError {
+    repr: RepoErrorRepr,
 }
 
 #[derive(Debug)]
-pub(crate) enum CloneRepoError {
-    Error(RepoErrorRepr),
-    Task(Box<dyn Error + Send + Sync>),
+pub(crate) struct CloneRepoError {
+    repr: RepoErrorRepr,
 }
 
 #[derive(Debug)]

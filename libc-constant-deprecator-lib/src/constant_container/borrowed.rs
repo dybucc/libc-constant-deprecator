@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, Weak},
 };
 
-use crate::{Const, Sealed};
+use crate::{Const, Sealed, sealed_impl};
 
 /// Represents a borrowed view into multiple segments of a [`ConstContainer`] as
 /// a single, contiguous container of its own.
@@ -36,12 +36,25 @@ impl BorrowedContainer {
     }
 }
 
-// NOTE: we use a trait here to define shared behavior between taking an owning
-// range, or a reference to one, but it may just be better to have three
-// different implementations of `Index` packed in a macro.
-trait Indexer<T> {
+/// Defines shared behavior between types capable of indexing into
+/// [`BorrowedContainer`].
+///
+/// This is sealed because the underlying container type in `BorrowedContainer`
+/// is not implemented in this crate, and only allows a limited range of types
+/// to index into it.
+#[expect(
+    private_bounds,
+    reason = "The whole point of the `Sealed` pattern is to not allow public implementations of \
+              it."
+)]
+pub trait Indexer<T>: Sealed {
     fn eval(self) -> T;
 }
+
+sealed_impl! { for Range<usize>, &Range<usize>, &mut Range<usize>; }
+
+// TODO: if time allows, write a macro to get rid of the following repetitive
+// implementations.
 
 impl Indexer<Range<usize>> for Range<usize> {
     fn eval(self) -> Range<usize> {
@@ -95,11 +108,6 @@ impl BorrowedContainer {
     /// This is useful when requiring multiple subsequent levels of detail into
     /// the same overarching `ConstContainer`, without giving up on any of the
     /// intermediate, borrowed views.
-    #[expect(
-        private_bounds,
-        reason = "It's meant to be this way. The trait with which we can index into the borrowed \
-                  view is not meant to be implementable by library users."
-    )]
     pub fn select(&mut self, range: impl Indexer<Range<usize>>) -> BorrowedSubset<'_> {
         let Self { source, init_state } = self;
         let selected = range.eval();
@@ -128,8 +136,7 @@ pub trait Visit: Sealed {
     fn visit<B>(&self, visitor: impl FnMut(&Const) -> ControlFlow<B, ()>) -> Option<B>;
 }
 
-impl Sealed for BorrowedSubset<'_> {}
-impl Sealed for BorrowedContainer {}
+sealed_impl! { for BorrowedSubset<'_>, BorrowedContainer; }
 
 macro_rules! visit_impl {
     (@body) => {

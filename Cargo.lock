@@ -3004,7 +3004,7 @@ dependencies = [
 [[package]]
 name = "tester-impl"
 version = "0.1.0"
-source = "git+https://github.com/dybucc/ostep.git#df3d1b1faf6c8a1fa38fa770f436eb643a2c6505"
+source = "git+https://github.com/dybucc/ostep.git?rev=c48b9098865509c9435861d9c9e6b9acb73a61d1#c48b9098865509c9435861d9c9e6b9acb73a61d1"
 dependencies = [
  "proc-macro2",
  "quote",

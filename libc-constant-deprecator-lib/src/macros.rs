@@ -7,3 +7,11 @@ macro_rules! deprecate {
         }
     }};
 }
+
+macro_rules! sealed_impl {
+    (for $($t:ty),+ ;) => {
+        $(
+            impl $crate::support::Sealed for $t {}
+        )+
+    };
+}

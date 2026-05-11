@@ -26,8 +26,8 @@ use walkdir::WalkDir;
 
 use crate::{
     CloneErrorKind, CloneRepoError, ConstContainer, ConstContainerBuilder, DiscoverErrorKind,
-    DiscoverRepoError, FetchParseError, RepoErrorRepr, ScanFilesError, ScanFilesErrorRepr,
-    SourceFile, parser::parse_constants,
+    DiscoverRepoError, FetchParseError, RepoErrorRepr, ScanError, ScanErrorRepr, SourceFile,
+    parser::parse_constants,
 };
 
 pub(crate) const LIBC_REPO: &str = "https://github.com/rust-lang/libc.git";
@@ -54,7 +54,7 @@ pub(crate) const LIBC_REPO: &str = "https://github.com/rust-lang/libc.git";
 pub async fn scan(
     #[cfg(all(not(doc), debug_assertions))] libc_path: impl AsRef<Path> + Debug,
     #[cfg(any(doc, not(debug_assertions)))] libc_path: impl AsRef<Path>,
-) -> Result<ConstContainer, ScanFilesError> {
+) -> Result<ConstContainer, ScanError> {
     // NOTE: it's more intuitive to have the routine name be the token tree we
     // accept for recursive munching, but that way the recursive macro invocation
     // would have to replace the start of the path of the enum variant, which seems
@@ -68,17 +68,14 @@ pub async fn scan(
         };
         ($err:tt) => {{
             handle_result!(@$err)(libc_path.as_ref().to_owned())
-                .await
-                .map_err(|err| match err {
-                    $err::Error(err) => ScanFilesErrorRepr::RepoError(err),
-                    $err::Task(err) => ScanFilesErrorRepr::Other(err),
-                })?
+                .map_err($err::into_inner)
+                .map_err(ScanErrorRepr::RepoError)?
         }};
     }
 
-    if let Ok(libc_path) = fs::canonicalize(&libc_path).await
-        && ensure_libc(&libc_path).await.is_ok()
-    {
+    if let Ok(libc_path) = fs::canonicalize(&libc_path).await {
+        ensure_libc(libc_path).await?;
+
         handle_result!(DiscoverRepoError);
     } else {
         handle_result!(CloneRepoError);
@@ -94,15 +91,15 @@ pub async fn scan(
     {
         Ok(((), res)) => Ok(res),
         Err(err) => match err {
-            FetchParseError::ParsingFailed(path) => Err(ScanFilesErrorRepr::ParseError(path)),
-            FetchParseError::IoBound(err) => Err(ScanFilesErrorRepr::IoBound(err)),
-            FetchParseError::Other(err) => Err(ScanFilesErrorRepr::Other(err)),
+            FetchParseError::ParsingFailed(path) => Err(ScanErrorRepr::ParseError(path)),
+            FetchParseError::IoBound(err) => Err(ScanErrorRepr::IoBound(err)),
+            FetchParseError::Other(err) => Err(ScanErrorRepr::Other(err)),
         }
         .map_err(Into::into),
     }
 }
 
-async fn ensure_libc(path: impl AsRef<Path>) -> Result<(), ScanFilesError> {
+async fn ensure_libc(path: impl AsRef<Path>) -> Result<(), ScanError> {
     let metadata = MetadataCommand::parse(
         str::from_utf8(
             Command::new("cargo")
@@ -110,29 +107,29 @@ async fn ensure_libc(path: impl AsRef<Path>) -> Result<(), ScanFilesError> {
                 .current_dir(path)
                 .output()
                 .await
-                .map_err(ScanFilesErrorRepr::IoBound)?
+                .map_err(ScanErrorRepr::IoBound)?
                 .stdout
                 .as_slice(),
         )
         .map_err(Into::into)
-        .map_err(ScanFilesErrorRepr::Other)?,
+        .map_err(ScanErrorRepr::Other)?,
     )
     .map_err(Into::into)
-    .map_err(ScanFilesErrorRepr::Other)?;
+    .map_err(ScanErrorRepr::Other)?;
 
     let libc_potential_pkg = metadata
         .root_package()
         .ok_or("repo does not contain `libc` crate as root pkg")
         .map_err(Into::into)
-        .map_err(ScanFilesErrorRepr::Other)?;
+        .map_err(ScanErrorRepr::Other)?;
 
     (libc_potential_pkg.name == "libc")
-        .ok_or(ScanFilesErrorRepr::NotLibcRepo)
+        .ok_or(ScanErrorRepr::NotLibcRepo)
         .map_err(Into::into)
 }
 
-async fn discover_repo(path: PathBuf) -> Result<(), DiscoverRepoError> {
-    task::spawn_blocking(|| {
+fn discover_repo(path: PathBuf) -> Result<(), DiscoverRepoError> {
+    task::block_in_place(|| {
         gix::discover(&path)
             .map_err(|err| match err {
                 discover::Error::Discover(err) => match err {
@@ -189,26 +186,20 @@ async fn discover_repo(path: PathBuf) -> Result<(), DiscoverRepoError> {
             })
             .map(|_| ())
     })
-    .await
     .map_err(Into::into)
-    .map_err(DiscoverRepoError::Task)?
-    .map_err(DiscoverRepoError::Error)
 }
 
-async fn clone_repo(path: PathBuf) -> Result<(), CloneRepoError> {
-    task::spawn_blocking(|| {
+fn clone_repo(path: PathBuf) -> Result<(), CloneRepoError> {
+    task::block_in_place(|| {
         fetch_repo(path.clone(), prepare_clone(path.clone())?)?
             .main_worktree(Discard, &AtomicBool::new(false))
             .map_err(|err| RepoErrorRepr::Clone {
                 path,
                 kind: CloneErrorKind::Other(err.into()),
             })
-            .map_err(CloneRepoError::Error)
+            .map_err(Into::into)
             .map(|_| ())
     })
-    .await
-    .map_err(Into::into)
-    .map_err(CloneRepoError::Task)?
 }
 
 fn prepare_clone(path: PathBuf) -> Result<PrepareFetch, CloneRepoError> {
@@ -285,7 +276,7 @@ fn prepare_clone(path: PathBuf) -> Result<PrepareFetch, CloneRepoError> {
                 }
             }
         })
-        .map_err(CloneRepoError::Error)
+        .map_err(Into::into)
 }
 
 fn fetch_repo(
@@ -375,7 +366,7 @@ fn fetch_repo(
                 kind: CloneErrorKind::Other(err.into()),
             },
         })
-        .map_err(CloneRepoError::Error)
+        .map_err(Into::into)
         .map(|(out, _)| out)
 }
 
@@ -384,9 +375,9 @@ async fn fetch_details(
     tx: UnboundedSender<PathBuf>,
 ) -> Result<(), FetchParseError> {
     // NOTE: we don't implement manual directory traversal with something like
-    // `tokio`'s `fs` functions because those use the same `std` blocking functions
-    // only on a separate, "blocking-friendly" thread, so we may as well keep
-    // `walkdir` but run it also in such separate "type" of thread.
+    // `tokio::fs::read_dir` functions because those use the same `std` blocking
+    // functions only on a separate, "blocking-friendly" thread, so we may as
+    // well keep `walkdir` but run it also in such separate "type" of thread.
     task::spawn_blocking(move || {
         path.push("src");
 
