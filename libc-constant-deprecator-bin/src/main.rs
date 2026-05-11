@@ -15,9 +15,12 @@ use std::{
 
 use clap::Parser;
 use crossterm::{
-    cursor::{self, Hide, MoveToNextLine, MoveToPreviousLine, RestorePosition, SavePosition},
+    cursor::{
+        self, Hide, MoveRight, MoveToNextLine, MoveToPreviousLine, RestorePosition, SavePosition,
+        SetCursorStyle, Show,
+    },
     event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers},
-    style::Print,
+    style::{ContentStyle, Print, PrintStyledContent, StyledContent, Stylize},
     terminal::{self, Clear, ClearType},
 };
 use futures::{StreamExt, future};
@@ -598,7 +601,10 @@ impl State {
         };
 
         match event.kind() {
-            UserEventKind::TextualInput => prompt.push(event.into_text()),
+            UserEventKind::TextualInput => {
+                prompt.push(event.into_text());
+                *pos += 1;
+            }
             UserEventKind::Search => constants.filter_with(&prompt, filter_buf)?,
             // NOTE: toggles all constants because we are either (1) outside select mode, or (2)
             // within it but without a selection ranging beyond a single row.
@@ -742,63 +748,49 @@ impl State {
             ..
         } = self;
 
-        reset(&mut stdout);
+        // NOTE: we proceed by first drawing all static contents to the terminal buffer,
+        // to then highlight and/or reposition the cursor according to the current
+        // running state.
+        //
+        // Then we consider two types of routines; The printers and the finalizes. The
+        // printers perform operations that have a side effect but on exit will
+        // guarantee that the terminal cursor is at the very first column of the line
+        // where the prompt is. These area also the routines in charge of getting
+        // everything initially layed out on-screen.
+        //
+        // The finalizers do something similar, but are meant to be run last to provide
+        // the last tidbits of visual feedback required for each one of the modes. This
+        // includes highlighting items in the list, as well as moving the cursor
+        // wherever it is that the `pos` field in the running state indicates.
 
-        match mode.kind() {
-            ModeKind::Insert => print_prompt(&mut stdout, prompt, *mode)?,
-            ModeKind::Normal => todo!(),
-            // NOTE: recall we don't check whether we are in the prompt or in the list of constant
-            // symbols because select mode can only be accessed from normal mode once the user is in
-            // the list of constants.
-            ModeKind::Select => todo!(),
-        }
+        print_reset(&mut stdout);
+        print_prompt(&mut stdout, prompt)?;
+        print_list(&mut stdout, filter_buf)?;
 
-        // TODO: replace the below logic with a simpler logic to determine in which mode
-        // we are in, and then delegate the ground work of actually drawing to the
-        // terminal buffer to different functions to deal with it.
+        match (mode.kind(), pos.kind()) {
+            (ModeKind::Insert, PositionKind::Prompt) => {
+                finalize_insert_prompt(&mut stdout, pos.into_prompt())?;
+            }
+            (ModeKind::Normal, PositionKind::Prompt) => {
+                finalize_normal_prompt(&mut stdout, pos.into_prompt())?;
+            }
+            (ModeKind::Normal, PositionKind::List) => {
+                finalize_normal_list(&mut stdout, pos.into_list(), filter_buf)?;
+            }
+            (ModeKind::Select, PositionKind::List) => {
+                finalize_select_list(&mut stdout, pos.into_list(), filter_buf, selected)?
+            }
 
-        let mut line_counter = 0;
-
-        if let Some(err) = filter_buf
-            .visit(|constant| {
-                line_counter += 1;
-
-                if line_counter > 10 {
-                    return ControlFlow::Break(None);
-                }
-
-                match try {
-                    crossterm::queue!(stdout, Print("["))?;
-
-                    if constant.is_deprecated() {
-                        crossterm::queue!(stdout, Print("x"))?;
-                    } else {
-                        crossterm::queue!(stdout, Print(" "))?;
-                    }
-
-                    crossterm::queue!(
-                        stdout,
-                        Print(fmt::from_fn(|f| { write!(f, "] {}", constant.ident()) }))
-                    )?;
-
-                    if line_counter != 10 {
-                        crossterm::queue!(stdout, MoveToNextLine(1))?;
-                    }
-                } {
-                    Ok(()) => ControlFlow::Continue(()),
-                    Err(err) => ControlFlow::Break(err.into()),
-                }
-            })
-            .flatten()
-        {
-            return Err(err.into());
+            // NOTE: ignored cases include being in insert mode while in the list, and being in
+            // select mode while in the prompt, both of which are logically impossible.
+            _ => (),
         }
 
         stdout.flush().map_err(Into::into)
     }
 }
 
-fn reset(mut stdout: impl Write) -> anyhow::Result<()> {
+fn print_reset(mut stdout: impl Write) -> anyhow::Result<()> {
     crossterm::queue!(
         stdout,
         Hide,
@@ -808,11 +800,124 @@ fn reset(mut stdout: impl Write) -> anyhow::Result<()> {
     .map_err(Into::into)
 }
 
-#[expect(unused, reason = "WIP.")]
-fn print_prompt(mut stdout: impl Write, prompt: impl AsRef<str>, mode: Mode) -> anyhow::Result<()> {
-    crossterm::queue!(stdout, Print(fmt::from_fn(|f| { write!(f, "") })))?;
+fn print_prompt(mut stdout: impl Write, prompt: impl AsRef<str>) -> anyhow::Result<()> {
+    crossterm::queue!(
+        stdout,
+        Print(fmt::from_fn(|f| write!(f, "> {}", prompt.as_ref()))),
+        RestorePosition,
+    )
+    .map_err(Into::into)
+}
 
-    Ok(())
+// TODO: this will need a refactor once scorlling is implemented.
+fn print_list(mut stdout: impl Write, list: &impl Visit) -> anyhow::Result<()> {
+    crossterm::queue!(stdout, MoveToNextLine(1))?;
+
+    let mut line_counter = 0;
+
+    list.visit(|constant| {
+        line_counter += 1;
+
+        if line_counter > 10 {
+            return ControlFlow::Break(None);
+        }
+
+        if let Err(err) = try {
+            crossterm::queue!(
+                stdout,
+                Print(fmt::from_fn(|f| {
+                    write!(
+                        f,
+                        "[{}] {}",
+                        if constant.is_deprecated() { "X" } else { "  " },
+                        constant.ident(),
+                    )
+                })),
+            )?;
+
+            if line_counter == 10 {
+                crossterm::queue!(stdout, RestorePosition)?;
+            } else {
+                crossterm::queue!(stdout, MoveToNextLine(1))?;
+            }
+        } {
+            ControlFlow::Break(err.into())
+        } else {
+            ControlFlow::Continue(())
+        }
+    })
+    .flatten()
+    .map(Into::into)
+    .map_or_else(|| anyhow::Ok(()), Err)
+}
+
+fn finalize_insert_prompt(mut stdout: impl Write, off: u16) -> anyhow::Result<()> {
+    crossterm::queue!(
+        stdout,
+        MoveRight(PROMPT_COORD.get().map(|(col, _)| col + off).unwrap()),
+        SetCursorStyle::BlinkingBar,
+        Show,
+    )
+    .map_err(Into::into)
+}
+
+fn finalize_normal_prompt(mut stdout: impl Write, off: u16) -> anyhow::Result<()> {
+    crossterm::queue!(
+        stdout,
+        MoveRight(PROMPT_COORD.get().map(|(col, _)| col + off).unwrap()),
+        SetCursorStyle::SteadyBlock,
+        Show,
+    )
+    .map_err(Into::into)
+}
+
+// TODO: this is going to need a refactor once scrolling is implemented but this
+// particular routine should likely profit from the refactor in the `print_list`
+// routine for the same scrollign purposes.
+fn finalize_normal_list(mut stdout: impl Write, off: u16, list: &impl Visit) -> anyhow::Result<()> {
+    let mut line_counter = 0;
+
+    crossterm::queue!(
+        stdout,
+        MoveToNextLine(1 + off),
+        PrintStyledContent(StyledContent::new(
+            ContentStyle::new().bold().underlined(),
+            list.visit(|constant| {
+                if line_counter != off {
+                    line_counter += 1;
+                    return ControlFlow::Continue(());
+                }
+
+                let ident = constant.ident().clone();
+
+                ControlFlow::Break(fmt::from_fn(move |f| write!(f, "{ident}")))
+            })
+            .unwrap(),
+        )),
+    )
+    .map_err(Into::into)
+}
+
+// TODO: this is going to need a refactor once scrolling is implemented but this
+// particular routine should likely profit from the refactor in the `print_list`
+// routine for the same scrollign purposes.
+fn finalize_select_list(
+    mut stdout: impl Write,
+    off: u16,
+    list: &impl Visit,
+    selected: &Selection,
+) -> anyhow::Result<()> {
+    let mut line_counter = 0;
+
+    crossterm::queue!(
+        stdout,
+        MoveToNextLine(1 + off),
+        PrintStyledContent(StyledContent::new(
+            ContentStyle::new()..white().on_green(),
+            list.visit(|constant| todo!()),
+        )),
+    )
+    .map_err(Into::into)
 }
 
 fn toggle_in_select(filter_buf: &mut BorrowedContainer, selected: &Selection) {
@@ -1335,6 +1440,9 @@ async fn handle_input(channel: UnboundedSender<RawUserEvent>) -> anyhow::Result<
 // changing their terminal emulator size, which we don't handle just yet, this
 // should be constant beyond its point of initialization in `prepare_space()`.
 // That is why, at the moment, we use `OnceLock`.
+// TODO: possibly get this to use a custom wrapper around `OnceLock` that allows
+// fetching the right position in the terminal buffer provided the offsets we
+// store in the running state.
 static PROMPT_COORD: OnceLock<(u16, u16)> = OnceLock::new();
 
 #[tracing::instrument(skip_all, err(level = "info"))]
@@ -1364,6 +1472,11 @@ async fn prepare_space() -> anyhow::Result<()> {
 // messages that would get reported on each of the tasks.
 #[tracing::instrument(skip_all, err(level = "info"))]
 async fn init() -> anyhow::Result<ConstContainer> {
+    // TODO: move this spinner type to crate scope, and make it configurable, such
+    // that it accepts an arbitrary future with which to run the worker task, and
+    // returns a wrapper type around a transmitter with which to fetch messages from
+    // the worker task,
+
     repr! {
         #[derive(Debug, Default, Clone, Copy)]
         SpinnerKind
