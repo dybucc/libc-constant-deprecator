@@ -88,6 +88,7 @@ impl Const {
         }
     }
 
+    #[tracing::instrument]
     pub(crate) fn deprecate(&mut self, yes: bool) {
         self.deprecated = yes;
     }

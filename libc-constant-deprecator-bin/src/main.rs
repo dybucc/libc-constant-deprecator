@@ -3,7 +3,7 @@
 use std::{
     borrow::Borrow,
     cmp::Ordering,
-    env,
+    debug_assert_matches, env,
     fmt::{self, Display, Formatter},
     fs::File,
     io::{self as std_io, BufWriter as StdBufWriter, Stdout, Write},
@@ -584,7 +584,10 @@ impl State {
         )
     }
 
-    #[tracing::instrument(skip_all)]
+    // TODO: refactor this routine into smaller chunks. Recall that we already
+    // attempted getting the function calls for mode switching separated into a
+    // table of closures/function pointers and that did not work out too well.
+    #[tracing::instrument(skip_all, err(level = "info"))]
     pub(crate) async fn update(&mut self, event: Option<UserEvent>) -> anyhow::Result<()> {
         let Self {
             filter_buf,
@@ -603,6 +606,7 @@ impl State {
         match event.kind() {
             UserEventKind::TextualInput => {
                 prompt.push(event.into_text());
+
                 *pos += 1;
             }
             UserEventKind::Search => constants.filter_with(&prompt, filter_buf)?,
@@ -625,6 +629,7 @@ impl State {
             UserEventKind::Effect => constants.effect_changes().await?,
             UserEventKind::Clear => {
                 prompt.clear();
+
                 constants.filter_with(".*", filter_buf)?;
             }
             UserEventKind::Switch => match mode.kind() {
@@ -698,11 +703,34 @@ impl State {
                     // NOTE: which one of the row or column should be modified is already handled in
                     // the corresponding impl of `Add` and `Sub` for `Position`. This allows us to
                     // converge events into two basic operations over an x-axis and a y-axis.
-                    //
-                    // We need only handle a special case when in select mode, as that mode requires
-                    // further manipulating the currently active selection.
-                    ModeActionKind::GoLeft | ModeActionKind::GoUp if mode.is_normal() => *pos -= 1,
+                    ModeActionKind::GoLeft | ModeActionKind::GoUp if mode.is_normal() => {
+                        if cfg!(debug_assertions) && pos.is_prompt() {
+                            debug_assert_matches!(
+                                usize::from(pos.into_prompt()).cmp(&prompt.len()),
+                                Ordering::Less | Ordering::Equal,
+                                "prompt position in terminal grid should always be less than the \
+                                 prompt string length"
+                            );
+                        }
+
+                        *pos -= 1;
+                    }
                     ModeActionKind::GoRight | ModeActionKind::GoDown if mode.is_normal() => {
+                        if pos.is_prompt() {
+                            debug_assert_matches!(
+                                usize::from(pos.into_prompt()).cmp(&prompt.len()),
+                                Ordering::Less | Ordering::Equal,
+                                "prompt position in terminal grid should always be less than the \
+                                 prompt string length"
+                            );
+
+                            // NOTE: this ensures moving right does not move beyond what's written
+                            // in the prompt.
+                            if usize::from(pos.into_prompt()) == prompt.len().saturating_sub(1) {
+                                return Ok(());
+                            }
+                        }
+
                         *pos += 1;
                     }
                     ModeActionKind::GoUp if mode.is_select() => {
@@ -714,7 +742,8 @@ impl State {
                         selected.extend(Dir::new_down(), pos);
                     }
 
-                    // NOTE: ignored cases include ...TODO
+                    // NOTE: ignored cases include motion bindings while in insert mode, which are
+                    // not possible as navigation keys are always interpreted as textual input.
                     _ => (),
                 }
             }
@@ -737,7 +766,7 @@ impl State {
     }
 
     #[expect(unused, reason = "WIP.")]
-    #[tracing::instrument(skip_all)]
+    #[tracing::instrument(skip_all, err(level = "info"))]
     fn draw(&self, mut stdout: impl Write) -> anyhow::Result<()> {
         let Self {
             mode,
@@ -767,6 +796,8 @@ impl State {
         print_prompt(&mut stdout, prompt)?;
         print_list(&mut stdout, filter_buf)?;
 
+        // FIXME: when drawing the highlights, the deprecation mark is being written
+        // over.
         match (mode.kind(), pos.kind()) {
             (ModeKind::Insert, PositionKind::Prompt) => {
                 finalize_insert_prompt(&mut stdout, pos.into_prompt())?;
@@ -778,7 +809,7 @@ impl State {
                 finalize_normal_list(&mut stdout, pos.into_list(), filter_buf)?;
             }
             (ModeKind::Select, PositionKind::List) => {
-                finalize_select_list(&mut stdout, pos.into_list(), filter_buf, selected)?
+                finalize_select_list(&mut stdout, pos.into_list(), filter_buf, selected)?;
             }
 
             // NOTE: ignored cases include being in insert mode while in the list, and being in
@@ -864,7 +895,7 @@ fn finalize_insert_prompt(mut stdout: impl Write, off: u16) -> anyhow::Result<()
 fn finalize_normal_prompt(mut stdout: impl Write, off: u16) -> anyhow::Result<()> {
     crossterm::queue!(
         stdout,
-        MoveRight(PROMPT_COORD.get().map(|(col, _)| col + off).unwrap()),
+        MoveRight(2 + off),
         SetCursorStyle::SteadyBlock,
         Show,
     )
@@ -892,8 +923,10 @@ fn finalize_normal_list(mut stdout: impl Write, off: u16, list: &impl Visit) -> 
 
                 ControlFlow::Break(fmt::from_fn(move |f| write!(f, "{ident}")))
             })
-            .unwrap(),
+            .expect("offset into visual list of symbols was not within bounds of inner list"),
         )),
+        SetCursorStyle::SteadyBlock,
+        Show
     )
     .map_err(Into::into)
 }
@@ -908,14 +941,47 @@ fn finalize_select_list(
     selected: &Selection,
 ) -> anyhow::Result<()> {
     let mut line_counter = 0;
+    let (start, end) = {
+        let Range { start, end } = *selected.range_ref();
+
+        (start, end)
+    };
+
+    crossterm::queue!(stdout, MoveToNextLine(1))?;
+
+    list.visit(|constant| {
+        if line_counter < start || line_counter == end {
+            return ControlFlow::Continue(());
+        }
+
+        match crossterm::queue!(
+            stdout,
+            PrintStyledContent(StyledContent::new(
+                if line_counter == off {
+                    ContentStyle::new().bold().underlined().white().on_green()
+                } else {
+                    ContentStyle::new().white().on_green()
+                },
+                constant.ident(),
+            ))
+        ) {
+            Ok(()) => {
+                line_counter += 1;
+
+                ControlFlow::Continue(())
+            }
+            Err(err) => ControlFlow::Break(err),
+        }
+    })
+    .map(Into::into)
+    .map_or_else(|| anyhow::Ok(()), Err)?;
 
     crossterm::queue!(
         stdout,
+        RestorePosition,
         MoveToNextLine(1 + off),
-        PrintStyledContent(StyledContent::new(
-            ContentStyle::new()..white().on_green(),
-            list.visit(|constant| todo!()),
-        )),
+        SetCursorStyle::SteadyUnderScore,
+        Show
     )
     .map_err(Into::into)
 }
@@ -1048,18 +1114,27 @@ impl Sub<u16> for Position {
         let mut out = self;
         let Self { repr, row, col } = &mut out;
 
-        // NOTE: unlike in the impl of `Add<u16>`, we don't require performing bound
+        // NOTE: unlike in the impl of `Add<u16>`, we don't require performing bounds
         // checks here because it holds that `prompt_col` already starts at 0. The same
         // applies for `list_row`, which even though not constructed through a `Default`
         // impl, behaves the same way when `transition()`ing between layout containers.
+        //
+        // The only special casing we need here is in the case we hit the very first row
+        // of the list, where the raw row index must be handled with care so as to avoid
+        // subtracting from it. This is because this index is not in sycn with the
+        // offset that `list_row` represents.
         match repr {
             PositionRepr::Prompt(prompt_col) => {
                 *prompt_col = prompt_col.saturating_sub(rhs);
                 *col = col.saturating_sub(rhs);
             }
-            PositionRepr::List(list_row) => {
-                *list_row = list_row.saturating_sub(rhs);
+            PositionRepr::List(list_row) if let Some(res) = list_row.checked_sub(rhs) => {
+                *list_row = res;
                 *row = row.saturating_sub(rhs);
+            }
+            PositionRepr::List(list_row) => {
+                *list_row = 0;
+                *row = PROMPT_COORD.get().map(|(_, row)| row).copied().unwrap();
             }
         }
 
@@ -1095,7 +1170,7 @@ impl Add<u16> for Position {
         // We also intentionally use the logical numerical limit expressed as a
         // 0-indexed number instead of checking for a relation of strict `less than`
         // w.r.t. to the analogous, 1-indexed limit, because we prefer to keep it
-        // consistent with having mapped the terminal grid size to 0-indexed space
+        // consistent with having mapped the terminal grid dimensions to 0-indexed space
         // above.
         match repr {
             PositionRepr::Prompt(prompt_col) => {
@@ -1342,7 +1417,7 @@ impl RawUserEvent {
 pub(crate) static SYNC_BUF: LazyLock<Mutex<StdBufWriter<Stdout>>> =
     LazyLock::new(|| Mutex::new(StdBufWriter::new(std_io::stdout())));
 
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(skip_all, err(level = "info"))]
 async fn render(mut state: State) -> anyhow::Result<()> {
     loop {
         draw_screen(&mut state).await?;
@@ -1353,9 +1428,11 @@ async fn render(mut state: State) -> anyhow::Result<()> {
     }
 }
 
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(skip_all, err(level = "info"))]
 async fn draw_screen(state: &mut State) -> anyhow::Result<()> {
     let stdout = &mut *SYNC_BUF.lock().await;
+
+    info!(redraw = true);
 
     task::block_in_place(|| state.draw(stdout))
 }
@@ -1591,10 +1668,9 @@ async fn init() -> anyhow::Result<ConstContainer> {
 async fn main() -> anyhow::Result<()> {
     if cfg!(debug_assertions) {
         tracing_subscriber::fmt()
-            .with_level(true)
-            .with_file(true)
+            .with_level(false)
             .with_ansi(false)
-            .with_line_number(true)
+            .with_line_number(false)
             .with_writer(StdMutex::new(
                 File::create(env::current_dir().map(|pwd| pwd.join("debug.log")).unwrap()).unwrap(),
             ))
