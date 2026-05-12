@@ -321,6 +321,9 @@ macro_rules! repr_impl {
     };
 }
 
+// TODO: it may be necessary to add a flag to allow customizing the maximum
+// regex compilation limit, even if we allow regexes to compile for up to 2^20
+// bytes ~= 1.04 mebibytes.
 #[derive(Debug, Parser)]
 pub(crate) struct Args {
     /// Path to the `libc` repo. Pass a non-existent directory to clone it to
@@ -624,10 +627,6 @@ impl State {
     fn new(constants: ConstContainer) -> (Self, UnboundedSender<RawUserEvent>) {
         let (tx, rx) = mpsc::unbounded_channel();
 
-        // NOTE: it could be that the `Default` impl of `Range` does not produce an
-        // empty range (it should, though, because it relies on the `Default` impl of
-        // the `Idx` polymorphic parameter; A `usize` here,) so keep an eye out for that
-        // once testing starts.
         (
             Self {
                 events: rx,
@@ -678,7 +677,9 @@ impl State {
                         if cfg!(debug_assertions) {
                             let span = info_span!($intro);
 
-                            filter_buf.select(0..10).visit(|constant| {
+                            filter_buf.select(
+                                0..if let len = filter_buf.len() && len < 10 { len } else { 10 }
+                            ).visit(|constant| {
                                 info!(parent: &span, "{}", constant.ident());
 
                                 ControlFlow::<(), _>::Continue(())

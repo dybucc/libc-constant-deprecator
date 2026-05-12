@@ -60,17 +60,25 @@ macro_rules! filter_impl {
                     .then(|| info!(matched_symbol = %ptr.0.ident()))
                     .is_some()
             });
+
+        info!("filtering done");
     };
     (@filter_with => $iter:expr, $borrowed:expr) => {{
         let buf = $borrowed.buffer();
 
         buf.clear();
 
-        _ = $iter.map(Arc::downgrade).collect_into(buf)
+        _ = $iter.map(Arc::downgrade).collect_into(buf);
+
+        info!("gathering_done");
     }};
-    (@filter => $iter:expr) => {
-        $iter.cloned().collect::<Vec<_>>()
-    };
+    (@filter => $iter:expr) => {{
+        let out = $iter.cloned().collect::<Vec<_>>();
+
+        info!("gathering done");
+
+        out
+    }};
     // This subtree requires so much repetition because once it recurses to the branch that
     // generates the docstrings, the macro system seems to require the item to already be there, not
     // requiring further macro invocations to actually resolve to an item. Otherwise, the docstrings

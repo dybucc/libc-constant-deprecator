@@ -36,6 +36,26 @@ impl BorrowedContainer {
     }
 }
 
+impl BorrowedContainer {
+    #[expect(
+        clippy::must_use_candidate,
+        reason = "It's not a bug not to use the result of this routine."
+    )]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[expect(
+        clippy::must_use_candidate,
+        reason = "It's not a bug not to use the result of this routine."
+    )]
+    pub fn len(&self) -> usize {
+        let Self { source, .. } = self;
+
+        source.len()
+    }
+}
+
 /// Defines shared behavior between types capable of indexing into
 /// [`BorrowedContainer`].
 ///
