@@ -1,4 +1,4 @@
-#![feature(range_bounds_is_empty, range_into_bounds, try_blocks)]
+#![feature(range_into_bounds, try_blocks)]
 
 use std::{
     borrow::Borrow,
@@ -323,7 +323,8 @@ macro_rules! repr_impl {
 
 #[derive(Debug, Parser)]
 pub(crate) struct Args {
-    /// Path to the `libc` repo. Leavy empty to clone it to the pwd.
+    /// Path to the `libc` repo. Pass a non-existent directory to clone it to
+    /// that directory.
     path: Option<String>,
 }
 
@@ -644,6 +645,11 @@ impl State {
     // TODO: refactor this routine into smaller chunks. Recall that we already
     // attempted getting the function calls for mode switching separated into a
     // table of closures/function pointers and that did not work out too well.
+    #[expect(
+        clippy::match_wildcard_for_single_variants,
+        reason = "We prefer to keep it this way such that the note left besides the wildcard \
+                  match gets the attention it deserves."
+    )]
     #[tracing::instrument(skip_all, err(level = "info"))]
     pub(crate) async fn update(&mut self, event: Option<UserEvent>) -> anyhow::Result<()> {
         let Self {
@@ -660,11 +666,6 @@ impl State {
             return Ok(());
         };
 
-        // FIXME: there seems to be an issue with the way constants either get
-        // deprecated or otherwise get shown as being deprecated; when marking for
-        // deprecation the constants shown in the list, only the very first constant is
-        // properly marked (without taking into consideration its actual state in
-        // memory.)
         match event.kind() {
             UserEventKind::TextualInput => {
                 prompt.push(event.into_text());
@@ -672,16 +673,28 @@ impl State {
                 *pos += 1;
             }
             UserEventKind::Search => constants.filter_with(&prompt, filter_buf)?,
+
             // NOTE: toggles all constants because we are either (1) outside select mode, or (2)
             // within it but without a selection ranging beyond a single row.
-            UserEventKind::Toggle if selected.is_empty() && all_deprecated(filter_buf) => {
+            UserEventKind::Toggle if mode.is_normal() && all_deprecated(filter_buf) => {
+                info!(toggle_mode = "normal", toggle_type = "undeprecation");
+
                 filter_buf.undeprecate();
             }
-            UserEventKind::Toggle if selected.is_empty() => filter_buf.deprecate(),
+            UserEventKind::Toggle if mode.is_normal() => {
+                info!(toggle_mode = "normal", toggle_type = "deprecation");
+
+                filter_buf.deprecate();
+            }
             // NOTE: this uses `BorrowedSubset` to add another degree of refinement to the set of
             // constants currently under consideration. This only happens in select mode, where the
             // range in `selected` may be non-empty.
-            UserEventKind::Toggle => toggle_in_select(filter_buf, selected),
+            UserEventKind::Toggle => {
+                info!(toggle_mode = "select");
+
+                toggle_in_select(filter_buf, selected);
+            }
+
             // TODO: this is the only piece of this routine that forces it to be run in an async
             // context. This should not be the case, and this match arm should instead use a channel
             // to send a message to the async rendering loop, such that while effecting changes
@@ -689,7 +702,7 @@ impl State {
             // hesitant to make the main drawing and update routines in the rendering loop be run in
             // parallel because that would make sequential reaction to events harder to implement.
             UserEventKind::Effect => constants.effect_changes().await?,
-            UserEventKind::Clear => {
+            UserEventKind::Clear if !prompt.is_empty() => {
                 prompt.clear();
 
                 constants.filter_with(".*", filter_buf)?;
@@ -808,6 +821,7 @@ impl State {
 
                         *pos += 1;
                     }
+
                     ModeActionKind::GoUp if mode.is_select() => {
                         *pos -= 1;
 
@@ -824,6 +838,11 @@ impl State {
                     _ => (),
                 }
             }
+
+            // NOTE: ignored cases include issuing a clear command without there being anything in
+            // the prompt, which also triggers a wildcard regex. We prefer not to call into that
+            // regex if not necessary (even if it gets cached past the first clear command.)
+            _ => (),
         }
 
         Ok(())
@@ -982,6 +1001,7 @@ fn finalize_normal_list(mut stdout: impl Write, off: u16, list: &impl Visit) -> 
         list.visit(|constant| {
             if line_counter != off {
                 line_counter += 1;
+
                 return ControlFlow::Continue(());
             }
 
@@ -1126,6 +1146,7 @@ macro_rules! style_impl {
 
 style_impl! {}
 
+#[tracing::instrument(skip_all)]
 fn toggle_in_select(filter_buf: &mut BorrowedContainer, selected: &Selection) {
     let mut selected = filter_buf.select(selected.map_ref(|range| {
         let (Bound::Included(start), Bound::Excluded(end)) = range.range().clone().into_bounds()
@@ -1143,8 +1164,12 @@ fn toggle_in_select(filter_buf: &mut BorrowedContainer, selected: &Selection) {
     }));
 
     if all_deprecated(&selected) {
+        info!(toggle_type = "undeprecation");
+
         selected.undeprecate();
     } else {
+        info!(toggle_type = "deprecation");
+
         selected.deprecate();
     }
 }

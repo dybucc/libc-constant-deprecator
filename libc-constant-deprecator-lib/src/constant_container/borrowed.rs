@@ -172,6 +172,8 @@ macro_rules! deprecate_impl {
     (body @deprecate) => { true };
     (body @undeprecate) => { false };
     (@body $op:tt, $self:expr) => {
+        use tracing::info;
+
         // NOTE: Yes, it's odd that type inference does not work here, but apparently it
         // only works when destructuring the overaching `BorrowedContainer`, which
         // doesn't work as well when destrucuring the `BorrowedSubset`, because the
@@ -182,11 +184,15 @@ macro_rules! deprecate_impl {
 
         source
             .iter_mut()
-            .filter_map(|ptr| ptr.upgrade().map(|ptr| unsafe {
-                Arc::as_ptr(&ptr).cast_mut().as_mut_unchecked()
-            }))
+            .filter_map(|ptr| {
+                ptr.upgrade().map(|ptr| unsafe {
+                    Arc::as_ptr(&ptr).cast_mut().as_mut_unchecked()
+                })
+            })
             .zip(init_state)
             .for_each(|((constant, modified), init_modified)| {
+                info!(modified_constant = true, deprecated = deprecate_impl!(body @$op));
+
                 constant.deprecate(deprecate_impl!(body @$op));
 
                 *modified = *init_modified == *modified;
@@ -207,20 +213,24 @@ macro_rules! deprecate_impl {
     () => {
         impl BorrowedContainer {
             deprecate_impl! { @doc deprecate {
+                #[cfg_attr(debug_assertions, tracing::instrument(skip_all))]
                 pub fn deprecate(&mut self) { deprecate_impl! { @body deprecate, self } }
             } }
 
             deprecate_impl! { @doc undeprecate {
+                #[cfg_attr(debug_assertions, tracing::instrument(skip_all))]
                 pub fn undeprecate(&mut self) { deprecate_impl! { @body undeprecate, self } }
             } }
         }
 
         impl BorrowedSubset<'_> {
             deprecate_impl! { @doc deprecate {
+                #[cfg_attr(debug_assertions, tracing::instrument(skip_all))]
                 pub fn deprecate(&mut self) { deprecate_impl! { @body deprecate, self } }
             } }
 
             deprecate_impl! { @doc undeprecate {
+                #[cfg_attr(debug_assertions, tracing::instrument(skip_all))]
                 pub fn undeprecate(&mut self) { deprecate_impl! { @body undeprecate, self } }
             } }
         }
