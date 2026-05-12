@@ -482,7 +482,7 @@ impl Selection {
             DirKind::Down
                 if pos.into_list() <= *pivot
                     && let start = repr.start_mut()
-                    && *start < 10 =>
+                    && *start < 9 =>
             {
                 *start += 1;
             }
@@ -1803,12 +1803,14 @@ async fn init() -> anyhow::Result<ConstContainer> {
 #[tokio::main]
 #[tracing::instrument(skip_all)]
 async fn main() -> anyhow::Result<()> {
-    // TODO: if time allows, find a way of getting `tracing` not to print any
-    // information whatsoever about the "parent" of each event (i.e. the crate and
-    // module information to trace back the call.)
     if cfg!(debug_assertions) {
         tracing_subscriber::fmt()
+            .with_target(false)
             .with_level(false)
+            .with_thread_ids(false)
+            .with_file(false)
+            .with_thread_names(false)
+            .without_time()
             .with_ansi(false)
             .with_line_number(false)
             .with_writer(StdMutex::new(
