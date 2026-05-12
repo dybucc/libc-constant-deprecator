@@ -449,13 +449,7 @@ impl Selection {
         repr
     }
 
-    #[expect(
-        clippy::match_wildcard_for_single_variants,
-        reason = "This is a case where there's additional logic involved in the decision to match \
-                  against some cases but not against others, which is relfected then in both the \
-                  comment left and the match arm guards."
-    )]
-    #[cfg_attr(debug_assertions, tracing::instrument(skip(dir)))]
+    #[cfg_attr(debug_assertions, tracing::instrument(skip(self, dir)))]
     pub(crate) fn extend(
         &mut self,
         dir: Dir,
@@ -465,13 +459,18 @@ impl Selection {
         let Self { repr, pivot } = self;
         let pos = pos.borrow();
 
+        info!(pivot);
+
+        // FIXME: everything's patched except for an edge case when sitting at the end
+        // of the list, where extension should not happen downwards, but is apparently
+        // being allowed.
         match dir.kind() {
-            DirKind::Up
-                if pos.into_list() < *pivot
-                    && let start = repr.start_mut()
-                    && *start > 0 =>
-            {
-                *start -= 1;
+            DirKind::Up if pos.into_list() < *pivot => {
+                if let start = repr.start_mut()
+                    && *start > 0
+                {
+                    *start -= 1;
+                }
             }
             DirKind::Up
                 if let (start, end) = (*repr.start(), repr.end_mut())
@@ -479,13 +478,20 @@ impl Selection {
             {
                 *end -= 1;
             }
-            DirKind::Down if pos.into_list() < *pivot => *repr.start_mut() += 1,
-            DirKind::Down => *repr.end_mut() += 1,
 
-            // NOTE: ignored cases include going up but having the end bound be equal to or less
-            // than the start bound. The range is inclusive on the left and exclusive on its right,
-            // so to keep the invariant the end bound is always one unit larger than the start
-            // bound, we ought ignore this case.
+            DirKind::Down
+                if pos.into_list() <= *pivot
+                    && let start = repr.start_mut()
+                    && *start < 10 =>
+            {
+                *start += 1;
+            }
+            DirKind::Down
+                if let end = repr.end_mut()
+                    && *end < 10 =>
+            {
+                *end += 1;
+            }
             _ => (),
         }
     }
@@ -654,6 +660,11 @@ impl State {
             return Ok(());
         };
 
+        // FIXME: there seems to be an issue with the way constants either get
+        // deprecated or otherwise get shown as being deprecated; when marking for
+        // deprecation the constants shown in the list, only the very first constant is
+        // properly marked (without taking into consideration its actual state in
+        // memory.)
         match event.kind() {
             UserEventKind::TextualInput => {
                 prompt.push(event.into_text());
@@ -995,20 +1006,27 @@ fn finalize_select_list(
     selected: &Selection,
 ) -> anyhow::Result<()> {
     let mut line_counter = 0;
-    let (start, end) = {
-        let Range { start, end } = *selected.range();
+    let Range { start, end } = *selected.range();
 
-        (start, end)
-    };
+    info!(selection_start = start, selection_end = end);
 
-    crossterm::queue!(stdout, MoveToNextLine(1))?;
+    // NOTE: we move past however as many constants are not part of the selection,
+    // plus the "base position" required to reach the list of symbols from the
+    // prompt (1 row.)
+    crossterm::queue!(stdout, MoveToNextLine(1 + start))?;
 
     list.visit(|constant| {
         if line_counter < start {
+            line_counter += 1;
+
+            info!(constant_pre_bounds = true);
+
             return ControlFlow::Continue(());
         } else if line_counter == end {
             return ControlFlow::Break(Ok(()));
         }
+
+        info!(constant_in_bounds = true);
 
         let cmd = StylizedSymbol::from_constant(constant).on_blue();
 
@@ -1035,7 +1053,7 @@ fn finalize_select_list(
             Err(err) => ControlFlow::Break(Err(err)),
         }
     })
-    .map_or_else(|| anyhow::Ok(()), |res| res.map_err(Into::into))?;
+    .unwrap_or(Ok(()))?;
 
     crossterm::queue!(stdout, RestorePosition, MoveToNextLine(1 + off),).map_err(Into::into)
 }
@@ -1785,6 +1803,9 @@ async fn init() -> anyhow::Result<ConstContainer> {
 #[tokio::main]
 #[tracing::instrument(skip_all)]
 async fn main() -> anyhow::Result<()> {
+    // TODO: if time allows, find a way of getting `tracing` not to print any
+    // information whatsoever about the "parent" of each event (i.e. the crate and
+    // module information to trace back the call.)
     if cfg!(debug_assertions) {
         tracing_subscriber::fmt()
             .with_level(false)
