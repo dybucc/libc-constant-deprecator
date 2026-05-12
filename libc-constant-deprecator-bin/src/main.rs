@@ -4,7 +4,7 @@ use std::{
     borrow::Borrow,
     cmp::Ordering,
     debug_assert_matches, env,
-    fmt::{self, Display, Formatter},
+    fmt::{self, Debug, Display, Formatter},
     fs::File,
     io::{self as std_io, BufWriter as StdBufWriter, Stdout, Write},
     ops::{Add, AddAssign, Bound, ControlFlow, IntoBounds, Range, RangeBounds, Sub, SubAssign},
@@ -90,7 +90,8 @@ macro_rules! repr {
         // denoting the variants because its body requires metavariable
         // expansion at multiple levels of depth.
         #[allow(
-            unused,
+            dead_code,
+            unused_variables,
             reason = "The macro requires having some type parameters expand to semantically \
                       unignored parameters because I can't think of a way to modify the provided \
                       parameter token trees."
@@ -127,7 +128,8 @@ macro_rules! repr {
         }
 
         #[allow(
-            unused,
+            dead_code,
+            unused_variables,
             reason = "The macro requires having some type parameters expand to semantically \
                       unignored parameters because I can't think of a way to modify the provided \
                       parameter token trees."
@@ -166,7 +168,8 @@ macro_rules! repr_impl {
     }) => {
         $(
             #[allow(
-                unused,
+                dead_code,
+                unused_variables,
                 reason = "The macro requires having some type parameters expand to semantically \
                           unignored parameters because I can't think of a way to modify the \
                           provided parameter token trees."
@@ -188,7 +191,9 @@ macro_rules! repr_impl {
 
             $(
                 #[allow(
-                    unused,
+                    dead_code,
+                    unused_variables,
+                    unused_parens,
                     reason = "The macro requires having some type parameters expand to \
                               semantically unignored parameters because I can't think of a way to \
                               modify the provided parameter token trees."
@@ -205,7 +210,9 @@ macro_rules! repr_impl {
                 }
 
                 #[allow(
-                    unused,
+                    dead_code,
+                    unused_variables,
+                    unused_parens,
                     reason = "The macro requires having some type parameters expand to \
                               semantically unignored parameters because I can't think of a way to \
                               modify the provided parameter token trees."
@@ -222,7 +229,9 @@ macro_rules! repr_impl {
                 }
 
                 #[allow(
-                    unused,
+                    dead_code,
+                    unused_variables,
+                    unused_parens,
                     reason = "The macro requires having some type parameters expand to \
                               semantically unignored parameters because I can't think of a way to \
                               modify the provided parameter token trees."
@@ -241,7 +250,9 @@ macro_rules! repr_impl {
 
             $(
                 #[allow(
-                    unused,
+                    dead_code,
+                    unused_variables,
+                    unused_parens,
                     reason = "The macro requires having some type parameters expand to \
                               semantically unignored parameters because I can't think of a way to \
                               modify the provided parameter token trees."
@@ -258,7 +269,9 @@ macro_rules! repr_impl {
                 }
 
                 #[allow(
-                    unused,
+                    dead_code,
+                    unused_variables,
+                    unused_parens,
                     reason = "The macro requires having some type parameters expand to \
                               semantically unignored parameters because I can't think of a way to \
                               modify the provided parameter token trees."
@@ -275,7 +288,9 @@ macro_rules! repr_impl {
                 }
 
                 #[allow(
-                    unused,
+                    dead_code,
+                    unused_variables,
+                    unused_parens,
                     reason = "The macro requires having some type parameters expand to \
                               semantically unignored parameters because I can't think of a way to \
                               modify the provided parameter token trees."
@@ -293,7 +308,8 @@ macro_rules! repr_impl {
             )?
 
             #[allow(
-                unused,
+                dead_code,
+                unused_variables,
                 reason = "The macro requires having some type parameters expand to semantically \
                           unignored parameters because I can't think of a way to modify the \
                           provided parameter token trees."
@@ -357,7 +373,7 @@ pub(crate) struct State {
 // and not an owned `T` (i.e. you end up with a `Bound<&mut &T>` instead of
 // `Bound<&mut T>` where `T` is owned in this latter case.)
 #[expect(
-    unused,
+    dead_code,
     reason = "Some trait methods exist purely for symmetry's sake."
 )]
 trait RangeBoundsExt<T> {
@@ -390,18 +406,122 @@ pub(crate) struct Selection {
     pivot: u16,
 }
 
+#[expect(
+    dead_code,
+    reason = "It's mostly just accessor and mutator methods that exist for symmetry's sake."
+)]
+impl Selection {
+    pub(crate) fn with_pivot(pivot: u16) -> Self {
+        Self {
+            pivot,
+            repr: SelectionRange::new(pivot, pivot + 1),
+        }
+    }
+
+    pub(crate) fn map_ref<T>(&self, f: impl FnOnce(&Self) -> T) -> T {
+        f(self)
+    }
+
+    pub(crate) fn into_range(self) -> Range<u16> {
+        let Self {
+            repr: SelectionRange { repr },
+            ..
+        } = self;
+
+        repr
+    }
+
+    pub(crate) fn range(&self) -> &Range<u16> {
+        let Self {
+            repr: SelectionRange { repr },
+            ..
+        } = self;
+
+        repr
+    }
+
+    pub(crate) fn range_mut(&mut self) -> &mut Range<u16> {
+        let Self {
+            repr: SelectionRange { repr },
+            ..
+        } = self;
+
+        repr
+    }
+
+    #[expect(
+        clippy::match_wildcard_for_single_variants,
+        reason = "This is a case where there's additional logic involved in the decision to match \
+                  against some cases but not against others, which is relfected then in both the \
+                  comment left and the match arm guards."
+    )]
+    #[cfg_attr(debug_assertions, tracing::instrument(skip(dir)))]
+    pub(crate) fn extend(
+        &mut self,
+        dir: Dir,
+        #[cfg(not(debug_assertions))] pos: impl Borrow<Position>,
+        #[cfg(debug_assertions)] pos: impl Borrow<Position> + Debug,
+    ) {
+        let Self { repr, pivot } = self;
+        let pos = pos.borrow();
+
+        match dir.kind() {
+            DirKind::Up
+                if pos.into_list() < *pivot
+                    && let start = repr.start_mut()
+                    && *start > 0 =>
+            {
+                *start -= 1;
+            }
+            DirKind::Up
+                if let (start, end) = (*repr.start(), repr.end_mut())
+                    && *end > start + 1 =>
+            {
+                *end -= 1;
+            }
+            DirKind::Down if pos.into_list() < *pivot => *repr.start_mut() += 1,
+            DirKind::Down => *repr.end_mut() += 1,
+
+            // NOTE: ignored cases include going up but having the end bound be equal to or less
+            // than the start bound. The range is inclusive on the left and exclusive on its right,
+            // so to keep the invariant the end bound is always one unit larger than the start
+            // bound, we ought ignore this case.
+            _ => (),
+        }
+    }
+}
+
+impl RangeBounds<u16> for Selection {
+    fn start_bound(&self) -> Bound<&u16> {
+        let Self { repr, .. } = self;
+
+        repr.repr.start_bound()
+    }
+
+    fn end_bound(&self) -> Bound<&u16> {
+        let Self {
+            repr: SelectionRange { repr },
+            ..
+        } = self;
+
+        repr.end_bound()
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SelectionRange {
     repr: Range<u16>,
 }
 
 #[expect(
-    unused,
+    dead_code,
     reason = "It's mostly just accessor and mutator methods that exist for symmetry's sake."
 )]
 impl SelectionRange {
-    fn new() -> Self {
-        Self::default()
+    fn new(start: u16, end: u16) -> Self {
+        Self {
+            repr: Range { start, end },
+        }
     }
 
     fn start_bound_mut(&mut self) -> Bound<&mut u16> {
@@ -446,13 +566,13 @@ impl SelectionRange {
         repr
     }
 
-    fn inner(&self) -> &Range<u16> {
+    fn range(&self) -> &Range<u16> {
         let Self { repr } = self;
 
         repr
     }
 
-    fn inner_mut(&mut self) -> &mut Range<u16> {
+    fn range_mut(&mut self) -> &mut Range<u16> {
         let Self { repr } = self;
 
         repr
@@ -468,94 +588,6 @@ impl Default for SelectionRange {
         Self {
             repr: Range { start: 0, end: 1 },
         }
-    }
-}
-
-#[expect(
-    unused,
-    reason = "It's mostly just accessor and mutator methods that exist for symmetry's sake."
-)]
-impl Selection {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
-    pub(crate) fn map_ref<T>(&self, f: impl FnOnce(&Self) -> T) -> T {
-        f(self)
-    }
-
-    pub(crate) fn range(self) -> Range<u16> {
-        let Self {
-            repr: SelectionRange { repr },
-            ..
-        } = self;
-
-        repr
-    }
-
-    pub(crate) fn range_ref(&self) -> &Range<u16> {
-        let Self {
-            repr: SelectionRange { repr },
-            ..
-        } = self;
-
-        repr
-    }
-
-    pub(crate) fn range_mut(&mut self) -> &mut Range<u16> {
-        let Self {
-            repr: SelectionRange { repr },
-            ..
-        } = self;
-
-        repr
-    }
-
-    // FIXME: the selection needs to record some form of pivot cursor position when
-    // entering select mode, such that we may use that to further determine whether
-    // the selection should move up by changing the underlying `start` bound and
-    // keeping the `end` bound fixed, or if it should instead decrease the selection
-    // by decreasing the `end` bound. This will likely involve a larger refactor of
-    // the `Selection` type.
-    pub(crate) fn extend(&mut self, dir: Dir, pos: impl Borrow<Position>) {
-        let Self { repr, pivot } = self;
-        let pos = pos.borrow();
-
-        match dir.kind() {
-            DirKind::Up if pos.list() == pivot => {
-                pivot.saturating_sub(1);
-
-                todo!()
-            }
-            // NOTE: if the current cusor position is not equal to the index of the pivot, then
-            // surely the it is smaller as otherwise the above case would've caught it and the pivot
-            // would have been adjusted accordingly.
-            DirKind::Up => {
-                let (start, end) = (repr.start_mut(), repr.end_mut());
-
-                todo!()
-            }
-            DirKind::Down => {
-                todo!()
-            }
-        }
-    }
-}
-
-impl RangeBounds<u16> for Selection {
-    fn start_bound(&self) -> Bound<&u16> {
-        let Self { repr, .. } = self;
-
-        repr.repr.start_bound()
-    }
-
-    fn end_bound(&self) -> Bound<&u16> {
-        let Self {
-            repr: SelectionRange { repr },
-            ..
-        } = self;
-
-        repr.end_bound()
     }
 }
 
@@ -654,12 +686,14 @@ impl State {
             UserEventKind::Switch => match mode.kind() {
                 ModeKind::Insert => {
                     *mode = Mode::new_normal();
+
                     pos.transition();
                 }
                 ModeKind::Normal => pos.transition(),
                 ModeKind::Select => {
                     *mode = Mode::new_normal();
                     *selected = Selection::default();
+
                     pos.transition();
                 }
             },
@@ -677,7 +711,7 @@ impl State {
                                 *pos -= 1;
                             }
 
-                            // Normal mode to other all other modes.
+                            // Normal mode to other modes.
                             (ModeKind::Normal, ModeKind::Insert) => {
                                 *mode = new_mode;
 
@@ -691,6 +725,14 @@ impl State {
                             }
                             (ModeKind::Normal, ModeKind::Select) if pos.is_list() => {
                                 *mode = new_mode;
+
+                                // NOTE: because selecting requires keeping track of which element
+                                // the selection started at to determine which of the bounds should
+                                // be changes at a given time, we have to set the current pivot to
+                                // be the current cursor position. The associated function
+                                // `with_pivot` will return a `Selection` that starts its range in
+                                // the current element, and has set the pivot the current element.
+                                *selected = Selection::with_pivot(pos.into_list());
                             }
 
                             // Select mode to other modes.
@@ -757,15 +799,17 @@ impl State {
                     }
                     ModeActionKind::GoUp if mode.is_select() => {
                         *pos -= 1;
+
                         selected.extend(Dir::new_up(), pos);
                     }
                     ModeActionKind::GoDown if mode.is_select() => {
                         *pos += 1;
+
                         selected.extend(Dir::new_down(), pos);
                     }
 
-                    // NOTE: ignored cases include motion bindings while in insert mode, which are
-                    // not possible as navigation keys are always interpreted as textual input.
+                    // NOTE: ignored cases include motion bindings while in insert mode, which we do
+                    // not process as navigation keys are always interpreted as textual input.
                     _ => (),
                 }
             }
@@ -787,7 +831,6 @@ impl State {
         }
     }
 
-    #[expect(unused, reason = "WIP.")]
     #[tracing::instrument(skip_all, err(level = "info"))]
     fn draw(&self, mut stdout: impl Write) -> anyhow::Result<()> {
         let Self {
@@ -814,7 +857,7 @@ impl State {
         // includes highlighting items in the list, as well as moving the cursor
         // wherever it is that the `pos` field in the running state indicates.
 
-        print_reset(&mut stdout);
+        print_reset(&mut stdout)?;
         print_prompt(&mut stdout, prompt)?;
         print_list(&mut stdout, filter_buf)?;
 
@@ -841,6 +884,7 @@ impl State {
     }
 }
 
+#[tracing::instrument(skip_all, err(level = "info"))]
 fn print_reset(mut stdout: impl Write) -> anyhow::Result<()> {
     crossterm::queue!(
         stdout,
@@ -851,6 +895,7 @@ fn print_reset(mut stdout: impl Write) -> anyhow::Result<()> {
     .map_err(Into::into)
 }
 
+#[tracing::instrument(skip_all, err(level = "info"))]
 fn print_prompt(mut stdout: impl Write, prompt: impl AsRef<str>) -> anyhow::Result<()> {
     crossterm::queue!(
         stdout,
@@ -861,15 +906,14 @@ fn print_prompt(mut stdout: impl Write, prompt: impl AsRef<str>) -> anyhow::Resu
 }
 
 // TODO: this will need a refactor once scrolling is implemented.
+#[tracing::instrument(skip_all, err(level = "info"))]
 fn print_list(mut stdout: impl Write, list: &impl Visit) -> anyhow::Result<()> {
     crossterm::queue!(stdout, MoveToNextLine(1))?;
 
     let mut line_counter = 0;
 
     list.visit(|constant| {
-        line_counter += 1;
-
-        if line_counter > 10 {
+        if line_counter == 10 {
             return ControlFlow::Break(None);
         }
 
@@ -879,11 +923,13 @@ fn print_list(mut stdout: impl Write, list: &impl Visit) -> anyhow::Result<()> {
                 StylizedSymbol::from_constant(constant).into_command(),
             )?;
 
-            if line_counter == 10 {
+            if line_counter == 9 {
                 crossterm::queue!(stdout, RestorePosition)?;
             } else {
                 crossterm::queue!(stdout, MoveToNextLine(1))?;
             }
+
+            line_counter += 1;
         } {
             ControlFlow::Break(err.into())
         } else {
@@ -895,11 +941,13 @@ fn print_list(mut stdout: impl Write, list: &impl Visit) -> anyhow::Result<()> {
     .map_or_else(|| anyhow::Ok(()), Err)
 }
 
+#[tracing::instrument(skip_all, err(level = "info"))]
 fn finalize_insert_prompt(mut stdout: impl Write, off: u16) -> anyhow::Result<()> {
     crossterm::queue!(stdout, MoveRight(2 + off), SetCursorStyle::SteadyBar, Show)
         .map_err(Into::into)
 }
 
+#[tracing::instrument(skip_all, err(level = "info"))]
 fn finalize_normal_prompt(mut stdout: impl Write, off: u16) -> anyhow::Result<()> {
     crossterm::queue!(
         stdout,
@@ -913,6 +961,7 @@ fn finalize_normal_prompt(mut stdout: impl Write, off: u16) -> anyhow::Result<()
 // TODO: this is going to need a refactor once scrolling is implemented but this
 // particular routine should likely benefit from the refactor in the
 // `print_list` routine for the same scrollign purposes.
+#[tracing::instrument(skip_all, err(level = "info"))]
 fn finalize_normal_list(mut stdout: impl Write, off: u16, list: &impl Visit) -> anyhow::Result<()> {
     let mut line_counter = 0;
 
@@ -938,6 +987,7 @@ fn finalize_normal_list(mut stdout: impl Write, off: u16, list: &impl Visit) -> 
 // TODO: this is going to need a refactor once scrolling is implemented but this
 // particular routine should likely benefit from the refactor in the
 // `print_list` routine for the same scrollign purposes.
+#[tracing::instrument(skip_all, err(level = "info"))]
 fn finalize_select_list(
     mut stdout: impl Write,
     off: u16,
@@ -946,7 +996,7 @@ fn finalize_select_list(
 ) -> anyhow::Result<()> {
     let mut line_counter = 0;
     let (start, end) = {
-        let Range { start, end } = *selected.range_ref();
+        let Range { start, end } = *selected.range();
 
         (start, end)
     };
@@ -960,17 +1010,23 @@ fn finalize_select_list(
             return ControlFlow::Break(Ok(()));
         }
 
-        let cmd = StylizedSymbol::from_constant(constant).white().on_green();
+        let cmd = StylizedSymbol::from_constant(constant).on_blue();
 
-        match crossterm::queue!(
-            stdout,
-            if line_counter == off {
-                cmd.bold().underlined()
-            } else {
-                cmd
+        match try {
+            crossterm::queue!(
+                stdout,
+                if line_counter == off {
+                    cmd.bold().underlined()
+                } else {
+                    cmd
+                }
+                .into_command(),
+            )?;
+
+            if line_counter < 9 {
+                crossterm::queue!(stdout, MoveToNextLine(1))?;
             }
-            .into_command(),
-        ) {
+        } {
             Ok(()) => {
                 line_counter += 1;
 
@@ -984,7 +1040,7 @@ fn finalize_select_list(
     crossterm::queue!(stdout, RestorePosition, MoveToNextLine(1 + off),).map_err(Into::into)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 struct StylizedSymbol<T: Display> {
     repr: T,
     deprecated: bool,
@@ -992,10 +1048,10 @@ struct StylizedSymbol<T: Display> {
 }
 
 impl StylizedSymbol<Ident> {
-    fn from_constant(value: &Const) -> Self {
+    fn from_constant(sym: &Const) -> Self {
         Self {
-            repr: value.ident().clone(),
-            deprecated: value.is_deprecated(),
+            repr: sym.ident().clone(),
+            deprecated: sym.is_deprecated(),
             style: ContentStyle::new(),
         }
     }
@@ -1016,7 +1072,7 @@ impl<T: Display> StylizedSymbol<T> {
 
         PrintStyledContent(StyledContent::new(
             style,
-            fmt::from_fn(move |f| write!(f, "[{}] {repr}", if deprecated { "X" } else { "  " })),
+            fmt::from_fn(move |f| write!(f, "[{}] {repr}", if deprecated { "X" } else { " " })),
         ))
     }
 }
@@ -1050,12 +1106,11 @@ macro_rules! style_impl {
     };
 }
 
-style_impl!();
+style_impl! {}
 
 fn toggle_in_select(filter_buf: &mut BorrowedContainer, selected: &Selection) {
     let mut selected = filter_buf.select(selected.map_ref(|range| {
-        let (Bound::Included(start), Bound::Excluded(end)) =
-            range.range_ref().clone().into_bounds()
+        let (Bound::Included(start), Bound::Excluded(end)) = range.range().clone().into_bounds()
         else {
             unreachable!(
                 "The range under consideration is always bounded inclusively below and \
@@ -1301,12 +1356,12 @@ impl Mode {
 
             // Normal mode.
             (ModeKind::Normal, RawUserEventKind::PlainText)
-                if let Some(action) = ModeAction::is_navigation(*event.text()) =>
+                if let Some(action) = ModeAction::is_navigation(event.into_text()) =>
             {
                 UserEvent::new_action(action)
             }
             (ModeKind::Normal, RawUserEventKind::PlainText)
-                if let Some(action) = ModeAction::is_mode_transition(*event.text()) =>
+                if let Some(action) = ModeAction::is_mode_transition(event.into_text()) =>
             {
                 UserEvent::new_action(action)
             }
@@ -1331,8 +1386,9 @@ impl Mode {
                 UserEvent::new_action(ModeAction::switch_modes(Mode::new_normal()))
             }
 
-            // The one and only event that is allowed in all modes is to switch between the prompt
-            // and the list of constants, whichever one it is that the user is in.
+            // The one and only event that is allowed in all modes is to switch between the
+            // prompt and the list of constants, whichever one it is that the
+            // user is in.
             (ModeKind::Insert | ModeKind::Normal | ModeKind::Select, RawUserEventKind::Tab) => {
                 UserEvent::new_switch()
             }
@@ -1353,9 +1409,9 @@ impl Mode {
 }
 
 repr! {
-    #[derive(Debug)]
+    #[derive(Debug, Clone, Copy)]
     UserEventKind
-    #[derive(Debug)]
+    #[derive(Debug, Clone, Copy)]
     UserEventRepr => {
         // Corresponds with plain text user input at the prompt.
         TextualInput(char),
@@ -1375,7 +1431,7 @@ repr! {
         // Is triggered when going from insert mode to normal mode.
         ModeAction(ModeAction),
     }
-    #[derive(Debug)]
+    #[derive(Debug, Clone, Copy)]
     UserEvent
 }
 
@@ -1395,9 +1451,9 @@ impl UserEvent {
 // but (1) major actions, which are stored inline under `UserEvent`, and (2)
 // plain text user input.
 repr! {
-    #[derive(Debug)]
+    #[derive(Debug, Clone, Copy)]
     ModeActionKind
-    #[derive(Debug)]
+    #[derive(Debug, Clone, Copy)]
     ModeActionRepr => {
         // Corresponds with using the escape key in insert mode to go back to normal mode.
         ModeSwitch(Mode),
@@ -1410,7 +1466,7 @@ repr! {
         // Corresponds with the navigation binding assigned to `j`.
         GoDown
     }
-    #[derive(Debug)]
+    #[derive(Debug, Clone, Copy)]
     ModeAction
 }
 
@@ -1462,7 +1518,7 @@ repr! {
         Escape,
         Tab,
     }
-    #[derive(Debug)]
+    #[derive(Debug, Clone, Copy)]
     RawUserEvent
 }
 
@@ -1634,7 +1690,7 @@ async fn init() -> anyhow::Result<ConstContainer> {
 
     impl Display for Spinner {
         fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-            self.repr.fmt(f)
+            Display::fmt(&self.repr, f)
         }
     }
 
