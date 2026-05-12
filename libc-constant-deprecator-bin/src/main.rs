@@ -21,7 +21,7 @@ use crossterm::{
         SetCursorStyle, Show,
     },
     event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers},
-    style::{ContentStyle, Print, PrintStyledContent, StyledContent, Stylize},
+    style::{ContentStyle, Print, StyledContent, Stylize},
     terminal::{self, Clear, ClearType},
 };
 use futures::{StreamExt, future};
@@ -36,7 +36,7 @@ use tokio::{
     },
     task, time,
 };
-use tracing::info;
+use tracing::{info, info_span};
 
 // NOTE: this is used for the purposes of easing declaration of two sets of
 // enums from the same variants. This then allows to implement internal
@@ -672,7 +672,27 @@ impl State {
 
                 *pos += 1;
             }
-            UserEventKind::Search => constants.filter_with(&prompt, filter_buf)?,
+            UserEventKind::Search => {
+                macro_rules! info_first_ten {
+                    ($intro:expr) => {{
+                        if cfg!(debug_assertions) {
+                            let span = info_span!($intro);
+
+                            filter_buf.select(0..10).visit(|constant| {
+                                info!(parent: &span, "{}", constant.ident());
+
+                                ControlFlow::<(), _>::Continue(())
+                            });
+                        }
+                    }};
+                }
+
+                info!(name: "filtering", filtering_event = true);
+
+                info_first_ten!("filter_buf_pre_searching");
+                constants.filter_with(&prompt, filter_buf)?;
+                info_first_ten!("filter_buf_post_searching");
+            }
 
             // NOTE: toggles all constants because we are either (1) outside select mode, or (2)
             // within it but without a selection ranging beyond a single row.
@@ -704,6 +724,10 @@ impl State {
             UserEventKind::Effect => constants.effect_changes().await?,
             UserEventKind::Clear if !prompt.is_empty() => {
                 prompt.clear();
+
+                if pos.is_prompt() {
+                    *pos = Position::new_prompt(0);
+                }
 
                 constants.filter_with(".*", filter_buf)?;
             }
@@ -1005,11 +1029,13 @@ fn finalize_normal_list(mut stdout: impl Write, off: u16, list: &impl Visit) -> 
                 return ControlFlow::Continue(());
             }
 
-            ControlFlow::Break(StylizedSymbol::from_constant(constant))
+            ControlFlow::Break(
+                StylizedSymbol::from_constant(constant)
+                    .for_ident(ContentStyle::new().bold().underlined())
+                    .for_mark(ContentStyle::new().bold().underlined()),
+            )
         })
         .expect("offset into visual list of symbols was not within bounds of inner list")
-        .bold()
-        .underlined()
         .into_command(),
     )
     .map_err(Into::into)
@@ -1054,7 +1080,7 @@ fn finalize_select_list(
             crossterm::queue!(
                 stdout,
                 if line_counter == off {
-                    cmd.bold().underlined()
+                    cmd.for_mark(ContentStyle::new().bold().underlined())
                 } else {
                     cmd
                 }
@@ -1086,6 +1112,7 @@ struct StylizedSymbol<T: Display> {
     mark_style: ContentStyle,
 }
 
+#[expect(dead_code, reason = "Some methods exist for symmetry's sake.")]
 impl StylizedSymbol<Ident> {
     fn from_constant(sym: &Const) -> Self {
         Self {
@@ -1108,16 +1135,16 @@ impl StylizedSymbol<Ident> {
         StylizedMark::new(ident_style)
     }
 
-    fn for_mark(&mut self, style: ContentStyle) -> &mut Self {
-        let Self { mark_style, .. } = self;
+    fn for_mark(mut self, style: ContentStyle) -> Self {
+        let Self { mark_style, .. } = &mut self;
 
         *mark_style = style;
 
         self
     }
 
-    fn for_ident(&mut self, style: ContentStyle) -> &mut Self {
-        let Self { ident_style, .. } = self;
+    fn for_ident(mut self, style: ContentStyle) -> Self {
+        let Self { ident_style, .. } = &mut self;
 
         *ident_style = style;
 
@@ -1172,6 +1199,32 @@ macro_rules! style_impl {
             style_impl! { @fn @spec }
         }
     };
+    (@body @spec => $self:expr) => {
+        let Self { style } = $self;
+
+        style
+    };
+    (@trait @ $spec:tt) => {
+        impl<'a> AsRef<ContentStyle> for $spec<'a> {
+            fn as_ref(&self) -> &ContentStyle {
+                style_impl! { @body @spec => self }
+            }
+        }
+
+        impl<'a> AsMut<ContentStyle> for $spec<'a> {
+            fn as_mut(&mut self) -> &mut ContentStyle {
+                style_impl! { @body @spec => self }
+            }
+        }
+
+        impl<'a> Stylize for $spec<'a> {
+            type Styled = Self;
+
+            fn stylize(self) -> Self::Styled {
+                self
+            }
+        }
+    };
     (@body => $self:expr) => {
         let Self { ident_style, .. } = $self;
 
@@ -1201,8 +1254,8 @@ macro_rules! style_impl {
         style_impl! { @impl @StylizedIdent }
         style_impl! { @impl @StylizedMark }
 
-        // TODO: add other macro subtrees for the above types to also implement
-        // `Stylize` and required trait bounds on their respective styles.
+        style_impl! { @trait @StylizedIdent }
+        style_impl! { @trait @StylizedMark }
     };
 }
 

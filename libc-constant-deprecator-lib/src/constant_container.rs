@@ -50,13 +50,24 @@ macro_rules! filter_impl {
     (@body $it:tt => $self:expr, $re:expr, $iter:expr) => {
         let $crate::ConstContainer { inner, re_cache } = $self;
         let re = $crate::constant_container::probe_re($re, re_cache)?;
+
+        info!(?re);
+
         $iter = inner
             .iter()
-            .filter(|ptr| re.is_match(ptr.0.ident().to_string().as_bytes()));
+            .filter(|ptr| {
+                re.is_match(ptr.0.ident().to_string().as_bytes())
+                    .then(|| info!(matched_symbol = %ptr.0.ident()))
+                    .is_some()
+            });
     };
-    (@filter_with => $iter:expr, $borrowed:expr) => {
-        _ = $iter.map(Arc::downgrade).collect_into($borrowed.buffer())
-    };
+    (@filter_with => $iter:expr, $borrowed:expr) => {{
+        let buf = $borrowed.buffer();
+
+        buf.clear();
+
+        _ = $iter.map(Arc::downgrade).collect_into(buf)
+    }};
     (@filter => $iter:expr) => {
         $iter.cloned().collect::<Vec<_>>()
     };
@@ -66,11 +77,14 @@ macro_rules! filter_impl {
     // don't get attached to it, and you get the lints against free docstrings.
     () => {
         filter_impl! { @doc filter_with {
+            #[cfg_attr(debug_assertions, tracing::instrument(skip_all, err(level = "info")))]
             pub fn filter_with(
                 &mut self,
                 re: impl AsRef<str>,
                 borrowed_container: &mut BorrowedContainer,
             ) -> Result<(), FilterError> {
+                use tracing::info;
+
                 let iter;
                 filter_impl! { @body filter_with => self, re, iter }
 
@@ -79,10 +93,13 @@ macro_rules! filter_impl {
         } }
 
         filter_impl! { @doc filter {
+            #[cfg_attr(debug_assertions, tracing::instrument(skip_all, err(level = "info")))]
             pub fn filter(
                 &mut self,
                 re: impl AsRef<str>,
             ) -> Result<BorrowedContainer, FilterError> {
+                use tracing::info;
+
                 let iter;
                 filter_impl! { @body filter => self, re, iter }
 
