@@ -1048,7 +1048,7 @@ fn finalize_select_list(
 
         info!(constant_in_bounds = true);
 
-        let cmd = StylizedSymbol::from_constant(constant).on_blue();
+        let cmd = StylizedSymbol::from_constant(constant).dim();
 
         match try {
             crossterm::queue!(
@@ -1082,7 +1082,8 @@ fn finalize_select_list(
 struct StylizedSymbol<T: Display> {
     repr: T,
     deprecated: bool,
-    style: ContentStyle,
+    ident_style: ContentStyle,
+    mark_style: ContentStyle,
 }
 
 impl StylizedSymbol<Ident> {
@@ -1090,8 +1091,37 @@ impl StylizedSymbol<Ident> {
         Self {
             repr: sym.ident().clone(),
             deprecated: sym.is_deprecated(),
-            style: ContentStyle::new(),
+            ident_style: ContentStyle::new(),
+            mark_style: ContentStyle::new(),
         }
+    }
+
+    fn ident(&mut self) -> StylizedIdent<'_> {
+        let Self { ident_style, .. } = self;
+
+        StylizedIdent::new(ident_style)
+    }
+
+    fn mark(&mut self) -> StylizedMark<'_> {
+        let Self { ident_style, .. } = self;
+
+        StylizedMark::new(ident_style)
+    }
+
+    fn for_mark(&mut self, style: ContentStyle) -> &mut Self {
+        let Self { mark_style, .. } = self;
+
+        *mark_style = style;
+
+        self
+    }
+
+    fn for_ident(&mut self, style: ContentStyle) -> &mut Self {
+        let Self { ident_style, .. } = self;
+
+        *ident_style = style;
+
+        self
     }
 }
 
@@ -1105,21 +1135,47 @@ impl<T: Display> StylizedSymbol<T> {
         let Self {
             repr,
             deprecated,
-            style,
+            ident_style,
+            mark_style,
         } = self;
 
-        PrintStyledContent(StyledContent::new(
-            style,
-            fmt::from_fn(move |f| write!(f, "[{}] {repr}", if deprecated { "X" } else { " " })),
-        ))
+        let ident = StyledContent::new(ident_style, repr);
+
+        Print(fmt::from_fn(move |f| {
+            write!(
+                f,
+                "{} {ident}",
+                StyledContent::new(mark_style, if deprecated { "[X]" } else { "[ ]" }),
+            )
+        }))
     }
 }
 
-macro_rules! style_impl {
-    (@body => $self:expr) => {
-        let Self { style, .. } = $self;
+#[derive(Debug)]
+struct StylizedIdent<'a> {
+    style: &'a mut ContentStyle,
+}
 
-        style
+#[derive(Debug)]
+struct StylizedMark<'a> {
+    style: &'a mut ContentStyle,
+}
+
+macro_rules! style_impl {
+    (@fn @spec) => {
+        fn new(style: &'a mut ContentStyle) -> Self {
+            Self { style }
+        }
+    };
+    (@impl @ $spec:tt) => {
+        impl<'a> $spec<'a> {
+            style_impl! { @fn @spec }
+        }
+    };
+    (@body => $self:expr) => {
+        let Self { ident_style, .. } = $self;
+
+        ident_style
     };
     () => {
         impl<T: Display> AsRef<ContentStyle> for StylizedSymbol<T> {
@@ -1141,6 +1197,12 @@ macro_rules! style_impl {
                 self
             }
         }
+
+        style_impl! { @impl @StylizedIdent }
+        style_impl! { @impl @StylizedMark }
+
+        // TODO: add other macro subtrees for the above types to also implement
+        // `Stylize` and required trait bounds on their respective styles.
     };
 }
 
@@ -1823,6 +1885,10 @@ async fn init() -> anyhow::Result<ConstContainer> {
             res1.and(res2)
         })?
 }
+
+// TODO: if time allows, try to run the program under `hyperfine` and see into
+// drawing a heatmap of a test run, just to check out where can I look for
+// performance gains.
 
 #[defer_drm]
 #[tokio::main]
