@@ -21,7 +21,10 @@ use crossterm::{
         self, Hide, MoveRight, MoveToNextLine, MoveToPreviousLine, RestorePosition, SavePosition,
         SetCursorStyle, Show,
     },
-    event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        Event, EventStream, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     style::{ContentStyle, Print, StyledContent, Stylize},
     terminal::{self, Clear, ClearType},
 };
@@ -830,9 +833,6 @@ impl State {
                         }
                     }
 
-                    // TODO: the below two actions for navigation in normal mode while in the prompt
-                    // are going to require a refactor once backspace support is added.
-
                     // NOTE: which one of the row or column should be modified is already handled in
                     // the corresponding impl of `Add` and `Sub` for `Position`. This allows us to
                     // converge events into two basic operations over an x-axis and a y-axis.
@@ -911,6 +911,8 @@ impl State {
         }
     }
 
+    // TODO: implement support for showing the current path to the constant besides
+    // the constant itself.
     #[tracing::instrument(skip_all, err(level = "info"))]
     fn draw(&mut self, mut stdout: impl Write) -> anyhow::Result<()> {
         let Self {
@@ -1489,7 +1491,7 @@ repr! {
 }
 
 impl Mode {
-    #[tracing::instrument(ret)]
+    #[tracing::instrument(skip(self), fields(mode = ?self), ret)]
     pub(crate) fn interpret(self, event: RawUserEvent) -> Option<UserEvent> {
         match (self.kind(), event.kind()) {
             // Insert mode
@@ -1725,61 +1727,68 @@ async fn update(state: &mut State) -> anyhow::Result<Termination<()>> {
     Ok(Termination::keep_going(()))
 }
 
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(skip_all, err(level = "info"))]
 async fn handle_input(channel: UnboundedSender<RawUserEvent>) -> anyhow::Result<()> {
     let mut event_stream = EventStream::new().fuse();
 
     while let Some(event) = event_stream.next().await {
-        match event? {
-            Event::Key(KeyEvent {
-                code: KeyCode::Char(' '),
-                modifiers: KeyModifiers::NONE,
-                ..
-            }) => _ = channel.send(RawUserEvent::new_space()),
-            Event::Key(KeyEvent {
-                code: KeyCode::Char(c),
-                modifiers: KeyModifiers::NONE,
-                ..
-            }) => _ = channel.send(RawUserEvent::new_text(c)),
-            Event::Key(KeyEvent {
-                code: KeyCode::Enter,
-                modifiers: KeyModifiers::NONE,
-                ..
-            }) => _ = channel.send(RawUserEvent::new_ret()),
-            Event::Key(KeyEvent {
-                code: KeyCode::Enter,
-                modifiers: KeyModifiers::SHIFT,
-                ..
-            }) => _ = channel.send(RawUserEvent::new_sret()),
-            Event::Key(KeyEvent {
-                code: KeyCode::Esc,
-                modifiers: KeyModifiers::NONE,
-                ..
-            }) => _ = channel.send(RawUserEvent::new_esc()),
-            Event::Key(KeyEvent {
-                code: KeyCode::Tab,
-                modifiers: KeyModifiers::NONE,
-                ..
-            }) => _ = channel.send(RawUserEvent::new_tab()),
-            Event::Key(KeyEvent {
-                code: KeyCode::Backspace,
-                modifiers: KeyModifiers::NONE,
-                ..
-            }) => _ = channel.send(RawUserEvent::new_backspace()),
+        let event = event?;
 
-            // The termination event, which should break out of the loop and drop the producer end
-            // of the channel to have the receiver end indicate termination to the task managing it.
-            // NOTE: this tries to replicate getting sent SIGINT or EOF, which are likely the most
-            // common ways of triggering relatively smooth termination in the absence of an explicit
-            // mechanism to do so in the program. Such control sequences/signals are not available
-            // when the terminal emulator is operating in raw mode.
-            Event::Key(KeyEvent {
-                code: KeyCode::Char('c' | 'd'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            }) => break,
+        info!(event = ?event);
 
-            _ => (),
+        if event.is_key_press() {
+            match event {
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char(' '),
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                }) => _ = channel.send(RawUserEvent::new_space()),
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char(c),
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                }) => _ = channel.send(RawUserEvent::new_text(c)),
+                Event::Key(KeyEvent {
+                    code: KeyCode::Enter,
+                    modifiers: KeyModifiers::SHIFT,
+                    ..
+                }) => _ = channel.send(RawUserEvent::new_sret()),
+                Event::Key(KeyEvent {
+                    code: KeyCode::Enter,
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                }) => _ = channel.send(RawUserEvent::new_ret()),
+                Event::Key(KeyEvent {
+                    code: KeyCode::Esc,
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                }) => _ = channel.send(RawUserEvent::new_esc()),
+                Event::Key(KeyEvent {
+                    code: KeyCode::Tab,
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                }) => _ = channel.send(RawUserEvent::new_tab()),
+                Event::Key(KeyEvent {
+                    code: KeyCode::Backspace,
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                }) => _ = channel.send(RawUserEvent::new_backspace()),
+
+                // The termination event, which should break out of the loop and drop the producer
+                // end of the channel to have the receiver end indicate termination
+                // to the task managing it. NOTE: this tries to replicate getting
+                // sent SIGINT or EOF, which are likely the most common ways of
+                // triggering relatively smooth termination in the absence of an explicit
+                // mechanism to do so in the program. Such control sequences/signals are not
+                // available when the terminal emulator is operating in raw mode.
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char('c' | 'd'),
+                    modifiers: KeyModifiers::CONTROL,
+                    ..
+                }) => break,
+
+                _ => (),
+            }
         }
     }
 
@@ -1941,6 +1950,22 @@ async fn init() -> anyhow::Result<ConstContainer> {
 // drawing a heatmap of a test run, just to check out where can I look for
 // performance gains.
 
+// NOTE: we keep a constant with the exact bitmask we require such that popping
+// off the enhancement flags from the keyboard enhancement protocol requires
+// only a single event.
+//
+// Whether the author of the `crossterm` docs means that the "level" that the
+// popping event is with respect to some abstraction of their own or to some
+// abstraction of the kitty keyboard protocol remains to be seen, and may very
+// well cause issues if it turns out to be the latter.
+//
+// We avoid enabling processing of press/release events for plain text because
+// that produces the raw events even when we instended on having a character
+// requiring a modifier combo input.
+const ENHANCEMENT_FLAGS_IN_USE: KeyboardEnhancementFlags =
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        .union(KeyboardEnhancementFlags::REPORT_EVENT_TYPES);
+
 #[defer_drm]
 #[tokio::main]
 #[tracing::instrument(skip_all)]
@@ -1964,23 +1989,62 @@ async fn main() -> anyhow::Result<()> {
     let parsed_constants = init().await?;
 
     prepare_space().await?;
-    task::block_in_place(terminal::enable_raw_mode)?;
+    {
+        let mut stdout = SYNC_BUF.lock().await;
+
+        task::block_in_place(|| {
+            let res1 = terminal::enable_raw_mode();
+            let res2 = crossterm::execute!(
+                stdout,
+                PushKeyboardEnhancementFlags(ENHANCEMENT_FLAGS_IN_USE)
+            );
+
+            res1.and(res2)
+        })?;
+    }
 
     info!(prompt_coordinates = ?PROMPT_COORD.get().unwrap());
 
     let (state, events_tx) = State::new(parsed_constants);
 
+    // NOTE: below, we use an IO stream from `std` instead of the static that we
+    // used throughout exeuction because we know for sure that at this point there's
+    // no way `stdout`  is locked; If we bailed out, then the guard over the async
+    // `Mutex` has been dropped and the stream can thus be used without fear.
+    //
+    // It's neither feasible to get a lock inside the closures used with
+    // `inspect_err` because those are sync, but locking the static with `stdout`
+    // requires an async context. And, of course, locking prior to even spawning
+    // or completing the main tasks is not feasible because those tasks require
+    // locking the static themselves.
+    //
+    // The only way the above reasoning is unsound is if the process panics with a
+    // non-unwinding strategy, in which case it would just bail out without running
+    // the corresponding destructors (thus not dropping the guard over the mutex
+    // that may have been held while the thread panicked, and possibly failing to
+    // write through the instance of `Stdout` we fetch within the below clsoures.)
     future::try_join(
         task::spawn(handle_input(events_tx)),
         task::spawn(render(state)),
     )
     .await
-    .map(|(res1, res2)| res1.and(res2))??;
+    .map(|(res1, res2)| res1.and(res2))
+    .inspect_err(|_| {
+        crossterm::execute!(std_io::stdout(), PopKeyboardEnhancementFlags).unwrap();
+    })?
+    .inspect_err(|_| {
+        crossterm::execute!(std_io::stdout(), PopKeyboardEnhancementFlags).unwrap();
+    })?;
 
     let mut stdout = SYNC_BUF.lock().await;
 
     task::block_in_place(|| {
-        crossterm::execute!(stdout, RestorePosition, Clear(ClearType::FromCursorDown))
+        crossterm::execute!(
+            stdout,
+            RestorePosition,
+            Clear(ClearType::FromCursorDown),
+            PopKeyboardEnhancementFlags
+        )
     })?;
 
     Ok(())

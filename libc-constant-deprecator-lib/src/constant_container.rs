@@ -1,12 +1,9 @@
-use std::{
-    collections::HashMap,
-    ops::{Deref, DerefMut},
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 
 use regex::bytes::{Regex, RegexBuilder};
-use syn::{Item, ItemConst, spanned::Spanned};
+use syn::{Attribute, Item, ItemConst, spanned::Spanned};
 use tokio::{fs, task::JoinSet};
+use tracing::info;
 
 use crate::{
     BorrowedContainer, ChangesKind, Const, FilterError, FilterErrorRepr, IoBoundChanges,
@@ -124,10 +121,16 @@ macro_rules! filter_impl {
 impl ConstContainer {
     pub(crate) const MAX_RE_POWER: u8 = 20;
 
-    pub(crate) const DEPRECATION_NOTICE: &str = "This constant, among others often used in C for \
-                                                 the purposes of denoting the latest value or \
-                                                 limit in a set of constants, has been \
-                                                 deprecated. See #3131 for details and discussion.";
+    // NOTE: we keep the deprecation notice away from the source file for two
+    // reasons:
+    // + The message itself is too long to have it manually included here, and
+    //   adding more escaped backslashes to get the actual message (once changes are
+    //   effected to disk) to show up with line breaks in the codebase is
+    //   non-trivial.
+    // + The message requires using escaped backslashes so that the actual piece of
+    //   source code that gets inserted into the `libc` codebase does not span
+    //   multiple lines.
+    pub(crate) const DEPRECATION_NOTICE: &str = include_str!("../../DEPRECATION_NOTICE");
 
     pub(crate) fn new(inner: Vec<Const>) -> Self {
         Self {
@@ -184,77 +187,45 @@ impl ConstContainer {
     /// Fails if some I/O-bound operation fails while writing to disk, or if any
     /// one of (1) parsing the existing file from the codebase, or (2)
     /// formatting that file once the changes are made, fails.
-    #[cfg_attr(debug_assertions, tracing::instrument(skip_all))]
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "The only source of panics that the lint sees is not really a source of panics \
+                  because there's an invariant that holds at that site, where if the constant \
+                  symbol is about to be undeprecated, then surely it must have been annotated as \
+                  deprecated. Otherwise, the filtering that's done on the loop over all symbols \
+                  wouldn't have produced the symbol in the iteration."
+    )]
+    #[cfg_attr(debug_assertions, tracing::instrument(skip_all, err(level = "info")))]
     pub async fn effect_changes(&self) -> Result<(), MakeChangesError> {
-        // NOTE: the pointer here is actually meant to hold a reference into a given
-        // `Const`. It just so happens that `tokio`'s tasks require a `'static` lifetime
-        // on the futures they run, but we have invariant references to `'static'`. This
-        // is solved by way of raw pointers, which themselves require an unsafe impl to
-        // be accepted as thread-safe. It is sound to do this because all of the tasks
-        // spawned here are awaited before the function returns.
-        #[repr(transparent)]
-        struct ThreadedPtr<T>(*const T);
-
-        unsafe impl<T> Send for ThreadedPtr<T> {}
-
-        unsafe impl<T> Sync for ThreadedPtr<T> {}
-
-        impl<T> Deref for ThreadedPtr<T> {
-            type Target = *const T;
-
-            fn deref(&self) -> &Self::Target {
-                &self.0
-            }
-        }
-
-        impl<T> DerefMut for ThreadedPtr<T> {
-            fn deref_mut(&mut self) -> &mut Self::Target {
-                &mut self.0
-            }
-        }
-
         let mut task_pool = JoinSet::new();
 
-        for constant in self
-            .inner
-            .iter()
-            .map(|ptr| (&ptr.0, &ptr.1))
-            .filter_map(|(constant, modified)| if *modified { Some(constant) } else { None })
-            .map(|constant| &raw const *constant)
-            .map(ThreadedPtr)
-        {
+        for symbol in self.inner.iter().filter(|ptr| ptr.1).cloned() {
             task_pool.spawn(async move {
-                // NOTE: we only extract `source` from `constant` because other fields are
-                // `!Send` and we prefer to keep that from going across await points.
-                let source = unsafe { &constant.as_ref_unchecked().source() };
+                let constant = &symbol.0;
 
-                let contents = fs::read_to_string(source).await.map_err(|inner| {
-                    MakeChangesErrorRepr::IoBound(IoBoundChanges::new(
-                        (*source).clone(),
-                        inner,
-                        ChangesKind::fetch(),
-                    ))
-                })?;
+                info!(constant_to_save = %constant.ident(), state = constant.is_deprecated());
 
                 // NOTE: this is purposefully sandwiched between await points because it handles
-                // `!Send` types.
+                // `File: !Send`.
                 let modified_file = {
-                    let mut file = syn::parse_file(&contents)
-                        .map_err(|_| MakeChangesErrorRepr::Parse((*source).into()))?;
-
-                    let (ref_ident, deprecated, ref_span) = {
-                        let constant = unsafe { constant.as_ref_unchecked() };
-
-                        (constant.ident(), constant.is_deprecated(), constant.span())
-                    };
+                    let mut file = syn::parse_file(
+                        &fs::read_to_string(constant.path()).await.map_err(|inner| {
+                            MakeChangesErrorRepr::IoBound(IoBoundChanges::new(
+                                constant.path().clone(),
+                                inner,
+                                ChangesKind::fetch(),
+                            ))
+                        })?,
+                    )
+                    .map_err(|_| MakeChangesErrorRepr::Parse(constant.path().clone().into()))?;
 
                     file.items
                         .iter_mut()
                         .filter_map(|item| {
-                            if item.span().start() == ref_span
+                            if item.span().start() == constant.span()
                                 && let Item::Const(ItemConst { attrs, ident, .. }) = item
-                                && ident == ref_ident
-                                && deprecated
+                                && ident == constant.ident()
+                                && constant.is_deprecated()
                             {
                                 Some(attrs)
                             } else {
@@ -262,19 +233,31 @@ impl ConstContainer {
                             }
                         })
                         .for_each(|attrs| {
-                            attrs.push(deprecate!(Self::DEPRECATION_NOTICE));
+                            if constant.is_deprecated() {
+                                attrs.push(deprecate!(Self::DEPRECATION_NOTICE));
+                            } else {
+                                let attr_to_remove = attrs
+                                    .iter()
+                                    .map(Attribute::path)
+                                    .position(|attr_ident| attr_ident.is_ident("deprecated"))
+                                    .expect("");
+
+                                attrs.swap_remove(attr_to_remove);
+                            }
                         });
 
                     prettyplease::unparse(&file)
                 };
 
-                fs::write(source, modified_file).await.map_err(|inner| {
-                    MakeChangesErrorRepr::IoBound(IoBoundChanges::new(
-                        (*source).clone(),
-                        inner,
-                        ChangesKind::save(),
-                    ))
-                })?;
+                fs::write(constant.path(), modified_file)
+                    .await
+                    .map_err(|inner| {
+                        MakeChangesErrorRepr::IoBound(IoBoundChanges::new(
+                            constant.path().clone(),
+                            inner,
+                            ChangesKind::save(),
+                        ))
+                    })?;
 
                 Ok::<_, MakeChangesError>(())
             });

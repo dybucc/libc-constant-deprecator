@@ -65,12 +65,18 @@ impl Const {
         &self.ident
     }
 
-    pub(crate) fn span(&self) -> LineColumn {
-        self.span
+    /// Fetches the path to the source file where this constant got extracted
+    /// from.
+    #[expect(
+        clippy::must_use_candidate,
+        reason = "It's not a bug not to use the result of this routine."
+    )]
+    pub fn path(&self) -> &PathBuf {
+        &self.source
     }
 
-    pub(crate) fn source(&self) -> &PathBuf {
-        &self.source
+    pub(crate) fn span(&self) -> LineColumn {
+        self.span
     }
 }
 
