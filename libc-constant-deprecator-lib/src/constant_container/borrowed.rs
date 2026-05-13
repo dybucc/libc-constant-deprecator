@@ -162,7 +162,7 @@ pub trait Visit: Sealed {
     /// This is akin to a far less powerful version of iteration that gates the
     /// actual iterator, and only provides a temporary, in-place view with a
     /// closure that can capture callsite state.
-    fn visit<B>(&self, visitor: impl FnMut(&Const) -> ControlFlow<B, ()>) -> Option<B>;
+    fn visit<B>(&self, visitor: impl FnMut(&Const) -> ControlFlow<B>) -> Option<B>;
 
     /// Provided an index into the collection of symbols being traversed, this
     /// routine attempts to find it and perform some operation on it.

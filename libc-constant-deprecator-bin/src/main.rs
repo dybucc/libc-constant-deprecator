@@ -644,11 +644,6 @@ impl State {
     // TODO: refactor this routine into smaller chunks. Recall that we already
     // attempted getting the function calls for mode switching separated into a
     // table of closures/function pointers and that did not work out too well.
-    #[expect(
-        clippy::match_wildcard_for_single_variants,
-        reason = "We prefer to keep it this way such that the note left besides the wildcard \
-                  match gets the attention it deserves."
-    )]
     #[tracing::instrument(skip_all, err(level = "info"))]
     pub(crate) async fn update(&mut self, event: Option<UserEvent>) -> anyhow::Result<()> {
         let Self {
@@ -670,6 +665,11 @@ impl State {
                 prompt.push(event.into_text());
 
                 *pos += 1;
+            }
+            UserEventKind::Pop => {
+                prompt.pop();
+
+                *pos -= 1;
             }
             UserEventKind::Search => {
                 macro_rules! info_first_ten {
@@ -693,6 +693,12 @@ impl State {
                 info_first_ten!("filter_buf_pre_searching");
                 constants.filter_with(&prompt, filter_buf)?;
                 info_first_ten!("filter_buf_post_searching");
+
+                *selected = Selection::default();
+
+                if pos.is_list() {
+                    *pos = Position::new_list(0);
+                }
             }
 
             // NOTE: toggles all constants because we are either (1) outside select mode, or (2)
@@ -722,6 +728,7 @@ impl State {
             // there, we can also update the state and provide a minimal report message. I am
             // hesitant to make the main drawing and update routines in the rendering loop be run in
             // parallel because that would make sequential reaction to events harder to implement.
+            // TODO: test this out.
             UserEventKind::Effect => constants.effect_changes().await?,
             UserEventKind::Clear if !prompt.is_empty() => {
                 prompt.clear();
@@ -732,7 +739,7 @@ impl State {
 
                 constants.filter_with(".*", filter_buf)?;
             }
-            UserEventKind::Switch => match mode.kind() {
+            UserEventKind::Switch if !filter_buf.is_empty() => match mode.kind() {
                 ModeKind::Insert => {
                     *mode = Mode::new_normal();
 
@@ -813,39 +820,41 @@ impl State {
                         }
                     }
 
+                    // TODO: the below two actions for navigation in normal mode while in the prompt
+                    // are going to require a refactor once backspace support is added.
+
                     // NOTE: which one of the row or column should be modified is already handled in
                     // the corresponding impl of `Add` and `Sub` for `Position`. This allows us to
                     // converge events into two basic operations over an x-axis and a y-axis.
-                    ModeActionKind::GoLeft | ModeActionKind::GoUp if mode.is_normal() => {
-                        if cfg!(debug_assertions) && pos.is_prompt() {
-                            debug_assert_matches!(
-                                usize::from(pos.into_prompt()).cmp(&prompt.len()),
-                                Ordering::Less | Ordering::Equal,
-                                "prompt position in terminal grid should always be less than the \
-                                 prompt string length"
-                            );
-                        }
+                    ModeActionKind::GoLeft if mode.is_normal() && pos.is_prompt() => {
+                        debug_assert_matches!(
+                            usize::from(pos.into_prompt()).cmp(&prompt.len()),
+                            Ordering::Less | Ordering::Equal,
+                            "prompt position in terminal grid should always be less than or equal \
+                             to the prompt string length"
+                        );
 
                         *pos -= 1;
                     }
-                    ModeActionKind::GoRight | ModeActionKind::GoDown if mode.is_normal() => {
-                        if pos.is_prompt() {
-                            debug_assert_matches!(
-                                usize::from(pos.into_prompt()).cmp(&prompt.len()),
-                                Ordering::Less | Ordering::Equal,
-                                "prompt position in terminal grid should always be less than the \
-                                 prompt string length"
-                            );
+                    ModeActionKind::GoRight if mode.is_normal() && pos.is_prompt() => {
+                        debug_assert_matches!(
+                            usize::from(pos.into_prompt()).cmp(&prompt.len()),
+                            Ordering::Less | Ordering::Equal,
+                            "prompt position in terminal grid should always be less than or equal \
+                             to the prompt string length"
+                        );
 
-                            // NOTE: this ensures moving right does not move beyond what's written
-                            // in the prompt.
-                            if usize::from(pos.into_prompt()) == prompt.len().saturating_sub(1) {
-                                return Ok(());
-                            }
+                        // NOTE: this ensures moving right does moves only one character past the
+                        // last character written in the prompt, such that entering insert mode can
+                        // remove that one character.
+                        if usize::from(pos.into_prompt()) == prompt.len() {
+                            return Ok(());
                         }
 
                         *pos += 1;
                     }
+                    ModeActionKind::GoLeft if mode.is_normal() && pos.is_list() => *pos -= 1,
+                    ModeActionKind::GoRight if mode.is_normal() && pos.is_list() => *pos += 1,
 
                     ModeActionKind::GoUp if mode.is_select() => {
                         *pos -= 1;
@@ -864,9 +873,12 @@ impl State {
                 }
             }
 
-            // NOTE: ignored cases include issuing a clear command without there being anything in
-            // the prompt, which also triggers a wildcard regex. We prefer not to call into that
-            // regex if not necessary (even if it gets cached past the first clear command.)
+            // NOTE: ignored cases include:
+            // + Issuing a clear command without there being anything in the prompt, which also
+            //   triggers a wildcard regex. We prefer not to call into that regex if not necessary
+            //   (even if it gets cached past the first clear command.)
+            // + Attempting to swap between modes when there are no results in the list of filtered
+            //   symbols.
             _ => (),
         }
 
@@ -916,6 +928,17 @@ impl State {
         print_prompt(&mut stdout, prompt)?;
         print_list(&mut stdout, &select_first_ten(filter_buf))?;
 
+        if filter_buf.is_empty() {
+            print_empty(&mut stdout)?;
+
+            // NOTE: this ensures that if we are in the list of constants, the finalizer
+            // routine that comes up next does not bother rendering the list of constants,
+            // for there's none.
+            if pos.is_list() {
+                pos.transition();
+            }
+        }
+
         match (mode.kind(), pos.kind()) {
             (ModeKind::Insert, PositionKind::Prompt) => {
                 finalize_insert_prompt(&mut stdout, pos.into_prompt())?;
@@ -949,6 +972,16 @@ fn select_first_ten(buf: &mut BorrowedContainer) -> impl Visit {
             10
         },
     )
+}
+
+fn print_empty(mut stdout: impl Write) -> anyhow::Result<()> {
+    crossterm::queue!(
+        stdout,
+        MoveToNextLine(1),
+        Print("(no constants matched the regex)"),
+        RestorePosition,
+    )
+    .map_err(Into::into)
 }
 
 #[tracing::instrument(skip_all, err(level = "info"))]
@@ -1353,6 +1386,7 @@ impl SubAssign<u16> for Position {
 impl Sub<u16> for Position {
     type Output = Self;
 
+    #[tracing::instrument(skip(rhs), ret)]
     fn sub(self, rhs: u16) -> Self::Output {
         let mut out = self;
         let Self { repr, row, col } = &mut out;
@@ -1394,6 +1428,7 @@ impl AddAssign<u16> for Position {
 impl Add<u16> for Position {
     type Output = Self;
 
+    #[tracing::instrument(skip(rhs), ret)]
     fn add(self, rhs: u16) -> Self::Output {
         let mut out = self;
         let Self { repr, row, col } = &mut out;
@@ -1475,6 +1510,7 @@ impl Mode {
                 UserEvent::new_text(event.into_text())
             }
             (ModeKind::Insert, RawUserEventKind::Space) => UserEvent::new_text(' '),
+            (ModeKind::Insert, RawUserEventKind::Backspace) => UserEvent::new_pop(),
 
             // Normal mode.
             (ModeKind::Normal, RawUserEventKind::PlainText)
@@ -1537,16 +1573,21 @@ repr! {
     UserEventRepr => {
         // Corresponds with plain text user input at the prompt.
         TextualInput(char),
-        // Is triggered with the return key and should start a filtering event with the current
-        // contents of the prompt.
+        // Corresponds with having pressed the backspace key while in insert
+        // mode to remove the character currently under the cursor.
+        Pop,
+        // Is triggered with the return key and should start a filtering event
+        // with the current contents of the prompt.
         Search,
-        // Is triggered with the space key and should toggle all selected constants' state to
-        // "deprecated", unless all selected constants are already deprecated, in which case it
-        // should undeprecate them.
+        // Is triggered with the space key and should toggle all selected
+        // constants' state to "deprecated", unless all selected constants are
+        // already deprecated, in which case it should undeprecate them.
         Toggle,
-        // Is triggered with the shift + return combo and should effect the changes to disk.
+        // Is triggered with the shift + return combo and should effect the
+        // changes to disk.
         Effect,
-        // Is triggered with the escape key and should clear the currently input regex.
+        // Is triggered with the escape key and should clear the currently input
+        // regex.
         Clear,
         // Is triggered when the user switches between modes with the TAB key.
         Switch,
@@ -1560,6 +1601,7 @@ repr! {
 impl UserEvent {
     repr_impl! { UserEventRepr => {
         new_text, is_text, into_text, text, text_mut => TextualInput(c: char);
+        new_pop, is_pop, _d, _d, _d => Pop;
         new_action, is_action, into_action, action, action_mut => ModeAction(action: ModeAction);
         new_search, is_search, _d, _d, _d => Search;
         new_toggle, is_toggle, _d, _d, _d => Toggle;
@@ -1639,6 +1681,7 @@ repr! {
         ShiftReturn,
         Escape,
         Tab,
+        Backspace,
     }
     #[derive(Debug, Clone, Copy)]
     RawUserEvent
@@ -1652,6 +1695,7 @@ impl RawUserEvent {
         new_sret, is_sret, _d, _d, _d => ShiftReturn;
         new_esc, is_esc, _d, _d, _d => Escape;
         new_tab, is_tab, _d, _d, _d => Tab;
+        new_backspace, is_backspace, _d, _d, _d => Backspace;
     }}
 }
 
@@ -1730,15 +1774,18 @@ async fn handle_input(channel: UnboundedSender<RawUserEvent>) -> anyhow::Result<
                 modifiers: KeyModifiers::NONE,
                 ..
             }) => _ = channel.send(RawUserEvent::new_tab()),
-
-            // TODO: handle backspace key for character removal.
+            Event::Key(KeyEvent {
+                code: KeyCode::Backspace,
+                modifiers: KeyModifiers::NONE,
+                ..
+            }) => _ = channel.send(RawUserEvent::new_backspace()),
 
             // The termination event, which should break out of the loop and drop the producer end
             // of the channel to have the receiver end indicate termination to the task managing it.
-            // This tries to replicate getting sent SIGINT or EOF, which are likely the most common
-            // ways of triggering relatively smooth termination in the absence of an explicit
-            // mechanism to do so. Such control sequences/signals are not available through the
-            // keyboard in raw mode.
+            // NOTE: this tries to replicate getting sent SIGINT or EOF, which are likely the most
+            // common ways of triggering relatively smooth termination in the absence of an explicit
+            // mechanism to do so in the program. Such control sequences/signals are not available
+            // when the terminal emulator is operating in raw mode.
             Event::Key(KeyEvent {
                 code: KeyCode::Char('c' | 'd'),
                 modifiers: KeyModifiers::CONTROL,
