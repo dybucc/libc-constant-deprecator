@@ -1,9 +1,11 @@
 use std::{
-    ops::{ControlFlow, Range},
+    ops::{Bound, ControlFlow, IntoBounds, Range, Try},
     sync::{Arc, Weak},
 };
 
-use crate::{Const, Sealed, sealed_impl};
+use tracing::info;
+
+use crate::{Const, Sealed};
 
 /// Represents a borrowed view into multiple segments of a [`ConstContainer`] as
 /// a single, contiguous container of its own.
@@ -71,25 +73,29 @@ pub trait Indexer<T>: Sealed {
     fn eval(self) -> T;
 }
 
-sealed_impl! { for Range<usize>, &Range<usize>, &mut Range<usize>; }
+impl<I: Into<usize>> Sealed for Range<I> {}
+
+impl<I: Into<usize>> Sealed for &Range<I> {}
+
+impl<I: Into<usize>> Sealed for &mut Range<I> {}
 
 // TODO: if time allows, write a macro to get rid of the following repetitive
 // implementations.
 
-impl Indexer<Range<usize>> for Range<usize> {
-    fn eval(self) -> Range<usize> {
+impl<I: Into<usize>> Indexer<Range<I>> for Range<I> {
+    fn eval(self) -> Range<I> {
         self
     }
 }
 
-impl Indexer<Range<usize>> for &Range<usize> {
-    fn eval(self) -> Range<usize> {
+impl<I: Into<usize> + Clone> Indexer<Range<I>> for &Range<I> {
+    fn eval(self) -> Range<I> {
         self.clone()
     }
 }
 
-impl Indexer<Range<usize>> for &mut Range<usize> {
-    fn eval(self) -> Range<usize> {
+impl<I: Into<usize> + Clone> Indexer<Range<I>> for &mut Range<I> {
+    fn eval(self) -> Range<I> {
         self.clone()
     }
 }
@@ -128,11 +134,14 @@ impl BorrowedContainer {
     /// This is useful when requiring multiple subsequent levels of detail into
     /// the same overarching `ConstContainer`, without giving up on any of the
     /// intermediate, borrowed views.
-    pub fn select(&mut self, range: impl Indexer<Range<usize>>) -> BorrowedSubset<'_> {
+    pub fn select<I: Into<usize>>(&mut self, range: impl Indexer<Range<I>>) -> BorrowedSubset<'_> {
         let Self { source, init_state } = self;
-        let selected = range.eval();
+        let (start, end) = range.eval().into_bounds();
 
-        BorrowedSubset::new(&mut source[selected.clone()], &init_state[selected])
+        let start = start.map(Into::into);
+        let end = end.map(Into::into);
+
+        BorrowedSubset::new(&mut source[(start, end)], &init_state[(start, end)])
     }
 }
 
@@ -154,9 +163,91 @@ pub trait Visit: Sealed {
     /// actual iterator, and only provides a temporary, in-place view with a
     /// closure that can capture callsite state.
     fn visit<B>(&self, visitor: impl FnMut(&Const) -> ControlFlow<B, ()>) -> Option<B>;
+
+    /// Provided an index into the collection of symbols being traversed, this
+    /// routine attempts to find it and perform some operation on it.
+    fn find_indexed<T>(&self, idx: impl Into<usize>, mut f: impl FnMut(&Const) -> T) -> Option<T> {
+        let mut counter = 0;
+        let idx = idx.into();
+
+        self.visit(|constant| {
+            if counter == idx {
+                return ControlFlow::Break(f(constant));
+            }
+
+            counter += 1;
+
+            ControlFlow::Continue(())
+        })
+    }
+
+    /// Provided an identifier, this routine traverses the collection of symbols
+    /// attempting to find some symbol that matches such identifier, and
+    /// provides access to it.
+    fn find_named<T>(&self, sym: impl AsRef<str>, mut f: impl FnMut(&Const) -> T) -> Option<T> {
+        self.visit(|constant| {
+            if *constant.ident() == sym {
+                return ControlFlow::Break(f(constant));
+            }
+
+            ControlFlow::Continue(())
+        })
+    }
+
+    /// Provided a range into the collection being traversed, this routine
+    /// allows running a closure over the set of constants whose traversal index
+    /// is within such range.
+    fn select<T, I: Into<usize>, R: Try<Output = (), Residual = T>>(
+        &self,
+        range: impl Indexer<Range<I>>,
+        mut f: impl FnMut(&Const) -> R,
+    ) -> Option<T> {
+        let (start, end) = range.eval().into_bounds();
+        let start = start.map(Into::into);
+        let end = end.map(Into::into);
+
+        let mut counter = 0;
+
+        self.visit(move |constant| {
+            if counter < {
+                let Bound::Included(start) = start else {
+                    panic!("start bound is always included below in the considered range")
+                };
+
+                info!(contant_in_bounds = false);
+
+                start
+            } {
+                counter += 1;
+
+                return ControlFlow::Continue(());
+            } else if counter == {
+                let Bound::Excluded(end) = end else {
+                    panic!("end bound is alwasy excluded above in the considered range");
+                };
+
+                end
+            } {
+                return ControlFlow::Break(None);
+            }
+
+            info!(contant_in_bounds = true);
+
+            if let ControlFlow::Break(res) = f(constant).branch() {
+                return ControlFlow::Break(res.into());
+            }
+
+            counter += 1;
+
+            ControlFlow::Continue(())
+        })
+        .flatten()
+    }
 }
 
-sealed_impl! { for BorrowedSubset<'_>, BorrowedContainer; }
+impl Sealed for BorrowedContainer {}
+
+impl Sealed for BorrowedSubset<'_> {}
 
 macro_rules! visit_impl {
     (@body) => {

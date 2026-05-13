@@ -3,7 +3,7 @@
 //!
 //! It is most useful when paired with the accompanying binary.
 
-#![feature(iter_collect_into, bool_to_result)]
+#![feature(iter_collect_into, bool_to_result, range_into_bounds, try_trait_v2)]
 
 mod constant;
 mod constant_container;
@@ -63,5 +63,4 @@ macro_rules! decl {
 
 decl! {
     use deprecate;
-    use sealed_impl;
 }

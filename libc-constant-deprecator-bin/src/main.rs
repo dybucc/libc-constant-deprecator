@@ -1,4 +1,4 @@
-#![feature(range_into_bounds, try_blocks)]
+#![feature(try_blocks)]
 
 use std::{
     borrow::Borrow,
@@ -7,7 +7,7 @@ use std::{
     fmt::{self, Debug, Display, Formatter},
     fs::File,
     io::{self as std_io, BufWriter as StdBufWriter, Stdout, Write},
-    ops::{Add, AddAssign, Bound, ControlFlow, IntoBounds, Range, RangeBounds, Sub, SubAssign},
+    ops::{Add, AddAssign, Bound, ControlFlow, Range, RangeBounds, Sub, SubAssign},
     path::PathBuf,
     sync::{LazyLock, Mutex as StdMutex, OnceLock},
     time::Duration,
@@ -887,7 +887,7 @@ impl State {
     }
 
     #[tracing::instrument(skip_all, err(level = "info"))]
-    fn draw(&self, mut stdout: impl Write) -> anyhow::Result<()> {
+    fn draw(&mut self, mut stdout: impl Write) -> anyhow::Result<()> {
         let Self {
             mode,
             filter_buf,
@@ -914,7 +914,7 @@ impl State {
 
         print_reset(&mut stdout)?;
         print_prompt(&mut stdout, prompt)?;
-        print_list(&mut stdout, filter_buf)?;
+        print_list(&mut stdout, &select_first_ten(filter_buf))?;
 
         match (mode.kind(), pos.kind()) {
             (ModeKind::Insert, PositionKind::Prompt) => {
@@ -924,7 +924,7 @@ impl State {
                 finalize_normal_prompt(&mut stdout, pos.into_prompt())?;
             }
             (ModeKind::Normal, PositionKind::List) => {
-                finalize_normal_list(&mut stdout, pos.into_list(), filter_buf)?;
+                finalize_normal_list(&mut stdout, pos.into_list(), &select_first_ten(filter_buf))?;
             }
             (ModeKind::Select, PositionKind::List) => {
                 finalize_select_list(&mut stdout, pos.into_list(), filter_buf, selected)?;
@@ -937,6 +937,18 @@ impl State {
 
         stdout.flush().map_err(Into::into)
     }
+}
+
+fn select_first_ten(buf: &mut BorrowedContainer) -> impl Visit {
+    buf.select(
+        0..if let len = buf.len()
+            && len < 10
+        {
+            len
+        } else {
+            10
+        },
+    )
 }
 
 #[tracing::instrument(skip_all, err(level = "info"))]
@@ -965,26 +977,14 @@ fn print_prompt(mut stdout: impl Write, prompt: impl AsRef<str>) -> anyhow::Resu
 fn print_list(mut stdout: impl Write, list: &impl Visit) -> anyhow::Result<()> {
     crossterm::queue!(stdout, MoveToNextLine(1))?;
 
-    let mut line_counter = 0;
-
     list.visit(|constant| {
-        if line_counter == 10 {
-            return ControlFlow::Break(None);
-        }
-
         if let Err(err) = try {
             crossterm::queue!(
                 stdout,
                 StylizedSymbol::from_constant(constant).into_command(),
             )?;
 
-            if line_counter == 9 {
-                crossterm::queue!(stdout, RestorePosition)?;
-            } else {
-                crossterm::queue!(stdout, MoveToNextLine(1))?;
-            }
-
-            line_counter += 1;
+            crossterm::queue!(stdout, MoveToNextLine(1))?;
         } {
             ControlFlow::Break(err.into())
         } else {
@@ -993,7 +993,9 @@ fn print_list(mut stdout: impl Write, list: &impl Visit) -> anyhow::Result<()> {
     })
     .flatten()
     .map(Into::into)
-    .map_or_else(|| anyhow::Ok(()), Err)
+    .map_or_else(|| anyhow::Ok(()), Err)?;
+
+    crossterm::queue!(stdout, RestorePosition).map_err(Into::into)
 }
 
 #[tracing::instrument(skip_all, err(level = "info"))]
@@ -1018,26 +1020,14 @@ fn finalize_normal_prompt(mut stdout: impl Write, off: u16) -> anyhow::Result<()
 // `print_list` routine for the same scrollign purposes.
 #[tracing::instrument(skip_all, err(level = "info"))]
 fn finalize_normal_list(mut stdout: impl Write, off: u16, list: &impl Visit) -> anyhow::Result<()> {
-    let mut line_counter = 0;
-
     crossterm::queue!(
         stdout,
         MoveToNextLine(1 + off),
-        list.visit(|constant| {
-            if line_counter != off {
-                line_counter += 1;
-
-                return ControlFlow::Continue(());
-            }
-
-            ControlFlow::Break(
-                StylizedSymbol::from_constant(constant)
-                    .for_ident(ContentStyle::new().bold().underlined())
-                    .for_mark(ContentStyle::new().bold().underlined()),
-            )
-        })
-        .expect("offset into visual list of symbols was not within bounds of inner list")
-        .into_command(),
+        list.find_indexed(off, |constant| StylizedSymbol::from_constant(constant)
+            .for_ident(ContentStyle::new().bold().underlined())
+            .for_mark(ContentStyle::new().bold().underlined()))
+            .expect("offset into visual list of symbols was not within bounds of inner list")
+            .into_command(),
     )
     .map_err(Into::into)
 }
@@ -1052,7 +1042,6 @@ fn finalize_select_list(
     list: &impl Visit,
     selected: &Selection,
 ) -> anyhow::Result<()> {
-    let mut line_counter = 0;
     let Range { start, end } = *selected.range();
 
     info!(selection_start = start, selection_end = end);
@@ -1062,45 +1051,32 @@ fn finalize_select_list(
     // prompt (1 row.)
     crossterm::queue!(stdout, MoveToNextLine(1 + start))?;
 
-    list.visit(|constant| {
-        if line_counter < start {
-            line_counter += 1;
-
-            info!(constant_pre_bounds = true);
-
-            return ControlFlow::Continue(());
-        } else if line_counter == end {
-            return ControlFlow::Break(Ok(()));
-        }
-
-        info!(constant_in_bounds = true);
-
-        let cmd = StylizedSymbol::from_constant(constant).dim();
-
-        match try {
-            crossterm::queue!(
-                stdout,
-                if line_counter == off {
-                    cmd.for_mark(ContentStyle::new().bold().underlined())
-                } else {
-                    cmd
-                }
+    list.select(selected.range(), |constant| {
+        crossterm::queue!(
+            stdout,
+            StylizedSymbol::from_constant(constant)
+                .for_mark(ContentStyle::new().bold().underlined())
+                .dim()
                 .into_command(),
-            )?;
-
-            if line_counter < 9 {
-                crossterm::queue!(stdout, MoveToNextLine(1))?;
-            }
-        } {
-            Ok(()) => {
-                line_counter += 1;
-
-                ControlFlow::Continue(())
-            }
-            Err(err) => ControlFlow::Break(Err(err)),
-        }
+            MoveToNextLine(1),
+        )
     })
-    .unwrap_or(Ok(()))?;
+    .map_or_else(|| anyhow::Ok(()), |res| res.map(|_| ()).map_err(Into::into))?;
+
+    list.find_indexed(off, |constant| {
+        crossterm::queue!(
+            stdout,
+            RestorePosition,
+            MoveToNextLine(1 + off),
+            StylizedSymbol::from_constant(constant)
+                .for_mark(ContentStyle::new().bold().underlined())
+                .dim()
+                .bold()
+                .underlined()
+                .into_command(),
+        )
+    })
+    .map_or_else(|| anyhow::Ok(()), |res| res.map_err(Into::into))?;
 
     crossterm::queue!(stdout, RestorePosition, MoveToNextLine(1 + off),).map_err(Into::into)
 }
@@ -1264,20 +1240,7 @@ style_impl! {}
 
 #[tracing::instrument(skip_all)]
 fn toggle_in_select(filter_buf: &mut BorrowedContainer, selected: &Selection) {
-    let mut selected = filter_buf.select(selected.map_ref(|range| {
-        let (Bound::Included(start), Bound::Excluded(end)) = range.range().clone().into_bounds()
-        else {
-            unreachable!(
-                "The range under consideration is always bounded inclusively below and \
-                 exclusively above."
-            );
-        };
-
-        Range {
-            start: usize::from(start),
-            end: usize::from(end),
-        }
-    }));
+    let mut selected = filter_buf.select(selected.range());
 
     if all_deprecated(&selected) {
         info!(toggle_type = "undeprecation");
