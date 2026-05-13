@@ -7,7 +7,7 @@ use std::{
     fmt::{self, Debug, Display, Formatter},
     fs::File,
     io::{self as std_io, BufWriter as StdBufWriter, Stdout, Write},
-    ops::{Add, AddAssign, Bound, ControlFlow, Range, RangeBounds, Sub, SubAssign},
+    ops::{Bound, ControlFlow, Range, RangeBounds},
     path::PathBuf,
     sync::{LazyLock, Mutex as StdMutex, OnceLock},
     time::Duration,
@@ -72,7 +72,7 @@ macro_rules! repr {
         $wrap:tt // The wrapper type around the internal representation.
         // Which may or may not have fields other than the internal `repr` we generate it with.
         $({
-            $($wrap_field:tt: $wrap_type:ty),+
+            $($wrap_field:tt: $wrap_type:ty),+ $(,)?
         })?
     ) => {
         // NOTE: the treatment of field variants is not exhaustive, and it could
@@ -671,7 +671,7 @@ impl State {
                     prompt.insert(current_col, event.into_text());
                 }
 
-                *pos += 1;
+                pos.advance(filter_buf.len());
             }
             UserEventKind::Pop => {
                 let current_col = usize::from(pos.into_prompt());
@@ -682,7 +682,7 @@ impl State {
                     prompt.remove(current_col);
                 }
 
-                *pos -= 1;
+                pos.retract();
             }
             UserEventKind::Search => {
                 macro_rules! info_first_ten {
@@ -775,10 +775,7 @@ impl State {
 
                         match (mode.kind(), new_mode.kind()) {
                             // Insert to normal mode.
-                            (ModeKind::Insert, ModeKind::Normal) => {
-                                *mode = new_mode;
-                                *pos -= 1;
-                            }
+                            (ModeKind::Insert, ModeKind::Normal) => *mode = new_mode,
 
                             // Normal mode to other modes.
                             (ModeKind::Normal, ModeKind::Insert) => {
@@ -847,7 +844,7 @@ impl State {
                              to the prompt string length"
                         );
 
-                        *pos -= 1;
+                        pos.retract();
                     }
                     ModeActionKind::GoRight if mode.is_normal() && pos.is_prompt() => {
                         debug_assert_matches!(
@@ -864,19 +861,21 @@ impl State {
                             return Ok(());
                         }
 
-                        *pos += 1;
+                        pos.advance(filter_buf.len());
                     }
 
-                    ModeActionKind::GoUp if mode.is_normal() && pos.is_list() => *pos -= 1,
-                    ModeActionKind::GoDown if mode.is_normal() && pos.is_list() => *pos += 1,
+                    ModeActionKind::GoUp if mode.is_normal() && pos.is_list() => pos.retract(),
+                    ModeActionKind::GoDown if mode.is_normal() && pos.is_list() => {
+                        pos.advance(filter_buf.len());
+                    }
 
                     ModeActionKind::GoUp if mode.is_select() => {
-                        *pos -= 1;
+                        pos.retract();
 
                         selected.extend(Dir::new_up(), pos);
                     }
                     ModeActionKind::GoDown if mode.is_select() => {
-                        *pos += 1;
+                        pos.advance(filter_buf.len());
 
                         selected.extend(Dir::new_down(), pos);
                     }
@@ -964,7 +963,12 @@ impl State {
                 finalize_normal_list(&mut stdout, pos.into_list(), &select_first_ten(filter_buf))?;
             }
             (ModeKind::Select, PositionKind::List) => {
-                finalize_select_list(&mut stdout, pos.into_list(), filter_buf, selected)?;
+                finalize_select_list(
+                    &mut stdout,
+                    pos.into_list(),
+                    &select_first_ten(filter_buf),
+                    selected,
+                )?;
             }
 
             // NOTE: ignored cases include being in insert mode while in the list, and being in
@@ -1045,13 +1049,13 @@ fn print_list(mut stdout: impl Write, list: &impl Visit) -> anyhow::Result<()> {
     crossterm::queue!(stdout, RestorePosition).map_err(Into::into)
 }
 
-#[tracing::instrument(skip_all, err(level = "info"))]
+#[tracing::instrument(skip(stdout), err(level = "info"))]
 fn finalize_insert_prompt(mut stdout: impl Write, off: u16) -> anyhow::Result<()> {
     crossterm::queue!(stdout, MoveRight(2 + off), SetCursorStyle::SteadyBar, Show)
         .map_err(Into::into)
 }
 
-#[tracing::instrument(skip_all, err(level = "info"))]
+#[tracing::instrument(skip(stdout), err(level = "info"))]
 fn finalize_normal_prompt(mut stdout: impl Write, off: u16) -> anyhow::Result<()> {
     crossterm::queue!(
         stdout,
@@ -1065,7 +1069,7 @@ fn finalize_normal_prompt(mut stdout: impl Write, off: u16) -> anyhow::Result<()
 // TODO: this is going to need a refactor once scrolling is implemented but this
 // particular routine should likely benefit from the refactor in the
 // `print_list` routine for the same scrollign purposes.
-#[tracing::instrument(skip_all, err(level = "info"))]
+#[tracing::instrument(skip(stdout, list), err(level = "info"))]
 fn finalize_normal_list(mut stdout: impl Write, off: u16, list: &impl Visit) -> anyhow::Result<()> {
     // NOTE: we have to keep this declaration outside the macro invocation because
     // the result that we propagate has as an `Err` variant a `anyhow::Error`, which
@@ -1089,7 +1093,7 @@ fn finalize_normal_list(mut stdout: impl Write, off: u16, list: &impl Visit) -> 
 // TODO: this is going to need a refactor once scrolling is implemented but this
 // particular routine should likely benefit from the refactor in the
 // `print_list` routine for the same scrollign purposes.
-#[tracing::instrument(skip_all, err(level = "info"))]
+#[tracing::instrument(skip(stdout, list), err(level = "info"))]
 fn finalize_select_list(
     mut stdout: impl Write,
     off: u16,
@@ -1346,7 +1350,73 @@ repr! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
     Position {
         row: u16,
-        col: u16
+        col: u16,
+    }
+}
+
+impl Position {
+    #[expect(
+        clippy::match_wildcard_for_single_variants,
+        reason = "The note besdes the wildcard case would quite possibly not be read if it \
+                  weren't a wildcard."
+    )]
+    pub(crate) fn retract(&mut self) {
+        let Self { repr, row, col } = self;
+
+        match repr {
+            PositionRepr::Prompt(prompt_col) => {
+                *prompt_col = prompt_col.saturating_sub(1);
+                *col = col.saturating_sub(1);
+            }
+            PositionRepr::List(list_row) if let Some(res) = list_row.checked_sub(1) => {
+                *list_row = res;
+                *row -= 1;
+            }
+
+            // NOTE: ignored cases include contexts where the user is found to be at the start of
+            // the list or at the very left of the prompt.
+            _ => (),
+        }
+    }
+
+    pub(crate) fn advance(&mut self, element_count: usize) {
+        let Self { repr, row, col } = self;
+
+        // NOTE: this adjusts the maximum allowed number of elements in the list such
+        // that if there are fewer than 10 elements, we properly handle that situation.
+        let limit = if element_count < 10 {
+            element_count
+        } else {
+            10
+        };
+
+        // NOTE: we map the terminal dimensions from 0-indexed space to 1-indexed space,
+        // such that we keep magntidues in the operations following consitent (the
+        // internal positions and offsets are 0-indexed.)
+        let (max_col, max_row) = terminal::size()
+            .map(|(max_col, max_row)| (max_col - 1, max_row - 1))
+            .unwrap();
+
+        match repr {
+            PositionRepr::Prompt(prompt_col)
+                if let res = *prompt_col + 1
+                    && res < max_col =>
+            {
+                *prompt_col = res;
+                *col += 1;
+            }
+            PositionRepr::List(list_row)
+                if let res = *list_row + 1
+                    && usize::from(res) < limit
+                    && res < max_row =>
+            {
+                *list_row = res;
+                *row += 1;
+            }
+
+            // NOTE: ignored cases include those were the
+            _ => (),
+        }
     }
 }
 
@@ -1390,121 +1460,17 @@ impl Position {
     }}
 }
 
+impl Default for Position {
+    fn default() -> Self {
+        Self::new_prompt(0)
+    }
+}
+
 // NOTE: this does not seem to be implementable through an automatically derived
 // `Default` on `PositionRepr` so we must implement it manually.
 impl Default for PositionRepr {
     fn default() -> Self {
         Self::Prompt(0)
-    }
-}
-
-impl SubAssign<u16> for Position {
-    fn sub_assign(&mut self, rhs: u16) {
-        *self = *self - rhs;
-    }
-}
-
-impl Sub<u16> for Position {
-    type Output = Self;
-
-    #[tracing::instrument(skip(rhs), ret)]
-    fn sub(self, rhs: u16) -> Self::Output {
-        let mut out = self;
-        let Self { repr, row, col } = &mut out;
-
-        // NOTE: unlike in the impl of `Add<u16>`, we don't require performing bounds
-        // checks here because it holds that `prompt_col` already starts at 0. The same
-        // applies for `list_row`, which even though not constructed through a `Default`
-        // impl, behaves the same way when `transition()`ing between layout containers.
-        //
-        // The only special casing we need here is in the case we hit the very first row
-        // of the list, where the raw row index must be handled with care so as to avoid
-        // subtracting from it. This is because this index is not in sycn with the
-        // offset that `list_row` represents.
-        match repr {
-            PositionRepr::Prompt(prompt_col) => {
-                *prompt_col = prompt_col.saturating_sub(rhs);
-                *col = col.saturating_sub(rhs);
-            }
-            PositionRepr::List(list_row) if let Some(res) = list_row.checked_sub(rhs) => {
-                *list_row = res;
-                *row = row.saturating_sub(rhs);
-            }
-            PositionRepr::List(list_row) => {
-                *list_row = 0;
-                *row = PROMPT_COORD.get().map(|(_, row)| row).copied().unwrap();
-            }
-        }
-
-        out
-    }
-}
-
-impl AddAssign<u16> for Position {
-    fn add_assign(&mut self, rhs: u16) {
-        *self = *self + rhs;
-    }
-}
-
-impl Add<u16> for Position {
-    type Output = Self;
-
-    #[tracing::instrument(skip(rhs), ret)]
-    fn add(self, rhs: u16) -> Self::Output {
-        let mut out = self;
-        let Self { repr, row, col } = &mut out;
-
-        // NOTE: we map the terminal grid dimensions to go from 1-indexed to 0-indexed.
-        // It holds that there will never be wrapping behavior because the smallest
-        // value returned by `terminal::size()` is `(1, 1)`, corresponding with the
-        // topmost left grid cell.
-        let (max_col, max_row) = terminal::size()
-            .map(|(max_col, max_row)| (max_col - 1, max_row - 1))
-            .unwrap();
-
-        // NOTE: we intentionally implement the operation with saturating arithmetic
-        // taking as limits the terminal size as otherwise we'd have to deal with that
-        // at callsite.
-        //
-        // We also intentionally use the logical numerical limit expressed as a
-        // 0-indexed number instead of checking for a relation of strict `less than`
-        // w.r.t. to the analogous, 1-indexed limit, because we prefer to keep it
-        // consistent with having mapped the terminal grid dimensions to 0-indexed space
-        // above.
-        match repr {
-            PositionRepr::Prompt(prompt_col) => {
-                if *prompt_col + rhs <= max_col {
-                    *prompt_col += rhs;
-                    *col += rhs;
-                } else {
-                    *prompt_col = max_col;
-                    *col = max_col;
-                }
-            }
-            PositionRepr::List(list_row) => {
-                if *list_row + rhs <= 9 {
-                    *list_row += rhs;
-                    *row += rhs;
-                } else {
-                    *list_row = 9;
-                    *row = if let res = row.saturating_add(rhs)
-                        && res <= max_row
-                    {
-                        res
-                    } else {
-                        max_row
-                    };
-                }
-            }
-        }
-
-        out
-    }
-}
-
-impl Default for Position {
-    fn default() -> Self {
-        Self::new_prompt(0)
     }
 }
 

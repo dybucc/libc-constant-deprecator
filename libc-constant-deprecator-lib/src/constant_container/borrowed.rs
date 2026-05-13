@@ -203,35 +203,27 @@ pub trait Visit: Sealed {
         mut f: impl FnMut(&Const) -> R,
     ) -> Option<T> {
         let (start, end) = range.eval().into_bounds();
-        let start = start.map(Into::into);
-        let end = end.map(Into::into);
+        let Bound::Included(start) = start.map(Into::into) else {
+            panic!("start bound is always included below in the considered range")
+        };
+        let Bound::Excluded(end) = end.map(Into::into) else {
+            panic!("end bound is alwasy excluded above in the considered range");
+        };
 
         let mut counter = 0;
 
         self.visit(move |constant| {
-            if counter < {
-                let Bound::Included(start) = start else {
-                    panic!("start bound is always included below in the considered range")
-                };
-
-                info!(contant_in_bounds = false);
-
-                start
-            } {
+            if counter < start {
                 counter += 1;
 
-                return ControlFlow::Continue(());
-            } else if counter == {
-                let Bound::Excluded(end) = end else {
-                    panic!("end bound is alwasy excluded above in the considered range");
-                };
+                info!(constant_in_bounds = false);
 
-                end
-            } {
+                return ControlFlow::Continue(());
+            } else if counter == end {
                 return ControlFlow::Break(None);
             }
 
-            info!(contant_in_bounds = true);
+            info!(constant_in_bounds = true);
 
             if let ControlFlow::Break(res) = f(constant).branch() {
                 return ControlFlow::Break(res.into());
