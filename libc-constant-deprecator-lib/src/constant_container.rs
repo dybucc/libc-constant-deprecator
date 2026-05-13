@@ -49,9 +49,13 @@ macro_rules! filter_impl {
     };
     (@body $it:tt => $self:expr, $re:expr, $iter:expr) => {
         let $crate::ConstContainer { inner, re_cache } = $self;
-        let re = $crate::constant_container::probe_re($re, re_cache)?;
+        let re = $crate::constant_container::probe_re(&$re, re_cache)?;
 
-        info!(?re);
+        // NOTE: when issuing a regex that matches all symbols, we prefer to
+        // keep the logs relatively clean and thus skip reporting those events.
+        if $re.as_ref() != ".*" {
+            info!(?re);
+        }
 
         $iter = inner
             .iter()
@@ -320,8 +324,6 @@ fn probe_re(
                 _ => unimplemented!("An unhandled case in the `regex::Error` type has appeared!"),
             })?,
         );
-
-        return Ok(cache.get(re.as_ref()).unwrap());
     }
 
     Ok(cache.get(re.as_ref()).unwrap())

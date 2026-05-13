@@ -13,6 +13,7 @@ use std::{
     time::Duration,
 };
 
+use anyhow::anyhow;
 use clap::Parser;
 use crossterm::{
     Command,
@@ -662,12 +663,24 @@ impl State {
 
         match event.kind() {
             UserEventKind::TextualInput => {
-                prompt.push(event.into_text());
+                let current_col = usize::from(pos.into_prompt());
+
+                if current_col == prompt.len() {
+                    prompt.push(event.into_text());
+                } else {
+                    prompt.insert(current_col, event.into_text());
+                }
 
                 *pos += 1;
             }
             UserEventKind::Pop => {
-                prompt.pop();
+                let current_col = usize::from(pos.into_prompt());
+
+                if current_col == prompt.len() {
+                    prompt.pop();
+                } else {
+                    prompt.remove(current_col);
+                }
 
                 *pos -= 1;
             }
@@ -853,8 +866,9 @@ impl State {
 
                         *pos += 1;
                     }
-                    ModeActionKind::GoLeft if mode.is_normal() && pos.is_list() => *pos -= 1,
-                    ModeActionKind::GoRight if mode.is_normal() && pos.is_list() => *pos += 1,
+
+                    ModeActionKind::GoUp if mode.is_normal() && pos.is_list() => *pos -= 1,
+                    ModeActionKind::GoDown if mode.is_normal() && pos.is_list() => *pos += 1,
 
                     ModeActionKind::GoUp if mode.is_select() => {
                         *pos -= 1;
@@ -1053,16 +1067,23 @@ fn finalize_normal_prompt(mut stdout: impl Write, off: u16) -> anyhow::Result<()
 // `print_list` routine for the same scrollign purposes.
 #[tracing::instrument(skip_all, err(level = "info"))]
 fn finalize_normal_list(mut stdout: impl Write, off: u16, list: &impl Visit) -> anyhow::Result<()> {
-    crossterm::queue!(
-        stdout,
-        MoveToNextLine(1 + off),
-        list.find_indexed(off, |constant| StylizedSymbol::from_constant(constant)
-            .for_ident(ContentStyle::new().bold().underlined())
-            .for_mark(ContentStyle::new().bold().underlined()))
-            .expect("offset into visual list of symbols was not within bounds of inner list")
-            .into_command(),
-    )
-    .map_err(Into::into)
+    // NOTE: we have to keep this declaration outside the macro invocation because
+    // the result that we propagate has as an `Err` variant a `anyhow::Error`, which
+    // is not convertible to the `std::io::Result` that the closure handled within
+    // the macro invocation uses (the command is issued within a call to `and_then`
+    // after having used the writer we pass in first (here `stdout`).)
+    let cmd = list
+        .find_indexed(off, |constant| {
+            StylizedSymbol::from_constant(constant)
+                .for_ident(ContentStyle::new().bold().underlined())
+                .for_mark(ContentStyle::new().bold().underlined())
+        })
+        .ok_or_else(|| {
+            anyhow!("offset into visual list of symbols was not within bounds of inner list")
+        })?
+        .into_command();
+
+    crossterm::queue!(stdout, MoveToNextLine(1 + off), cmd).map_err(Into::into)
 }
 
 // TODO: this is going to need a refactor once scrolling is implemented but this
