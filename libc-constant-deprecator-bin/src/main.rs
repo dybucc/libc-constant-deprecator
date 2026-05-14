@@ -1,15 +1,15 @@
-#![feature(try_blocks, unboxed_closures, async_fn_traits)]
+#![feature(try_blocks, async_fn_traits, unboxed_closures)]
 
 use std::{
-    borrow::{Borrow, Cow},
+    borrow::Borrow,
     cmp::Ordering,
     debug_assert_matches, env,
     fmt::{self, Debug, Display, Formatter},
     fs::File,
-    io::{self as std_io, BufWriter as StdBufWriter, Stdout, Write},
-    ops::{Bound, ControlFlow, Range, RangeBounds},
+    io::{self as std_io, BufWriter as StdBufWriter, Write},
+    ops::{Bound, ControlFlow, Deref, DerefMut, Range, RangeBounds},
     path::PathBuf,
-    sync::{LazyLock, Mutex as StdMutex, OnceLock},
+    sync::{Mutex as StdMutex, OnceLock},
     time::Duration,
 };
 
@@ -33,10 +33,7 @@ use libc_constant_deprecator_lib::{BorrowedContainer, Const, ConstContainer, Vis
 use proc_macro2::Ident;
 use tester_impl::defer_drm;
 use tokio::{
-    sync::{
-        Mutex,
-        mpsc::{self, UnboundedReceiver, UnboundedSender, error::TryRecvError},
-    },
+    sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
     task, time,
 };
 use tracing::{info, info_span};
@@ -362,15 +359,33 @@ impl Spinner {
         *self
     }
 
+    // NOTE: I tried getting this to work with a `Cow<'static, str>` but I failed.
+    // I'm likely missing some subtleties of the type system, and more specifically,
+    // something with subtyping, as the issue is in that just declaring the generic
+    // type parameter for `F` to contain a `'static` in the `Cow` is not general
+    // enough for the type system. Apparently, it requires that the lifetime
+    // associated with `Cow` is valid for all possible lifetimes. I then tried to
+    // replace the `'static` in `Cow` with a higher-ranked trait bound that
+    // satisfied the type system, but that for some reason, complained at call site
+    // that the parmater we are getting into the routine escapes it whenever it is
+    // that we call `send` on such parameter (the unbounded transmitter.) For the
+    // time being, I have gone with a slightly less efficient implementation, but
+    // one that at least type checks.
     #[tracing::instrument(skip_all)]
-    pub(crate) async fn run_while<T: Send>(
-        mut stdout: impl Write,
-        f: impl AsyncFnOnce(&mut UnboundedSender<Cow<'static, str>>) -> anyhow::Result<T>,
-    ) -> anyhow::Result<T> {
-        let (tx, rx) = mpsc::unbounded_channel();
+    pub(crate) async fn run_while<
+        T: Send,
+        F: AsyncFnOnce(UnboundedSender<String>) -> anyhow::Result<T>,
+    >(
+        mut stdout: impl Write + Send,
+        f: F,
+    ) -> anyhow::Result<T>
+    where
+        <F as AsyncFnOnce<(UnboundedSender<String>,)>>::CallOnceFuture: Send,
+    {
+        let (tx, mut rx) = mpsc::unbounded_channel();
 
-        let worker = task::spawn(f(&mut tx));
-        let spinner = task::spawn(async move {
+        let worker = f(tx);
+        let spinner = async move {
             info!("started spinner routine");
 
             let mut spinner = Self::default();
@@ -401,11 +416,11 @@ impl Spinner {
             info!("finished spinner task");
 
             anyhow::Ok(())
-        });
+        };
 
         future::try_join(worker, spinner)
             .await
-            .map(|(worker_res, spinner_res)| spinner_res.and(worker_res))?
+            .map(|(worker_res, ())| worker_res)
     }
 }
 
@@ -457,15 +472,25 @@ repr! {
     MsgRepr => {
         EffectingChnages,
         FinishedChanges,
+        None,
     }
     #[derive(Debug, Clone, Copy)]
     Msg
 }
 
 impl Msg {
+    fn stringified(self) -> Option<&'static str> {
+        Some(match self.repr {
+            MsgRepr::EffectingChnages => "Effecting changes to disk",
+            MsgRepr::FinishedChanges => "Finished effecting changes to disk",
+            MsgRepr::None => return None,
+        })
+    }
+
     repr_impl! { MsgRepr => {
         effecting_changes, is_effecting, _d, d, _d => EffectingChnages;
         finished, is_finished, _d, d, _d => FinishedChanges;
+        none, is_none, _d, d, _d => None;
     }}
 }
 
@@ -782,6 +807,8 @@ impl State {
             ..
         } = self;
 
+        effects.send(Msg::none())?;
+
         let Some(event) = event else {
             return Ok(());
         };
@@ -860,11 +887,62 @@ impl State {
                 toggle_in_select(filter_buf, selected);
             }
 
+            // NOTE: the current solution forces everything to type check by embedding my own
+            // reasoning about the way we handle the references that the task captures. Because we
+            // know of the drawing function that awaits for this task to finish, we can soundly
+            // state that the captured data (raw pointers to be used as references) does not require
+            // the lifetime of all captured variables to be `'static`.
             UserEventKind::Effect => {
+                #[repr(transparent)]
+                struct ThreadedPtr<T> {
+                    repr: *mut T,
+                }
+
+                impl<T> ThreadedPtr<T> {
+                    fn new(repr: *mut T) -> Self {
+                        Self { repr }
+                    }
+                }
+
+                unsafe impl<T> Send for ThreadedPtr<T> {}
+
+                unsafe impl<T> Sync for ThreadedPtr<T> {}
+
+                impl<T> Deref for ThreadedPtr<T> {
+                    type Target = *mut T;
+
+                    fn deref(&self) -> &Self::Target {
+                        let Self { repr } = self;
+
+                        repr
+                    }
+                }
+
+                impl<T> DerefMut for ThreadedPtr<T> {
+                    fn deref_mut(&mut self) -> &mut Self::Target {
+                        let Self { repr } = self;
+
+                        repr
+                    }
+                }
+
+                let constants = ThreadedPtr::new(&raw mut *constants);
+                let effects = ThreadedPtr::new(&raw mut *effects);
+
                 task::spawn(async move {
+                    let (constants, effects) =
+                        unsafe { (constants.as_mut_unchecked(), effects.as_ref_unchecked()) };
+
                     _ = effects.send(Msg::effecting_changes());
 
-                    constants.effect_changes().await.map_err(Into::into)
+                    constants
+                        .effect_changes()
+                        .await
+                        .map_err(Into::<anyhow::Error>::into)?;
+
+                    effects.send(Msg::finished())?;
+
+                    anyhow::Ok(())
                 });
             }
             UserEventKind::Clear if !prompt.is_empty() => {
@@ -1037,7 +1115,7 @@ impl State {
     #[tracing::instrument(skip_all, err(level = "info"))]
     async fn draw(
         &mut self,
-        mut stdout: impl Write,
+        mut stdout: impl Write + Send,
         effecting_changes: &mut UnboundedReceiver<Msg>,
     ) -> anyhow::Result<()> {
         let Self {
@@ -1063,61 +1141,56 @@ impl State {
         // the last tidbits of visual feedback required for each one of the modes. This
         // includes highlighting items in the list, as well as moving the cursor
         // wherever it is that the `pos` field in the running state indicates.
+        //
+        // Prior to all of that, we check if the running state is currently effecting
+        // changes to disk, as that requires completely wiping the screen and printing a
+        // progress report with the `Spinner` type.
 
-        match effecting_changes.try_recv() {
-            Ok(msg) => print_changes(&mut stdout, msg).await?,
-            Err(TryRecvError::Empty) => {
-                print_reset(&mut stdout)?;
-                print_prompt(&mut stdout, prompt)?;
+        if let Ok(init_msg) = effecting_changes.try_recv() {
+            info!("started to effect changes");
 
-                if filter_buf.is_empty() {
-                    print_empty(&mut stdout)?;
+            print_changes(&mut stdout, init_msg, effecting_changes).await?;
+        }
 
-                    // NOTE: this ensures that if we are in the list of constants, the finalizer
-                    // routine that comes up next does not bother rendering the list of constants,
-                    // for there's none.
-                    if pos.is_list() {
-                        pos.transition();
-                    }
-                } else {
-                    print_list(&mut stdout, &select_first_ten(filter_buf))?;
-                }
+        print_reset(&mut stdout)?;
+        print_prompt(&mut stdout, prompt)?;
 
-                match (mode.kind(), pos.kind()) {
-                    (ModeKind::Insert, PositionKind::Prompt) => {
-                        finalize_insert_prompt(&mut stdout, pos.into_prompt())?;
-                    }
-                    (ModeKind::Normal, PositionKind::Prompt) => {
-                        finalize_normal_prompt(&mut stdout, pos.into_prompt())?;
-                    }
-                    (ModeKind::Normal, PositionKind::List) => {
-                        finalize_normal_list(
-                            &mut stdout,
-                            pos.into_list(),
-                            &select_first_ten(filter_buf),
-                        )?;
-                    }
-                    (ModeKind::Select, PositionKind::List) => {
-                        finalize_select_list(
-                            &mut stdout,
-                            pos.into_list(),
-                            &select_first_ten(filter_buf),
-                            selected,
-                        )?;
-                    }
+        if filter_buf.is_empty() {
+            print_empty(&mut stdout)?;
 
-                    // NOTE: ignored cases include being in insert mode while in the list, and being
-                    // in select mode while in the prompt, both of which are
-                    // logically impossible.
-                    _ => (),
-                }
+            // NOTE: this ensures that if we are in the list of constants, the finalizer
+            // routine that comes up next does not bother rendering the list of constants,
+            // for there's none.
+            if pos.is_list() {
+                pos.transition();
             }
-            Err(TryRecvError::Disconnected) => unreachable!(
-                "The transmitter is stored within the running state, so the only way it is \
-                 dropped is if the running state itself is dropped. That can not happen at this \
-                 point in the execution flow, because this method must be called with an instance \
-                 of the running state."
-            ),
+        } else {
+            print_list(&mut stdout, &select_first_ten(filter_buf))?;
+        }
+
+        match (mode.kind(), pos.kind()) {
+            (ModeKind::Insert, PositionKind::Prompt) => {
+                finalize_insert_prompt(&mut stdout, pos.into_prompt())?;
+            }
+            (ModeKind::Normal, PositionKind::Prompt) => {
+                finalize_normal_prompt(&mut stdout, pos.into_prompt())?;
+            }
+            (ModeKind::Normal, PositionKind::List) => {
+                finalize_normal_list(&mut stdout, pos.into_list(), &select_first_ten(filter_buf))?;
+            }
+            (ModeKind::Select, PositionKind::List) => {
+                finalize_select_list(
+                    &mut stdout,
+                    pos.into_list(),
+                    &select_first_ten(filter_buf),
+                    selected,
+                )?;
+            }
+
+            // NOTE: ignored cases include being in insert mode while in the list, and being
+            // in select mode while in the prompt, both of which are
+            // logically impossible.
+            _ => (),
         }
 
         stdout.flush().map_err(Into::into)
@@ -1136,12 +1209,28 @@ fn select_first_ten(buf: &mut BorrowedContainer) -> impl Visit {
     )
 }
 
-async fn print_changes(stdout: impl Write, msg: Msg) -> anyhow::Result<()> {
-    Spinner::run_while(stdout, async move |tx| match msg.kind() {
-        MsgKind::EffectingChnages => tx
-            .send("Effecting changes to disk".into())
-            .map_err(Into::into),
-        MsgKind::FinishedChanges => tx.send("Changes to disk saved".into()).map_err(Into::into),
+#[tracing::instrument(skip(stdout, effecting_changes), err(level = "info"))]
+async fn print_changes(
+    stdout: impl Write + Send,
+    init_msg: Msg,
+    effecting_changes: &mut UnboundedReceiver<Msg>,
+) -> anyhow::Result<()> {
+    Spinner::run_while(stdout, async move |tx| {
+        if let Some(msg) = init_msg.stringified() {
+            tx.send(msg.into())?;
+        }
+
+        while let Some(msg) = effecting_changes.recv().await {
+            if let Some(msg) = msg.stringified() {
+                tx.send(msg.into())?;
+            } else {
+                info!("done effecting changes");
+
+                break;
+            }
+        }
+
+        anyhow::Ok(())
     })
     .await
 }
@@ -1840,12 +1929,6 @@ impl RawUserEvent {
     }}
 }
 
-// NOTE: this is wrapped in a `Mutex` to get interior mutability, as that is
-// required for the draw handle to be used in both the `prepare_space` routine
-// and in the `draw` method to re-render the screen.
-pub(crate) static SYNC_BUF: LazyLock<Mutex<StdBufWriter<Stdout>>> =
-    LazyLock::new(|| Mutex::new(StdBufWriter::new(std_io::stdout())));
-
 #[tracing::instrument(skip_all, err(level = "info"))]
 async fn render(
     mut state: State,
@@ -1865,9 +1948,9 @@ async fn draw_screen(
     state: &mut State,
     effecting_changes: &mut UnboundedReceiver<Msg>,
 ) -> anyhow::Result<()> {
-    let stdout = &mut *SYNC_BUF.lock().await;
-
     info!(redraw = true);
+
+    let stdout = StdBufWriter::new(std_io::stdout());
 
     state.draw(stdout, effecting_changes).await
 }
@@ -1966,7 +2049,7 @@ static PROMPT_COORD: OnceLock<(u16, u16)> = OnceLock::new();
 
 #[tracing::instrument(skip_all, err(level = "info"))]
 async fn prepare_space() -> anyhow::Result<()> {
-    let mut stdout = SYNC_BUF.lock().await;
+    let mut stdout = StdBufWriter::new(std_io::stdout());
 
     crossterm::queue!(
         stdout,
@@ -1993,9 +2076,7 @@ async fn prepare_space() -> anyhow::Result<()> {
 async fn init() -> anyhow::Result<ConstContainer> {
     info!("starting init routine");
 
-    let mut stdout = SYNC_BUF.lock().await;
-
-    Spinner::run_while(stdout, async move |tx| {
+    Spinner::run_while(StdBufWriter::new(std_io::stdout()), async move |tx| {
         tx.send("Parsing `libc` repo".into())?;
 
         libc_constant_deprecator_lib::scan(if let Some(path) = Args::parse().path {
@@ -2054,21 +2135,15 @@ async fn main() -> anyhow::Result<()> {
 
     prepare_space().await?;
 
-    let mut stdout = SYNC_BUF.lock().await;
-
     task::block_in_place(|| {
         let res1 = terminal::enable_raw_mode();
         let res2 = crossterm::execute!(
-            stdout,
+            std_io::stdout(),
             PushKeyboardEnhancementFlags(ENHANCEMENT_FLAGS_IN_USE)
         );
 
         res1.and(res2)
     })?;
-
-    // NOTE: we must manually drop the lock guard on `stdout` because it's going to
-    // be lokced across runs of the rendering loop.
-    drop(stdout);
 
     info!(prompt_coordinates = ?PROMPT_COORD.get().unwrap());
 
@@ -2103,11 +2178,9 @@ async fn main() -> anyhow::Result<()> {
         crossterm::execute!(std_io::stdout(), PopKeyboardEnhancementFlags).unwrap();
     })?;
 
-    let mut stdout = SYNC_BUF.lock().await;
-
     task::block_in_place(|| {
         crossterm::execute!(
-            stdout,
+            std_io::stdout(),
             RestorePosition,
             Clear(ClearType::FromCursorDown),
             PopKeyboardEnhancementFlags
