@@ -1,7 +1,7 @@
 #![feature(try_blocks, async_fn_traits, unboxed_closures)]
 
 use std::{
-    borrow::Borrow,
+    borrow::{Borrow, Cow},
     cmp::Ordering,
     debug_assert_matches, env,
     fmt::{self, Debug, Display, Formatter},
@@ -33,7 +33,7 @@ use libc_constant_deprecator_lib::{BorrowedContainer, Const, ConstContainer, Vis
 use proc_macro2::Ident;
 use tester_impl::defer_drm;
 use tokio::{
-    sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
+    sync::mpsc::{self, UnboundedReceiver, UnboundedSender, error::TryRecvError},
     task, time,
 };
 use tracing::{info, info_span};
@@ -373,22 +373,23 @@ impl Spinner {
     // one that at least type checks.
     #[tracing::instrument(skip_all)]
     pub(crate) async fn run_while<
-        T: Send,
+        T: Send + 'static,
         F: AsyncFnOnce(UnboundedSender<String>) -> anyhow::Result<T>,
     >(
-        mut stdout: impl Write + Send,
+        mut stdout: impl Write + Send + 'static,
         f: F,
     ) -> anyhow::Result<T>
     where
-        <F as AsyncFnOnce<(UnboundedSender<String>,)>>::CallOnceFuture: Send,
+        <F as AsyncFnOnce<(UnboundedSender<String>,)>>::CallOnceFuture: Send + 'static,
     {
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        let worker = f(tx);
-        let spinner = async move {
+        let worker = task::spawn(f(tx));
+        let spinner = task::spawn(async move {
             info!("started spinner routine");
 
             let mut spinner = Self::default();
+            let mut current_msg: Cow<'static, str> = "".into();
 
             task::block_in_place(|| {
                 crossterm::execute!(
@@ -399,28 +400,40 @@ impl Spinner {
                 )
             })?;
 
-            while let Some(msg) = rx.recv().await {
+            loop {
+                match rx.try_recv() {
+                    Ok(msg) => {
+                        info!(new_message = true, message = msg);
+
+                        current_msg = msg.into();
+                    }
+                    Err(TryRecvError::Empty) => (),
+                    Err(TryRecvError::Disconnected) => break,
+                }
+
                 task::block_in_place(|| {
                     crossterm::execute!(
                         stdout,
                         Clear(ClearType::CurrentLine),
-                        Print(fmt::from_fn(|f| { write!(f, "{spinner} {msg}") })),
+                        Print(fmt::from_fn(|f| { write!(f, "{spinner} {current_msg}") })),
                         RestorePosition,
                     )
                 })?;
 
                 spinner.transition();
+                info!("transitioned to spinner: {spinner}");
+
                 time::sleep(Duration::from_millis(128)).await;
             }
 
             info!("finished spinner task");
 
             anyhow::Ok(())
-        };
+        });
 
         future::try_join(worker, spinner)
             .await
-            .map(|(worker_res, ())| worker_res)
+            .map(|(worker_res, spinner_res)| spinner_res.and(worker_res))?
     }
 }
 
@@ -472,26 +485,59 @@ repr! {
     MsgRepr => {
         EffectingChnages,
         FinishedChanges,
-        None,
     }
     #[derive(Debug, Clone, Copy)]
     Msg
 }
 
 impl Msg {
-    fn stringified(self) -> Option<&'static str> {
-        Some(match self.repr {
+    fn stringified(self) -> &'static str {
+        match self.repr {
             MsgRepr::EffectingChnages => "Effecting changes to disk",
             MsgRepr::FinishedChanges => "Finished effecting changes to disk",
-            MsgRepr::None => return None,
-        })
+        }
     }
 
     repr_impl! { MsgRepr => {
         effecting_changes, is_effecting, _d, d, _d => EffectingChnages;
         finished, is_finished, _d, d, _d => FinishedChanges;
-        none, is_none, _d, d, _d => None;
     }}
+}
+
+// NOTE: we use this across different sites that require calling into values
+// with a `'static` lifetime, when we really only have a reference that cannot
+// escape the scope in which the task with the lifetime bound has been spawned.
+#[repr(transparent)]
+struct ThreadedPtr<T> {
+    repr: *mut T,
+}
+
+impl<T> ThreadedPtr<T> {
+    fn new(repr: &mut T) -> Self {
+        Self { repr }
+    }
+}
+
+unsafe impl<T> Send for ThreadedPtr<T> {}
+
+unsafe impl<T> Sync for ThreadedPtr<T> {}
+
+impl<T> Deref for ThreadedPtr<T> {
+    type Target = *mut T;
+
+    fn deref(&self) -> &Self::Target {
+        let Self { repr } = self;
+
+        repr
+    }
+}
+
+impl<T> DerefMut for ThreadedPtr<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        let Self { repr } = self;
+
+        repr
+    }
 }
 
 #[derive(Debug)]
@@ -807,8 +853,6 @@ impl State {
             ..
         } = self;
 
-        effects.send(Msg::none())?;
-
         let Some(event) = event else {
             return Ok(());
         };
@@ -891,55 +935,32 @@ impl State {
             // reasoning about the way we handle the references that the task captures. Because we
             // know of the drawing function that awaits for this task to finish, we can soundly
             // state that the captured data (raw pointers to be used as references) does not require
-            // the lifetime of all captured variables to be `'static`.
+            // the lifetime of all captured variables to be `'static`. It is guaranteed (though not
+            // a the type level, that the `print_changes` routine will not return until the task
+            // spawned here is complete, lest there's some fallible operation that returns early; In
+            // that case, it would all depend on the order in which values are dropped and tasks are
+            // cancelled.)
+            //
+            // A less risky solution would instead be to hold on to a shared pointer for the
+            // resources we require holding onto this task; Namely, the constants and the channel
+            // transmitter, such that we may clone them and thus not allow their ownership and drop
+            // glue to be tied to the running state.
+            //
+            // Ideally, the task would also be stored in a local set that could yield the results of
+            // the computations within it in case some write to disk fails (which at present is
+            // silently ignored.)
             UserEventKind::Effect => {
-                #[repr(transparent)]
-                struct ThreadedPtr<T> {
-                    repr: *mut T,
-                }
-
-                impl<T> ThreadedPtr<T> {
-                    fn new(repr: *mut T) -> Self {
-                        Self { repr }
-                    }
-                }
-
-                unsafe impl<T> Send for ThreadedPtr<T> {}
-
-                unsafe impl<T> Sync for ThreadedPtr<T> {}
-
-                impl<T> Deref for ThreadedPtr<T> {
-                    type Target = *mut T;
-
-                    fn deref(&self) -> &Self::Target {
-                        let Self { repr } = self;
-
-                        repr
-                    }
-                }
-
-                impl<T> DerefMut for ThreadedPtr<T> {
-                    fn deref_mut(&mut self) -> &mut Self::Target {
-                        let Self { repr } = self;
-
-                        repr
-                    }
-                }
-
-                let constants = ThreadedPtr::new(&raw mut *constants);
-                let effects = ThreadedPtr::new(&raw mut *effects);
+                let constants = ThreadedPtr::new(constants);
+                let effects = ThreadedPtr::new(effects);
 
                 task::spawn(async move {
                     let (constants, effects) =
-                        unsafe { (constants.as_mut_unchecked(), effects.as_ref_unchecked()) };
+                        unsafe { (constants.as_ref_unchecked(), effects.as_ref_unchecked()) };
 
-                    _ = effects.send(Msg::effecting_changes());
+                    info!("entered write-to-disk task");
 
-                    constants
-                        .effect_changes()
-                        .await
-                        .map_err(Into::<anyhow::Error>::into)?;
-
+                    effects.send(Msg::effecting_changes())?;
+                    constants.effect_changes().await?;
                     effects.send(Msg::finished())?;
 
                     anyhow::Ok(())
@@ -1115,7 +1136,7 @@ impl State {
     #[tracing::instrument(skip_all, err(level = "info"))]
     async fn draw(
         &mut self,
-        mut stdout: impl Write + Send,
+        mut stdout: impl Write + Send + 'static,
         effecting_changes: &mut UnboundedReceiver<Msg>,
     ) -> anyhow::Result<()> {
         let Self {
@@ -1147,9 +1168,17 @@ impl State {
         // progress report with the `Spinner` type.
 
         if let Ok(init_msg) = effecting_changes.try_recv() {
-            info!("started to effect changes");
+            info!("started to effect changes: {:?}", init_msg.stringified());
 
-            print_changes(&mut stdout, init_msg, effecting_changes).await?;
+            let stdout = ThreadedPtr::new(&mut stdout);
+            let effecting_changes = ThreadedPtr::new(effecting_changes);
+
+            print_changes(
+                unsafe { stdout.as_mut_unchecked() },
+                init_msg,
+                effecting_changes,
+            )
+            .await?;
         }
 
         print_reset(&mut stdout)?;
@@ -1211,20 +1240,21 @@ fn select_first_ten(buf: &mut BorrowedContainer) -> impl Visit {
 
 #[tracing::instrument(skip(stdout, effecting_changes), err(level = "info"))]
 async fn print_changes(
-    stdout: impl Write + Send,
+    stdout: impl Write + Send + 'static,
     init_msg: Msg,
-    effecting_changes: &mut UnboundedReceiver<Msg>,
+    effecting_changes: ThreadedPtr<UnboundedReceiver<Msg>>,
 ) -> anyhow::Result<()> {
     Spinner::run_while(stdout, async move |tx| {
-        if let Some(msg) = init_msg.stringified() {
-            tx.send(msg.into())?;
-        }
+        let effecting_changes = unsafe { effecting_changes.as_mut_unchecked() };
+
+        tx.send(init_msg.stringified().into())?;
 
         while let Some(msg) = effecting_changes.recv().await {
-            if let Some(msg) = msg.stringified() {
-                tx.send(msg.into())?;
+            if let MsgKind::EffectingChnages = msg.kind() {
+                tx.send(msg.stringified().into())?;
             } else {
                 info!("done effecting changes");
+                tx.send(msg.stringified().into())?;
 
                 break;
             }
@@ -2076,7 +2106,14 @@ async fn prepare_space() -> anyhow::Result<()> {
 async fn init() -> anyhow::Result<ConstContainer> {
     info!("starting init routine");
 
-    Spinner::run_while(StdBufWriter::new(std_io::stdout()), async move |tx| {
+    let mut stdout = StdBufWriter::new(std_io::stdout());
+
+    // NOTE: we require saving the position prior to starting the spinner because
+    // otherwise the task in charge of it will reset the position to the line in the
+    // shell that launched the command, and not to the next line.
+    task::block_in_place(|| crossterm::execute!(stdout, SavePosition))?;
+
+    Spinner::run_while(stdout, async move |tx| {
         tx.send("Parsing `libc` repo".into())?;
 
         libc_constant_deprecator_lib::scan(if let Some(path) = Args::parse().path {

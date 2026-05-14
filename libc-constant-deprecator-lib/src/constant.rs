@@ -94,8 +94,21 @@ impl Const {
         }
     }
 
+    // NOTE: the return value reports whether the symbol was previously deprecated,
+    // such that the `BorrowedContainer` deprecation routines can more easily
+    // determine whether the modified flag should be set for a given symbol.
     #[tracing::instrument]
-    pub(crate) fn deprecate(&mut self, yes: bool) {
-        self.deprecated = yes;
+    pub(crate) fn deprecate(&mut self, yes: bool) -> bool {
+        match (self.deprecated, yes) {
+            (true, false) => {
+                self.deprecated = false;
+                true
+            }
+            (false, true) => {
+                self.deprecated = true;
+                true
+            }
+            (true, true) | (false, false) => false,
+        }
     }
 }

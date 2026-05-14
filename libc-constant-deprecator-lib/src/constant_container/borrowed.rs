@@ -28,7 +28,7 @@ pub struct BorrowedContainer {
 impl BorrowedContainer {
     pub(crate) fn from_container(container: &[Arc<(Const, bool)>]) -> Self {
         Self {
-            init_state: container.iter().map(|ptr| ptr.1).collect(),
+            init_state: container.iter().map(|ptr| ptr.0.is_deprecated()).collect(),
             source: container.iter().map(Arc::downgrade).collect(),
         }
     }
@@ -293,12 +293,18 @@ macro_rules! deprecate_impl {
                 })
             })
             .zip(init_state)
-            .for_each(|((constant, modified), init_modified)| {
-                info!(modified_constant = true, deprecated = deprecate_impl!(body @$op));
-
+            .for_each(|((constant, modified), init_state)| {
                 constant.deprecate(deprecate_impl!(body @$op));
 
-                *modified = *init_modified == *modified;
+                info!(
+                    constant = %constant.ident(),
+                    init_state,
+                    current_state = constant.is_deprecated(),
+                );
+
+                *modified = *init_state != constant.is_deprecated();
+
+                info!(modified_constant = modified, deprecated = constant.is_deprecated());
             });
     };
     (@doc $op:tt { $it:item }) => {

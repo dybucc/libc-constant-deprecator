@@ -130,7 +130,7 @@ impl ConstContainer {
     // + The message requires using escaped backslashes so that the actual piece of
     //   source code that gets inserted into the `libc` codebase does not span
     //   multiple lines.
-    pub(crate) const DEPRECATION_NOTICE: &str = include_str!("../../DEPRECATION_NOTICE");
+    pub(crate) const DEPRECATION_NOTICE: &str = include!("../../DEPRECATION_NOTICE");
 
     pub(crate) fn new(inner: Vec<Const>) -> Self {
         Self {
