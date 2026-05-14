@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, Weak},
 };
 
-use tracing::info;
+use tracing::{info, info_span};
 
 use crate::{Const, Sealed};
 
@@ -27,10 +27,48 @@ pub struct BorrowedContainer {
 
 impl BorrowedContainer {
     pub(crate) fn from_container(container: &[Arc<(Const, bool)>]) -> Self {
-        Self {
+        let out = Self {
             init_state: container.iter().map(|ptr| ptr.0.is_deprecated()).collect(),
             source: container.iter().map(Arc::downgrade).collect(),
+        };
+
+        let preemptive_span = info_span!("preemptive_info");
+
+        if cfg!(debug_assertions) {
+            out.init_state
+                .iter()
+                .zip(out.source.iter().filter_map(|ptr| {
+                    ptr.upgrade()
+                        .map(|ptr| unsafe { Arc::as_ptr(&ptr).as_ref_unchecked() })
+                }))
+                .filter_map(|(state, (constant, _))| {
+                    constant
+                        .ident()
+                        .to_string()
+                        .contains("MINI")
+                        .then_some((constant.ident(), state))
+                })
+                .for_each(
+                    |(ident, state)| info!(parent: &preemptive_span, %ident, init_state = state),
+                );
         }
+
+        out
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn traverse(&self, mut f: impl FnMut(&Const, bool)) {
+        let Self { source, init_state } = self;
+
+        source
+            .iter()
+            .zip(init_state.iter().copied())
+            .filter_map(|(constant, init_state)| {
+                constant
+                    .upgrade()
+                    .map(|ptr| unsafe { (Arc::as_ptr(&ptr).as_ref_unchecked(), init_state) })
+            })
+            .for_each(|((constant, _), init_state)| f(constant, init_state));
     }
 
     pub(crate) fn buffer(&mut self) -> &mut Vec<Weak<(Const, bool)>> {
@@ -271,11 +309,20 @@ macro_rules! visit_impl {
 
 visit_impl! {}
 
+// FIXME: the bug with the filering operation apparently flipping bits for the
+// initial modification state of the borrowed container/view is actually due to
+// the fact the filtering operation can decrease the number of elements in the
+// non-owning container. But the filering routine only updates the buffer that
+// holds weak shared pointers to the owning allocation, and not the set of
+// references to the initial state that during construction held the right
+// modification stamp. To patch it one should just aim to modify both the buffer
+// with the pointers, and the buffer that holds the initial state.
+
 macro_rules! deprecate_impl {
     (body @deprecate) => { true };
     (body @undeprecate) => { false };
     (@body $op:tt, $self:expr) => {
-        use tracing::info;
+        use tracing::{info, info_span};
 
         // NOTE: Yes, it's odd that type inference does not work here, but apparently it
         // only works when destructuring the overaching `BorrowedContainer`, which
@@ -284,6 +331,27 @@ macro_rules! deprecate_impl {
         // indirection. This then makes the logic that follows not work for both types.
         let source: &mut [Weak<(Const, bool)>] = $self.source.as_mut();
         let init_state: &[bool] = $self.init_state.as_ref();
+
+        if cfg!(debug_assertions) {
+            let preemptive_span = info_span!("preemptive_info");
+
+            source
+                .iter()
+                .zip(init_state)
+                .filter_map(|(ptr, init)| {
+                    ptr.upgrade().map(|ptr| unsafe {
+                        (Arc::as_ptr(&ptr).cast_mut().as_ref_unchecked(), init)
+                    })
+                })
+                .for_each(|((constant, _), init)| {
+                    info!(
+                        parent: &preemptive_span,
+                        ident = %constant.ident(),
+                        deprecated = constant.is_deprecated(),
+                        init_state = init,
+                    );
+                });
+        }
 
         source
             .iter_mut()
@@ -297,9 +365,9 @@ macro_rules! deprecate_impl {
                 constant.deprecate(deprecate_impl!(body @$op));
 
                 info!(
-                    constant = %constant.ident(),
                     init_state,
                     current_state = constant.is_deprecated(),
+                    constant = %constant.ident(),
                 );
 
                 *modified = *init_state != constant.is_deprecated();
@@ -322,24 +390,36 @@ macro_rules! deprecate_impl {
     () => {
         impl BorrowedContainer {
             deprecate_impl! { @doc deprecate {
-                #[cfg_attr(debug_assertions, tracing::instrument(skip_all))]
+                #[cfg_attr(
+                    debug_assertions,
+                    tracing::instrument(skip_all, fields(deprecate_in_borrowed_container = true))
+                )]
                 pub fn deprecate(&mut self) { deprecate_impl! { @body deprecate, self } }
             } }
 
             deprecate_impl! { @doc undeprecate {
-                #[cfg_attr(debug_assertions, tracing::instrument(skip_all))]
+                #[cfg_attr(
+                    debug_assertions,
+                    tracing::instrument(skip_all, fields(deprecate_in_borrowed_container = true))
+                )]
                 pub fn undeprecate(&mut self) { deprecate_impl! { @body undeprecate, self } }
             } }
         }
 
         impl BorrowedSubset<'_> {
             deprecate_impl! { @doc deprecate {
-                #[cfg_attr(debug_assertions, tracing::instrument(skip_all))]
+                #[cfg_attr(
+                    debug_assertions,
+                    tracing::instrument(skip_all, fields(deprecate_in_borrowed_container = false))
+                )]
                 pub fn deprecate(&mut self) { deprecate_impl! { @body deprecate, self } }
             } }
 
             deprecate_impl! { @doc undeprecate {
-                #[cfg_attr(debug_assertions, tracing::instrument(skip_all))]
+                #[cfg_attr(
+                    debug_assertions,
+                    tracing::instrument(skip_all, fields(deprecate_in_borrowed_container = false))
+                )]
                 pub fn undeprecate(&mut self) { deprecate_impl! { @body undeprecate, self } }
             } }
         }

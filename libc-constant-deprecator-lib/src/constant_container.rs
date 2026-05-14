@@ -64,12 +64,31 @@ macro_rules! filter_impl {
 
         info!("filtering done");
     };
+    (@debug => $span:expr, $borrowed:expr) => {
+        #[cfg(debug_assertions)]
+        {
+            let span = info_span!($span);
+
+            $borrowed.traverse(|constant, init_state| {
+                if constant.ident().to_string().contains("MINI") {
+                    info!(
+                        parent: &span,
+                        constant = %constant.ident(),
+                        init_state_during_filtering = init_state,
+                    );
+                }
+            });
+        }
+    };
     (@filter_with => $iter:expr, $borrowed:expr) => {{
+        filter_impl!(@debug => "preemptive_information_prefilling", $borrowed);
+
         let buf = $borrowed.buffer();
 
         buf.clear();
-
         _ = $iter.map(Arc::downgrade).collect_into(buf);
+
+        filter_impl!(@debug => "preemptive_information_postfilling", $borrowed);
 
         info!("gathering_done");
     }};
@@ -92,7 +111,7 @@ macro_rules! filter_impl {
                 re: impl AsRef<str>,
                 borrowed_container: &mut BorrowedContainer,
             ) -> Result<(), FilterError> {
-                use tracing::info;
+                use tracing::{info, info_span};
 
                 let iter;
                 filter_impl! { @body filter_with => self, re, iter }
@@ -130,7 +149,10 @@ impl ConstContainer {
     // + The message requires using escaped backslashes so that the actual piece of
     //   source code that gets inserted into the `libc` codebase does not span
     //   multiple lines.
-    pub(crate) const DEPRECATION_NOTICE: &str = include!("../../DEPRECATION_NOTICE");
+    pub(crate) const DEPRECATION_NOTICE: &str =
+        "This constant, among others often used in C for the purposes of\ndenoting the latest \
+         value or limit in a set of constants, has been deprecated. See\n#3131 for details and \
+         discussion.";
 
     pub(crate) fn new(inner: Vec<Const>) -> Self {
         Self {

@@ -886,9 +886,7 @@ impl State {
                         if cfg!(debug_assertions) {
                             let span = info_span!($intro);
 
-                            filter_buf.select(
-                                0..if let len = filter_buf.len() && len < 10 { len } else { 10 }
-                            ).visit(|constant| {
+                            select_first_ten(filter_buf).visit(|constant| {
                                 info!(parent: &span, "{}", constant.ident());
 
                                 ControlFlow::<(), _>::Continue(())
@@ -897,11 +895,11 @@ impl State {
                     }};
                 }
 
-                info!(name: "filtering", filtering_event = true);
+                info!("filtering event");
 
-                info_first_ten!("filter_buf_pre_searching");
+                info_first_ten!("visible_list_pre_searching");
                 constants.filter_with(&prompt, filter_buf)?;
-                info_first_ten!("filter_buf_post_searching");
+                info_first_ten!("visible_list_post_searching");
 
                 *selected = Selection::default();
 
