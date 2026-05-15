@@ -117,14 +117,14 @@ pub trait Indexer<T>: Sealed {
     fn eval(self) -> T;
 }
 
+// TODO: if time allows, write a macro to get rid of the following repetitive
+// implementations.
+
 impl<I: Into<usize>> Sealed for Range<I> {}
 
 impl<I: Into<usize>> Sealed for &Range<I> {}
 
 impl<I: Into<usize>> Sealed for &mut Range<I> {}
-
-// TODO: if time allows, write a macro to get rid of the following repetitive
-// implementations.
 
 impl<I: Into<usize>> Indexer<Range<I>> for Range<I> {
     fn eval(self) -> Range<I> {
@@ -162,11 +162,11 @@ impl<I: Into<usize> + Clone> Indexer<Range<I>> for &mut Range<I> {
 #[derive(Debug)]
 pub struct BorrowedSubset<'a> {
     source: &'a mut [BorrowedElement],
-    init_state: &'a mut [bool],
+    init_state: &'a [bool],
 }
 
 impl<'a> BorrowedSubset<'a> {
-    fn new(source: &'a mut [BorrowedElement], init_state: &'a mut [bool]) -> Self {
+    fn new(source: &'a mut [BorrowedElement], init_state: &'a [bool]) -> Self {
         Self { source, init_state }
     }
 }
@@ -185,7 +185,33 @@ impl BorrowedContainer {
         let start = start.map(Into::into);
         let end = end.map(Into::into);
 
-        BorrowedSubset::new(&mut source[(start, end)], &mut init_state[(start, end)])
+        let source = &mut source[(start, end)];
+        let init_state = &mut init_state[(start, end)];
+
+        info!(subset_range = ?Range { start, end });
+
+        #[cfg(debug_assertions)]
+        {
+            source
+                .iter()
+                .zip(init_state.iter())
+                .for_each(|(elem, init_state)| {
+                    if elem
+                        .with_inner(|constant, _| {
+                            info!(
+                                "matched constant: {constant}:{init_state}",
+                                constant = constant.ident(),
+                                init_state = init_state
+                            );
+                        })
+                        .is_none()
+                    {
+                        info!("unmatched constant");
+                    }
+                });
+        }
+
+        BorrowedSubset::new(source, init_state)
     }
 }
 
@@ -207,6 +233,40 @@ pub trait Visit: Sealed {
     /// actual iterator, and only provides a temporary, in-place view with a
     /// closure that can capture callsite state.
     fn visit<B>(&self, visitor: impl FnMut(&Const) -> ControlFlow<B>) -> Option<B>;
+
+    /// Provides a mutable traversal throughout gathered constants that can be
+    /// put on halt.
+    ///
+    /// This is akin to a far less powerful version of iteration that gates the
+    /// actual iterator, and only provides a temporary, in-place view with a
+    /// closure that can capture callsite state.
+    fn visit_mut<B>(&mut self, visitor: impl FnMut(&mut Const) -> ControlFlow<B>) -> Option<B>;
+
+    /// Provides an immutable traversal throughout matched constants that can be
+    /// put on halt.
+    ///
+    /// Note the method will attempt to iterate through all constants that
+    /// matched the last regex with which the implementor got filled. This means
+    /// that the method will either traverse the first ten (possibly disjoint)
+    /// matched constants, or otherwise not traverse any constant whatsoever.
+    fn visit_n<B, R: Try<Output = (), Residual = B>>(
+        &self,
+        n: usize,
+        mut visitor: impl FnMut(&Const) -> R,
+    ) -> Option<B> {
+        let mut counter = 0;
+
+        self.visit(|constant| {
+            if counter == n - 1 {
+                return ControlFlow::Break(None);
+            }
+
+            counter += 1;
+
+            visitor(constant).branch().map_break(Some)
+        })
+        .flatten()
+    }
 
     /// Provided an index into the collection of symbols being traversed, this
     /// routine attempts to find it and perform some operation on it.
@@ -289,46 +349,51 @@ impl Sealed for BorrowedContainer {}
 impl Sealed for BorrowedSubset<'_> {}
 
 macro_rules! visit_impl {
-    (@body) => {
-        fn visit<B>(&self, mut visitor: impl FnMut(&Const) -> ControlFlow<B, ()>) -> Option<B> {
-            let Self { source, .. } = self;
+    (@body @iter @mut => $source:expr) => { $source.iter_mut() };
+    (@body @iter @ref => $source:expr) => { $source.iter() };
+    (@body @elem @mut => $elem:expr, $f:expr) => { $elem.with_inner_mut($f) };
+    (@body @elem @ref => $elem:expr, $f:expr) => { $elem.with_inner($f) };
+    (@body @$spec:tt => $self:expr, $visitor:expr) => {
+        let Self { source, .. } = $self;
 
-            if let ControlFlow::Break(b) = source.iter().try_for_each(|elem| {
-                if let Some(res) = elem.with_inner(|constant, _| visitor(constant))
-                    && res.is_break()
-                {
-                    res
-                } else {
-                    ControlFlow::Continue(())
-                }
-            }) {
-                b.into()
+        if let ControlFlow::Break(b) = visit_impl!(@body @iter @$spec => source).try_for_each(|elem| {
+            if let Some(res) = visit_impl!(@body @elem @$spec => elem, |constant, _| $visitor(constant))
+                && res.is_break()
+            {
+                res
             } else {
-                None
+                ControlFlow::Continue(())
             }
+        }) {
+            b.into()
+        } else {
+            None
+        }
+    };
+    (@proto) => {
+        fn visit<B>(&self, mut visitor: impl FnMut(&Const) -> ControlFlow<B, ()>) -> Option<B> {
+            visit_impl! { @body @ref => self, visitor }
+        }
+
+        fn visit_mut<B>(
+            &mut self,
+            mut visitor: impl FnMut(&mut Const) -> ControlFlow<B, ()>,
+        ) -> Option<B> {
+            visit_impl! { @body @mut => self, visitor }
         }
     };
     () => {
         impl Visit for BorrowedContainer {
-            visit_impl! { @body }
+            visit_impl! { @proto }
         }
 
         impl Visit for BorrowedSubset<'_> {
-            visit_impl! { @body }
+            visit_impl! { @proto }
         }
     };
 }
 
 visit_impl! {}
-
-// FIXME: the bug with the filering operation apparently flipping bits for the
-// initial modification state of the borrowed container/view is actually due to
-// the fact the filtering operation can decrease the number of elements in the
-// non-owning container. But the filering routine only updates the buffer that
-// holds weak shared pointers to the owning allocation, and not the set of
-// references to the initial state that during construction held the right
-// modification stamp. To patch it one should just aim to modify both the buffer
-// with the pointers, and the buffer that holds the initial state.
 
 macro_rules! deprecate_impl {
     (@body @deprecate) => { true };

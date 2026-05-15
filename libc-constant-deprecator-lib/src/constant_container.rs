@@ -58,15 +58,18 @@ macro_rules! filter_impl {
             .iter()
             .map(|ptr| {
                 if re.is_match(ptr.0.ident().to_string().as_bytes())
-                    .then(|| ::tracing::info!(matched_symbol = %ptr.0.ident()))
-                    .is_some() {
+                    .then(|| if $re.as_ref() != ".*" {
+                        ::tracing::info!(matched_symbol = %ptr.0.ident())
+                    })
+                    .is_some()
+                {
                     ptr.into()
                 } else {
                     None
                 }
             });
 
-        info!("filtering done");
+        ::tracing::info!("filtering done");
     };
     (@debug => $span:expr, $borrowed:expr) => {
         #[cfg(debug_assertions)]
@@ -87,11 +90,9 @@ macro_rules! filter_impl {
     (@filter_with => $iter:expr, $borrowed:expr) => {{
         filter_impl!(@debug => "preemptive_information_prefilling", $borrowed);
 
-        let buf = $borrowed.buffer_mut();
-
         $iter
             .map(|maybe_matched| maybe_matched.map(Arc::downgrade))
-            .zip(buf)
+            .zip($borrowed.buffer_mut())
             .for_each(|(ptr, buf_elem)| {
                 if let Some(ptr) = ptr {
                     *buf_elem = $crate::borrowed!(ptr);

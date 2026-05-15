@@ -1,4 +1,4 @@
-#![feature(try_blocks, async_fn_traits, unboxed_closures)]
+#![feature(async_fn_traits, unboxed_closures)]
 
 use std::{
     borrow::{Borrow, Cow},
@@ -507,6 +507,7 @@ impl Msg {
 // NOTE: we use this across different sites that require calling into values
 // with a `'static` lifetime, when we really only have a reference that cannot
 // escape the scope in which the task with the lifetime bound has been spawned.
+#[derive(Debug)]
 #[repr(transparent)]
 struct ThreadedPtr<T> {
     repr: *mut T,
@@ -886,7 +887,7 @@ impl State {
                         if cfg!(debug_assertions) {
                             let span = info_span!($intro);
 
-                            select_first_ten(filter_buf).visit(|constant| {
+                            filter_buf.visit_n(10, |constant| {
                                 info!(parent: &span, "{}", constant.ident());
 
                                 ControlFlow::<(), _>::Continue(())
@@ -1192,7 +1193,7 @@ impl State {
                 pos.transition();
             }
         } else {
-            print_list(&mut stdout, &select_first_ten(filter_buf))?;
+            print_list(&mut stdout, filter_buf)?;
         }
 
         match (mode.kind(), pos.kind()) {
@@ -1203,15 +1204,10 @@ impl State {
                 finalize_normal_prompt(&mut stdout, pos.into_prompt())?;
             }
             (ModeKind::Normal, PositionKind::List) => {
-                finalize_normal_list(&mut stdout, pos.into_list(), &select_first_ten(filter_buf))?;
+                finalize_normal_list(&mut stdout, pos.into_list(), filter_buf)?;
             }
             (ModeKind::Select, PositionKind::List) => {
-                finalize_select_list(
-                    &mut stdout,
-                    pos.into_list(),
-                    &select_first_ten(filter_buf),
-                    selected,
-                )?;
+                finalize_select_list(&mut stdout, pos.into_list(), filter_buf, selected)?;
             }
 
             // NOTE: ignored cases include being in insert mode while in the list, and being
@@ -1222,18 +1218,6 @@ impl State {
 
         stdout.flush().map_err(Into::into)
     }
-}
-
-fn select_first_ten(buf: &mut BorrowedContainer) -> impl Visit {
-    buf.select(
-        0..if let len = buf.len()
-            && len < 10
-        {
-            len
-        } else {
-            10
-        },
-    )
 }
 
 #[tracing::instrument(skip(stdout, effecting_changes), err(level = "info"))]
@@ -1299,23 +1283,15 @@ fn print_prompt(mut stdout: impl Write, prompt: impl AsRef<str>) -> anyhow::Resu
 fn print_list(mut stdout: impl Write, list: &impl Visit) -> anyhow::Result<()> {
     crossterm::queue!(stdout, MoveToNextLine(1))?;
 
-    list.visit(|constant| {
-        if let Err(err) = try {
-            crossterm::queue!(
-                stdout,
-                StylizedSymbol::from_constant(constant).into_command(),
-            )?;
+    list.visit_n(10, |constant| {
+        crossterm::queue!(
+            stdout,
+            StylizedSymbol::from_constant(constant).into_command(),
+        )?;
 
-            crossterm::queue!(stdout, MoveToNextLine(1))?;
-        } {
-            ControlFlow::Break(err.into())
-        } else {
-            ControlFlow::Continue(())
-        }
+        crossterm::queue!(stdout, MoveToNextLine(1))
     })
-    .flatten()
-    .map(Into::into)
-    .map_or_else(|| anyhow::Ok(()), Err)?;
+    .map_or_else(|| anyhow::Ok(()), |res| res.map(|_| ()).map_err(Into::into))?;
 
     crossterm::queue!(stdout, RestorePosition).map_err(Into::into)
 }
@@ -1567,9 +1543,10 @@ macro_rules! style_impl {
 
 style_impl! {}
 
-#[tracing::instrument(skip_all)]
-fn toggle_in_select(filter_buf: &mut BorrowedContainer, selected: &Selection) {
-    let mut selected = filter_buf.select(selected.range());
+#[tracing::instrument(skip(filter_buf))]
+fn toggle_in_select(filter_buf: &impl Visit, selected: &Selection) {
+    // TODO: finish transitioning this into the new visitor interface.
+    filter_buf.select(selected.range(), |constant| {});
 
     if all_deprecated(&selected) {
         info!(toggle_type = "undeprecation");
