@@ -215,6 +215,174 @@ impl BorrowedContainer {
     }
 }
 
+macro_rules! declare_visit {
+    (@spec @ref => $self:expr, $f:expr) => {
+        $self.visit($f)
+    };
+    (@spec @mut => $self:expr, $f:expr) => {
+        $self.visit_mut($f)
+    };
+    (@visit @$spec:tt => $self:expr, $n:expr, $visitor:expr) => {
+        let mut counter = 0;
+
+        declare_visit!(@spec @$spec => $self, |constant| {
+            if counter == $n {
+                return ControlFlow::Break(None);
+            }
+
+            counter += 1;
+
+            $visitor(constant).branch().map_break(Some)
+        })
+        .flatten()
+    };
+    (@find_indexed @$spec:tt => $self:expr, $idx:expr, $f:expr) => {
+        let mut counter = 0;
+        let idx = $idx.into();
+
+        declare_visit!(@spec @$spec => $self, |constant| {
+            if counter == idx {
+                return ControlFlow::Break($f(constant));
+            }
+
+            counter += 1;
+
+            ControlFlow::Continue(())
+        })
+    };
+    (@find_named @$spec:tt => $self:expr, $sym:expr, $f:expr) => {
+        declare_visit!(@spec @$spec => $self, |constant| {
+            if *constant.ident() == $sym {
+                return ControlFlow::Break($f(constant));
+            }
+
+            ControlFlow::Continue(())
+        })
+    };
+    (@select @$spec:tt => $self:expr, $range:expr, $f:expr) => {
+        let (start, end) = $range.eval().into_bounds();
+        let Bound::Included(start) = start.map(Into::into) else {
+            panic!("start bound is always included below in the considered range")
+        };
+        let Bound::Excluded(end) = end.map(Into::into) else {
+            panic!("end bound is alwasy excluded above in the considered range");
+        };
+
+        let mut counter = 0;
+
+        declare_visit!(@spec @$spec => $self, move |constant| {
+            if counter < start {
+                counter += 1;
+
+                info!(constant_in_bounds = false);
+
+                return ControlFlow::Continue(());
+            } else if counter == end {
+                return ControlFlow::Break(None);
+            }
+
+            info!(constant_in_bounds = true);
+
+            if let ControlFlow::Break(res) = $f(constant).branch() {
+                return ControlFlow::Break(res.into());
+            }
+
+            counter += 1;
+
+            ControlFlow::Continue(())
+        })
+        .flatten()
+    };
+    (@mut) => {
+        /// Provides access to the underlying matched constants through a
+        /// mutable traversal throughout matched constants that can be put on
+        /// halt.
+        ///
+        /// Note the method will attempt to iterate through all constants that
+        /// matched the last regex with which the implementor got filled. This means
+        /// that the method will either traverse the first ten (possibly disjoint)
+        /// matched constants, or otherwise not traverse any constant whatsoever.
+        fn visit_n_mut<B, R: Try<Output = (), Residual = B>>(
+            &mut self,
+            n: usize,
+            mut visitor: impl FnMut(&mut Const) -> R,
+        ) -> Option<B> {
+            declare_visit! { @visit @mut => self, n, visitor }
+        }
+
+        /// Provided an index into the collection of symbols being traversed, this
+        /// routine attempts to find it and perform some operation on it.
+        fn find_indexed_mut<T>(
+            &mut self,
+            idx: impl Into<usize>,
+            mut f: impl FnMut(&mut Const) -> T
+        ) -> Option<T> {
+            declare_visit! { @find_indexed @mut => self, idx, f }
+        }
+
+        /// Provided an identifier, this routine traverses the collection of symbols
+        /// attempting to find some symbol that matches such identifier, and
+        /// provides access to it.
+        fn find_named_mut<T>(&mut self,
+            sym: impl AsRef<str>,
+            mut f: impl FnMut(&mut Const) -> T
+        ) -> Option<T> {
+            declare_visit! { @find_named @mut => self, sym, f }
+        }
+
+        /// Provided a range into the collection being traversed, this routine
+        /// allows running a closure over the set of constants whose traversal index
+        /// is within such range.
+        fn select_mut<T, I: Into<usize>, R: Try<Output = (), Residual = T>>(
+            &mut self,
+            range: impl Indexer<Range<I>>,
+            mut f: impl FnMut(&mut Const) -> R,
+        ) -> Option<T> {
+            declare_visit! { @select @mut => self, range, f }
+        }
+    };
+    (@ref) => {
+        /// Provides immutable traversal throughout matched constants that can be
+        /// put on halt.
+        ///
+        /// Note the method will attempt to iterate through all constants that
+        /// matched the last regex with which the implementor got filled. This means
+        /// that the method will either traverse the first ten (possibly disjoint)
+        /// matched constants, or otherwise not traverse any constant whatsoever.
+        fn visit_n<B, R: Try<Output = (), Residual = B>>(
+            &self,
+            n: usize,
+            mut visitor: impl FnMut(&Const) -> R,
+        ) -> Option<B> {
+            declare_visit! { @visit @ref => self, n, visitor }
+        }
+
+        /// Provided an index into the collection of symbols being traversed, this
+        /// routine attempts to find it and perform some operation on it.
+        fn find_indexed<T>(&self, idx: impl Into<usize>, mut f: impl FnMut(&Const) -> T) -> Option<T> {
+            declare_visit! { @find_indexed @ref => self, idx, f }
+        }
+
+        /// Provided an identifier, this routine traverses the collection of symbols
+        /// attempting to find some symbol that matches such identifier, and
+        /// provides access to it.
+        fn find_named<T>(&self, sym: impl AsRef<str>, mut f: impl FnMut(&Const) -> T) -> Option<T> {
+            declare_visit! { @find_named @ref => self, sym, f }
+        }
+
+        /// Provided a range into the collection being traversed, this routine
+        /// allows running a closure over the set of constants whose traversal index
+        /// is within such range.
+        fn select<T, I: Into<usize>, R: Try<Output = (), Residual = T>>(
+            &self,
+            range: impl Indexer<Range<I>>,
+            mut f: impl FnMut(&Const) -> R,
+        ) -> Option<T> {
+            declare_visit! { @select @ref => self, range, f }
+        }
+    };
+}
+
 /// Utility trait to enable common constant symbol traversal pattern between
 /// borrowed views.
 ///
@@ -234,6 +402,15 @@ pub trait Visit: Sealed {
     /// closure that can capture callsite state.
     fn visit<B>(&self, visitor: impl FnMut(&Const) -> ControlFlow<B>) -> Option<B>;
 
+    declare_visit! { @ref }
+}
+
+#[expect(
+    private_bounds,
+    reason = "The whole point of the `Sealed` pattern is to not allow public implementations of \
+              it."
+)]
+pub trait VisitMut: Sealed {
     /// Provides a mutable traversal throughout gathered constants that can be
     /// put on halt.
     ///
@@ -242,106 +419,7 @@ pub trait Visit: Sealed {
     /// closure that can capture callsite state.
     fn visit_mut<B>(&mut self, visitor: impl FnMut(&mut Const) -> ControlFlow<B>) -> Option<B>;
 
-    /// Provides an immutable traversal throughout matched constants that can be
-    /// put on halt.
-    ///
-    /// Note the method will attempt to iterate through all constants that
-    /// matched the last regex with which the implementor got filled. This means
-    /// that the method will either traverse the first ten (possibly disjoint)
-    /// matched constants, or otherwise not traverse any constant whatsoever.
-    fn visit_n<B, R: Try<Output = (), Residual = B>>(
-        &self,
-        n: usize,
-        mut visitor: impl FnMut(&Const) -> R,
-    ) -> Option<B> {
-        let mut counter = 0;
-
-        self.visit(|constant| {
-            if counter == n - 1 {
-                return ControlFlow::Break(None);
-            }
-
-            counter += 1;
-
-            visitor(constant).branch().map_break(Some)
-        })
-        .flatten()
-    }
-
-    /// Provided an index into the collection of symbols being traversed, this
-    /// routine attempts to find it and perform some operation on it.
-    fn find_indexed<T>(&self, idx: impl Into<usize>, mut f: impl FnMut(&Const) -> T) -> Option<T> {
-        let mut counter = 0;
-        let idx = idx.into();
-
-        self.visit(|constant| {
-            if counter == idx {
-                return ControlFlow::Break(f(constant));
-            }
-
-            counter += 1;
-
-            ControlFlow::Continue(())
-        })
-    }
-
-    /// Provided an identifier, this routine traverses the collection of symbols
-    /// attempting to find some symbol that matches such identifier, and
-    /// provides access to it.
-    fn find_named<T>(&self, sym: impl AsRef<str>, mut f: impl FnMut(&Const) -> T) -> Option<T> {
-        self.visit(|constant| {
-            if *constant.ident() == sym {
-                return ControlFlow::Break(f(constant));
-            }
-
-            ControlFlow::Continue(())
-        })
-    }
-
-    // NOTE: this may be not be necessary considering there is already a `select`
-    // routine for `BorrowedContainer` to take a subset of its elements into a
-    // `BorrowedSubset`, itself an implementor of `Visit`.
-    /// Provided a range into the collection being traversed, this routine
-    /// allows running a closure over the set of constants whose traversal index
-    /// is within such range.
-    fn select<T, I: Into<usize>, R: Try<Output = (), Residual = T>>(
-        &self,
-        range: impl Indexer<Range<I>>,
-        mut f: impl FnMut(&Const) -> R,
-    ) -> Option<T> {
-        let (start, end) = range.eval().into_bounds();
-        let Bound::Included(start) = start.map(Into::into) else {
-            panic!("start bound is always included below in the considered range")
-        };
-        let Bound::Excluded(end) = end.map(Into::into) else {
-            panic!("end bound is alwasy excluded above in the considered range");
-        };
-
-        let mut counter = 0;
-
-        self.visit(move |constant| {
-            if counter < start {
-                counter += 1;
-
-                info!(constant_in_bounds = false);
-
-                return ControlFlow::Continue(());
-            } else if counter == end {
-                return ControlFlow::Break(None);
-            }
-
-            info!(constant_in_bounds = true);
-
-            if let ControlFlow::Break(res) = f(constant).branch() {
-                return ControlFlow::Break(res.into());
-            }
-
-            counter += 1;
-
-            ControlFlow::Continue(())
-        })
-        .flatten()
-    }
+    declare_visit!{ @mut }
 }
 
 impl Sealed for BorrowedContainer {}
@@ -356,25 +434,29 @@ macro_rules! visit_impl {
     (@body @$spec:tt => $self:expr, $visitor:expr) => {
         let Self { source, .. } = $self;
 
-        if let ControlFlow::Break(b) = visit_impl!(@body @iter @$spec => source).try_for_each(|elem| {
-            if let Some(res) = visit_impl!(@body @elem @$spec => elem, |constant, _| $visitor(constant))
-                && res.is_break()
-            {
-                res
-            } else {
-                ControlFlow::Continue(())
+        if let ControlFlow::Break(b) = visit_impl!(@body @iter @$spec => source)
+            .try_for_each(|elem| {
+                if let Some(res) = visit_impl!(
+                    @body @elem @$spec => elem, |constant, _| $visitor(constant)
+                ) && res.is_break()
+                {
+                    res
+                } else {
+                    ControlFlow::Continue(())
+                }
             }
-        }) {
+        ) {
             b.into()
         } else {
             None
         }
     };
-    (@proto) => {
+    (@proto @ref) => {
         fn visit<B>(&self, mut visitor: impl FnMut(&Const) -> ControlFlow<B, ()>) -> Option<B> {
             visit_impl! { @body @ref => self, visitor }
         }
-
+    };
+    (@proto @mut) => {
         fn visit_mut<B>(
             &mut self,
             mut visitor: impl FnMut(&mut Const) -> ControlFlow<B, ()>,
@@ -384,11 +466,19 @@ macro_rules! visit_impl {
     };
     () => {
         impl Visit for BorrowedContainer {
-            visit_impl! { @proto }
+            visit_impl! { @proto @ref }
+        }
+
+        impl VisitMut for BorrowedContainer {
+            visit_impl! { @proto @mut }
         }
 
         impl Visit for BorrowedSubset<'_> {
-            visit_impl! { @proto }
+            visit_impl! { @proto @ref }
+        }
+
+        impl VisitMut for BorrowedSubset<'_> {
+            visit_impl! { @proto @mut }
         }
     };
 }

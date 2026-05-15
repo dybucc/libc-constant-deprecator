@@ -98,7 +98,7 @@ impl Const {
     // such that the `BorrowedContainer` deprecation routines can more easily
     // determine whether the modified flag should be set for a given symbol.
     #[tracing::instrument]
-    pub(crate) fn deprecate(&mut self, yes: bool) -> bool {
+    pub fn deprecate(&mut self, yes: bool) -> bool {
         match (self.deprecated, yes) {
             (true, false) => {
                 self.deprecated = false;

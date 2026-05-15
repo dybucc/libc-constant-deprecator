@@ -29,7 +29,7 @@ use crossterm::{
     terminal::{self, Clear, ClearType},
 };
 use futures::{StreamExt, future};
-use libc_constant_deprecator_lib::{BorrowedContainer, Const, ConstContainer, Visit};
+use libc_constant_deprecator_lib::{BorrowedContainer, Const, ConstContainer, Visit, VisitMut};
 use proc_macro2::Ident;
 use tester_impl::defer_drm;
 use tokio::{
@@ -962,6 +962,8 @@ impl State {
                     constants.effect_changes().await?;
                     effects.send(Msg::finished())?;
 
+                    info!("finished write-to-disk task");
+
                     anyhow::Ok(())
                 });
             }
@@ -1170,7 +1172,6 @@ impl State {
             info!("started to effect changes: {:?}", init_msg.stringified());
 
             let stdout = ThreadedPtr::new(&mut stdout);
-            let effecting_changes = ThreadedPtr::new(effecting_changes);
 
             print_changes(
                 unsafe { stdout.as_mut_unchecked() },
@@ -1178,6 +1179,8 @@ impl State {
                 effecting_changes,
             )
             .await?;
+
+            task::block_in_place(|| unsafe { stdout.as_mut_unchecked().flush() })?;
         }
 
         print_reset(&mut stdout)?;
@@ -1224,8 +1227,10 @@ impl State {
 async fn print_changes(
     stdout: impl Write + Send + 'static,
     init_msg: Msg,
-    effecting_changes: ThreadedPtr<UnboundedReceiver<Msg>>,
+    effecting_changes: &mut UnboundedReceiver<Msg>,
 ) -> anyhow::Result<()> {
+    let effecting_changes = ThreadedPtr::new(effecting_changes);
+
     Spinner::run_while(stdout, async move |tx| {
         let effecting_changes = unsafe { effecting_changes.as_mut_unchecked() };
 
@@ -1543,20 +1548,42 @@ macro_rules! style_impl {
 
 style_impl! {}
 
-#[tracing::instrument(skip(filter_buf))]
-fn toggle_in_select(filter_buf: &impl Visit, selected: &Selection) {
-    // TODO: finish transitioning this into the new visitor interface.
-    filter_buf.select(selected.range(), |constant| {});
+#[tracing::instrument(skip(visited))]
+fn toggle_in_select(visited: &mut (impl Visit + VisitMut), selected: &Selection) {
+    let all_deprecated = all_deprecated_range(selected, visited);
 
-    if all_deprecated(&selected) {
+    #[cfg(debug_assertions)]
+    if all_deprecated {
         info!(toggle_type = "undeprecation");
-
-        selected.undeprecate();
     } else {
         info!(toggle_type = "deprecation");
-
-        selected.deprecate();
     }
+
+    visited.select_mut(selected.range(), |constant| {
+        if all_deprecated {
+            constant.deprecate(false);
+        } else {
+            constant.deprecate(true);
+        }
+
+        ControlFlow::<()>::Continue(())
+    });
+}
+
+fn all_deprecated_range(selected: &Selection, visited: &impl Visit) -> bool {
+    let mut all_deprecated = true;
+
+    visited.select(selected.range(), |constant| {
+        if !constant.is_deprecated() {
+            all_deprecated = false;
+
+            return ControlFlow::Break(());
+        }
+
+        ControlFlow::Continue(())
+    });
+
+    all_deprecated
 }
 
 fn all_deprecated(visited: &impl Visit) -> bool {
@@ -1565,6 +1592,7 @@ fn all_deprecated(visited: &impl Visit) -> bool {
     visited.visit(|constant| {
         if !constant.is_deprecated() {
             check = false;
+
             return ControlFlow::Break(());
         }
 

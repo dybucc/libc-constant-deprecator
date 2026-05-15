@@ -214,81 +214,89 @@ impl ConstContainer {
     /// Fails if some I/O-bound operation fails while writing to disk, or if any
     /// one of (1) parsing the existing file from the codebase, or (2)
     /// formatting that file once the changes are made, fails.
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "The only source of panics that the lint sees is not really a source of panics \
-                  because there's an invariant that holds at that site, where if the constant \
-                  symbol is about to be undeprecated, then surely it must have been annotated as \
-                  deprecated. Otherwise, the filtering that's done on the loop over all symbols \
-                  wouldn't have produced the symbol in the iteration."
-    )]
     #[cfg_attr(debug_assertions, tracing::instrument(skip_all, err(level = "info")))]
     pub async fn effect_changes(&self) -> Result<(), MakeChangesError> {
         let mut task_pool = JoinSet::new();
 
-        for symbol in self.inner.iter().filter(|ptr| ptr.1).cloned() {
-            task_pool.spawn(async move {
-                let constant = &symbol.0;
+        self.inner
+            .iter()
+            .filter(|ptr| ptr.1)
+            .cloned()
+            .for_each(|symbol| {
+                task_pool.spawn(async move {
+                    let constant = &symbol.0;
 
-                info!(constant_to_save = %constant.ident(), state = constant.is_deprecated());
+                    info!(constant_to_save = %constant.ident(), state = constant.is_deprecated());
 
-                // NOTE: this is purposefully sandwiched between await points because it handles
-                // `File: !Send`.
-                let modified_file = {
-                    let mut file = syn::parse_file(
-                        &fs::read_to_string(constant.path()).await.map_err(|inner| {
+                    // NOTE: this is purposefully sandwiched between await points because it handles
+                    // `File: !Send`.
+                    let modified_file = {
+                        let mut file = syn::parse_file(
+                            &fs::read_to_string(constant.path()).await.map_err(|inner| {
+                                MakeChangesErrorRepr::IoBound(IoBoundChanges::new(
+                                    constant.path().clone(),
+                                    inner,
+                                    ChangesKind::fetch(),
+                                ))
+                            })?,
+                        )
+                        .map_err(|_| MakeChangesErrorRepr::Parse(constant.path().clone().into()))?;
+
+                        // FIXME: while parsing the file anew, it seems like no constant is matching
+                        // the one with which this operation started. Keep experimenting with the
+                        // `B_MIN_ICON_TYPE` constant.
+                        file.items
+                            .iter_mut()
+                            .filter_map(|item| {
+                                if item.span().start() == constant.span()
+                                    && let Item::Const(ItemConst { attrs, ident, .. }) = item
+                                    && ident == constant.ident()
+                                    && constant.is_deprecated()
+                                {
+                                    Some(attrs)
+                                } else {
+                                    None
+                                }
+                            })
+                            .try_for_each(|attrs| {
+                                info!("entered filtered constant closure while saving to disk");
+
+                                if constant.is_deprecated() {
+                                    attrs.push(deprecate!(Self::DEPRECATION_NOTICE));
+                                } else {
+                                    let attr_to_remove = attrs
+                                        .iter()
+                                        .map(Attribute::path)
+                                        .position(|attr_ident| attr_ident.is_ident("deprecated"))
+                                        .ok_or({
+                                            "the `deprecated` attribute should have been found if \
+                                             the constant is marked as modified for undeprecation"
+                                        })
+                                        .map_err(Into::into)
+                                        .map_err(MakeChangesErrorRepr::Other)?;
+
+                                    attrs.swap_remove(attr_to_remove);
+                                }
+
+                                Ok::<_, MakeChangesError>(())
+                            })?;
+
+                        prettyplease::unparse(&file)
+                    };
+
+                    fs::write(constant.path(), modified_file)
+                        .await
+                        .map_err(|inner| {
                             MakeChangesErrorRepr::IoBound(IoBoundChanges::new(
                                 constant.path().clone(),
                                 inner,
-                                ChangesKind::fetch(),
+                                ChangesKind::save(),
                             ))
-                        })?,
-                    )
-                    .map_err(|_| MakeChangesErrorRepr::Parse(constant.path().clone().into()))?;
+                        })?;
 
-                    file.items
-                        .iter_mut()
-                        .filter_map(|item| {
-                            if item.span().start() == constant.span()
-                                && let Item::Const(ItemConst { attrs, ident, .. }) = item
-                                && ident == constant.ident()
-                                && constant.is_deprecated()
-                            {
-                                Some(attrs)
-                            } else {
-                                None
-                            }
-                        })
-                        .for_each(|attrs| {
-                            if constant.is_deprecated() {
-                                attrs.push(deprecate!(Self::DEPRECATION_NOTICE));
-                            } else {
-                                let attr_to_remove = attrs
-                                    .iter()
-                                    .map(Attribute::path)
-                                    .position(|attr_ident| attr_ident.is_ident("deprecated"))
-                                    .expect("");
-
-                                attrs.swap_remove(attr_to_remove);
-                            }
-                        });
-
-                    prettyplease::unparse(&file)
-                };
-
-                fs::write(constant.path(), modified_file)
-                    .await
-                    .map_err(|inner| {
-                        MakeChangesErrorRepr::IoBound(IoBoundChanges::new(
-                            constant.path().clone(),
-                            inner,
-                            ChangesKind::save(),
-                        ))
-                    })?;
-
-                Ok::<_, MakeChangesError>(())
+                    Ok::<_, MakeChangesError>(())
+                });
             });
-        }
 
         // NOTE: we cleanly shut down the tasks instead of just aborting them by letting
         // the task pool drop because we're handling the FS in each task, and it's best

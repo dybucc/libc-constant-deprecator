@@ -43,7 +43,7 @@ pub use crate::{
     constant::Const,
     constant_container::{
         ConstContainer,
-        borrowed::{BorrowedContainer, BorrowedSubset, Visit},
+        borrowed::{BorrowedContainer, BorrowedSubset, Visit, VisitMut},
     },
     errors::{FilterError, MakeChangesError, ScanError},
     scanner::scan,
