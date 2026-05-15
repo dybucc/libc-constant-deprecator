@@ -51,15 +51,19 @@ macro_rules! filter_impl {
         // NOTE: when issuing a regex that matches all symbols, we prefer to
         // keep the logs relatively clean and thus skip reporting those events.
         if $re.as_ref() != ".*" {
-            info!(?re);
+            ::tracing::info!(?re);
         }
 
         $iter = inner
             .iter()
-            .filter(|ptr| {
-                re.is_match(ptr.0.ident().to_string().as_bytes())
-                    .then(|| info!(matched_symbol = %ptr.0.ident()))
-                    .is_some()
+            .map(|ptr| {
+                if re.is_match(ptr.0.ident().to_string().as_bytes())
+                    .then(|| ::tracing::info!(matched_symbol = %ptr.0.ident()))
+                    .is_some() {
+                    ptr.into()
+                } else {
+                    None
+                }
             });
 
         info!("filtering done");
@@ -67,11 +71,11 @@ macro_rules! filter_impl {
     (@debug => $span:expr, $borrowed:expr) => {
         #[cfg(debug_assertions)]
         {
-            let span = info_span!($span);
+            let span = ::tracing::info_span!($span);
 
             $borrowed.traverse(|constant, init_state| {
                 if constant.ident().to_string().contains("MINI") {
-                    info!(
+                    ::tracing::info!(
                         parent: &span,
                         constant = %constant.ident(),
                         init_state_during_filtering = init_state,
@@ -83,26 +87,39 @@ macro_rules! filter_impl {
     (@filter_with => $iter:expr, $borrowed:expr) => {{
         filter_impl!(@debug => "preemptive_information_prefilling", $borrowed);
 
-        let buf = $borrowed.buffer();
+        let buf = $borrowed.buffer_mut();
 
-        buf.clear();
-        _ = $iter.map(Arc::downgrade).collect_into(buf);
+        $iter
+            .map(|maybe_matched| maybe_matched.map(Arc::downgrade))
+            .zip(buf)
+            .for_each(|(ptr, buf_elem)| {
+                if let Some(ptr) = ptr {
+                    *buf_elem = $crate::borrowed!(ptr);
+                } else {
+                    *buf_elem = $crate::borrowed!();
+                }
+            });
 
         filter_impl!(@debug => "preemptive_information_postfilling", $borrowed);
 
-        info!("gathering_done");
+        ::tracing::info!("gathering_done");
     }};
     (@filter => $iter:expr) => {{
-        let out = $iter.cloned().collect::<Vec<_>>();
+        // NOTE: when the filering operation is meant to create a whole new
+        // non-owning container, then we don't provide all values wrapped in
+        // `Option`s because there is no initialization state to keep track of
+        // in the borrowed container.
+        let out = $iter.filter_map(|ptr| ptr).cloned().collect::<Vec<_>>();
 
-        info!("gathering done");
+        ::tracing::info!("gathering done");
 
         out
     }};
-    // This subtree requires so much repetition because once it recurses to the branch that
-    // generates the docstrings, the macro system seems to require the item to already be there, not
-    // requiring further macro invocations to actually resolve to an item. Otherwise, the docstrings
-    // don't get attached to it, and you get the lints against free docstrings.
+    // This subtree requires so much repetition because once it recurses to the
+    // branch that generates the docstrings, the macro system seems to require
+    // the item to already be there, not requiring further macro invocations to
+    // actually resolve to an item. Otherwise, the docstrings don't get attached
+    // to it, and you get the lints against free docstrings.
     () => {
         filter_impl! { @doc filter_with {
             #[cfg_attr(debug_assertions, tracing::instrument(skip_all, err(level = "info")))]
@@ -111,8 +128,6 @@ macro_rules! filter_impl {
                 re: impl AsRef<str>,
                 borrowed_container: &mut BorrowedContainer,
             ) -> Result<(), FilterError> {
-                use tracing::{info, info_span};
-
                 let iter;
                 filter_impl! { @body filter_with => self, re, iter }
 
@@ -126,8 +141,6 @@ macro_rules! filter_impl {
                 &mut self,
                 re: impl AsRef<str>,
             ) -> Result<BorrowedContainer, FilterError> {
-                use tracing::info;
-
                 let iter;
                 filter_impl! { @body filter => self, re, iter }
 
@@ -140,15 +153,6 @@ macro_rules! filter_impl {
 impl ConstContainer {
     pub(crate) const MAX_RE_POWER: u8 = 20;
 
-    // NOTE: we keep the deprecation notice away from the source file for two
-    // reasons:
-    // + The message itself is too long to have it manually included here, and
-    //   adding more escaped backslashes to get the actual message (once changes are
-    //   effected to disk) to show up with line breaks in the codebase is
-    //   non-trivial.
-    // + The message requires using escaped backslashes so that the actual piece of
-    //   source code that gets inserted into the `libc` codebase does not span
-    //   multiple lines.
     pub(crate) const DEPRECATION_NOTICE: &str =
         "This constant, among others often used in C for the purposes of\ndenoting the latest \
          value or limit in a set of constants, has been deprecated. See\n#3131 for details and \

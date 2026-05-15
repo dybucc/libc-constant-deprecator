@@ -1,11 +1,13 @@
 use std::{
     ops::{Bound, ControlFlow, IntoBounds, Range, Try},
-    sync::{Arc, Weak},
+    sync::Arc,
 };
 
 use tracing::{info, info_span};
 
-use crate::{Const, Sealed};
+use crate::{BorrowedElement, Const, Sealed, borrowed};
+
+pub(crate) mod borrowed_element;
 
 /// Represents a borrowed view into multiple segments of a [`ConstContainer`] as
 /// a single, contiguous container of its own.
@@ -21,7 +23,7 @@ use crate::{Const, Sealed};
 /// [`filter_with()`]: `crate::ConstContainer::filter_with()`
 #[derive(Debug)]
 pub struct BorrowedContainer {
-    source: Vec<Weak<(Const, bool)>>,
+    source: Vec<BorrowedElement>,
     init_state: Vec<bool>,
 }
 
@@ -29,49 +31,53 @@ impl BorrowedContainer {
     pub(crate) fn from_container(container: &[Arc<(Const, bool)>]) -> Self {
         let out = Self {
             init_state: container.iter().map(|ptr| ptr.0.is_deprecated()).collect(),
-            source: container.iter().map(Arc::downgrade).collect(),
+            source: container
+                .iter()
+                .map(Arc::downgrade)
+                .map(|ptr| borrowed!(ptr))
+                .collect(),
         };
 
-        let preemptive_span = info_span!("preemptive_info");
-
         if cfg!(debug_assertions) {
+            let preemptive_span = info_span!("preemptive_info");
+
             out.init_state
                 .iter()
-                .zip(out.source.iter().filter_map(|ptr| {
-                    ptr.upgrade()
-                        .map(|ptr| unsafe { Arc::as_ptr(&ptr).as_ref_unchecked() })
-                }))
-                .filter_map(|(state, (constant, _))| {
-                    constant
-                        .ident()
-                        .to_string()
-                        .contains("MINI")
-                        .then_some((constant.ident(), state))
+                .zip(&out.source)
+                .filter_map(|(init_state, elem)| {
+                    elem.with_inner(|constant, _| {
+                        constant
+                            .ident()
+                            .to_string()
+                            .contains("MINI")
+                            .then_some((constant.ident().to_string(), *init_state))
+                    })
+                    .flatten()
                 })
-                .for_each(
-                    |(ident, state)| info!(parent: &preemptive_span, %ident, init_state = state),
-                );
+                .for_each(|(ident, init_state)| {
+                    info!(parent: &preemptive_span, ident, init_state = init_state);
+                });
         }
 
         out
     }
 
+    // NOTE: this is used in debugging builds to get raw access to all two buffers
+    // of the borrowed container, as the `Visit` trait is implemented as a public
+    // interface to exernal code that provides a view solely into the constant.
     #[cfg(debug_assertions)]
-    pub(crate) fn traverse(&self, mut f: impl FnMut(&Const, bool)) {
+    pub(crate) fn traverse(&self, f: impl Fn(&Const, bool)) {
         let Self { source, init_state } = self;
 
         source
             .iter()
             .zip(init_state.iter().copied())
-            .filter_map(|(constant, init_state)| {
-                constant
-                    .upgrade()
-                    .map(|ptr| unsafe { (Arc::as_ptr(&ptr).as_ref_unchecked(), init_state) })
-            })
-            .for_each(|((constant, _), init_state)| f(constant, init_state));
+            .for_each(|(constant, init_state)| {
+                constant.with_inner(|constant, _| f(constant, init_state));
+            });
     }
 
-    pub(crate) fn buffer(&mut self) -> &mut Vec<Weak<(Const, bool)>> {
+    pub(crate) fn buffer_mut(&mut self) -> &mut [BorrowedElement] {
         &mut self.source
     }
 }
@@ -155,12 +161,12 @@ impl<I: Into<usize> + Clone> Indexer<Range<I>> for &mut Range<I> {
 /// [`ConstContainer`]: `crate::ConstContainer`
 #[derive(Debug)]
 pub struct BorrowedSubset<'a> {
-    source: &'a mut [Weak<(Const, bool)>],
-    init_state: &'a [bool],
+    source: &'a mut [BorrowedElement],
+    init_state: &'a mut [bool],
 }
 
 impl<'a> BorrowedSubset<'a> {
-    fn new(source: &'a mut [Weak<(Const, bool)>], init_state: &'a [bool]) -> Self {
+    fn new(source: &'a mut [BorrowedElement], init_state: &'a mut [bool]) -> Self {
         Self { source, init_state }
     }
 }
@@ -179,7 +185,7 @@ impl BorrowedContainer {
         let start = start.map(Into::into);
         let end = end.map(Into::into);
 
-        BorrowedSubset::new(&mut source[(start, end)], &init_state[(start, end)])
+        BorrowedSubset::new(&mut source[(start, end)], &mut init_state[(start, end)])
     }
 }
 
@@ -232,6 +238,9 @@ pub trait Visit: Sealed {
         })
     }
 
+    // NOTE: this may be not be necessary considering there is already a `select`
+    // routine for `BorrowedContainer` to take a subset of its elements into a
+    // `BorrowedSubset`, itself an implementor of `Visit`.
     /// Provided a range into the collection being traversed, this routine
     /// allows running a closure over the set of constants whose traversal index
     /// is within such range.
@@ -281,15 +290,18 @@ impl Sealed for BorrowedSubset<'_> {}
 
 macro_rules! visit_impl {
     (@body) => {
-        fn visit<B>(&self, visitor: impl FnMut(&Const) -> ControlFlow<B, ()>) -> Option<B> {
+        fn visit<B>(&self, mut visitor: impl FnMut(&Const) -> ControlFlow<B, ()>) -> Option<B> {
             let Self { source, .. } = self;
 
-            if let ControlFlow::Break(b) = source
-                .iter()
-                .map(Weak::upgrade)
-                .filter_map(|ptr| ptr.map(|ptr| unsafe { &Arc::as_ptr(&ptr).as_ref_unchecked().0 }))
-                .try_for_each(visitor)
-            {
+            if let ControlFlow::Break(b) = source.iter().try_for_each(|elem| {
+                if let Some(res) = elem.with_inner(|constant, _| visitor(constant))
+                    && res.is_break()
+                {
+                    res
+                } else {
+                    ControlFlow::Continue(())
+                }
+            }) {
                 b.into()
             } else {
                 None
@@ -319,8 +331,8 @@ visit_impl! {}
 // with the pointers, and the buffer that holds the initial state.
 
 macro_rules! deprecate_impl {
-    (body @deprecate) => { true };
-    (body @undeprecate) => { false };
+    (@body @deprecate) => { true };
+    (@body @undeprecate) => { false };
     (@body $op:tt, $self:expr) => {
         use tracing::{info, info_span};
 
@@ -329,7 +341,7 @@ macro_rules! deprecate_impl {
         // doesn't work as well when destrucuring the `BorrowedSubset`, because the
         // latter holds references into the former, and so you end up with further
         // indirection. This then makes the logic that follows not work for both types.
-        let source: &mut [Weak<(Const, bool)>] = $self.source.as_mut();
+        let source: &mut [BorrowedElement] = $self.source.as_mut();
         let init_state: &[bool] = $self.init_state.as_ref();
 
         if cfg!(debug_assertions) {
@@ -338,41 +350,35 @@ macro_rules! deprecate_impl {
             source
                 .iter()
                 .zip(init_state)
-                .filter_map(|(ptr, init)| {
-                    ptr.upgrade().map(|ptr| unsafe {
-                        (Arc::as_ptr(&ptr).cast_mut().as_ref_unchecked(), init)
-                    })
-                })
-                .for_each(|((constant, _), init)| {
-                    info!(
-                        parent: &preemptive_span,
-                        ident = %constant.ident(),
-                        deprecated = constant.is_deprecated(),
-                        init_state = init,
-                    );
+                .for_each(|(elem, init_state)| {
+                    elem.with_inner(|constant, _| {
+                        info!(
+                            parent: &preemptive_span,
+                            ident = %constant.ident(),
+                            deprecated = constant.is_deprecated(),
+                            init_state,
+                        );
+                    });
                 });
         }
 
         source
             .iter_mut()
-            .filter_map(|ptr| {
-                ptr.upgrade().map(|ptr| unsafe {
-                    Arc::as_ptr(&ptr).cast_mut().as_mut_unchecked()
-                })
-            })
             .zip(init_state)
-            .for_each(|((constant, modified), init_state)| {
-                constant.deprecate(deprecate_impl!(body @$op));
+            .for_each(|(elem, init_state)| {
+                elem.with_inner_mut(|constant, modified| {
+                    constant.deprecate(deprecate_impl!(@body @$op));
 
-                info!(
-                    init_state,
-                    current_state = constant.is_deprecated(),
-                    constant = %constant.ident(),
-                );
+                    info!(
+                        init_state,
+                        current_state = constant.is_deprecated(),
+                        constant = %constant.ident(),
+                    );
 
-                *modified = *init_state != constant.is_deprecated();
+                    *modified = *init_state != constant.is_deprecated();
 
-                info!(modified_constant = modified, deprecated = constant.is_deprecated());
+                    info!(modified_constant = modified, deprecated = constant.is_deprecated());
+                });
             });
     };
     (@doc $op:tt { $it:item }) => {

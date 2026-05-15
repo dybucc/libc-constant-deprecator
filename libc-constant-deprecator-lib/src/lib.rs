@@ -3,7 +3,7 @@
 //!
 //! It is most useful when paired with the accompanying binary.
 
-#![feature(iter_collect_into, bool_to_result, range_into_bounds, try_trait_v2)]
+#![feature(bool_to_result, range_into_bounds, try_trait_v2)]
 
 mod constant;
 mod constant_container;
@@ -27,6 +27,7 @@ mod private {
 )]
 pub(crate) use crate::errors::*;
 pub(crate) use crate::{
+    constant_container::borrowed::borrowed_element::BorrowedElement,
     parser::{const_container_builder::ConstContainerBuilder, macro_parser::MacroParser},
     private::Sealed,
     source_file::SourceFile,
@@ -63,4 +64,5 @@ macro_rules! decl {
 
 decl! {
     use deprecate;
+    use borrowed;
 }

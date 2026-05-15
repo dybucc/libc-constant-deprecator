@@ -7,3 +7,8 @@ macro_rules! deprecate {
         }
     }};
 }
+
+macro_rules! borrowed {
+    ($elem:expr) => {{ $crate::support::BorrowedElement::new($elem.into()) }};
+    () => {{ $crate::support::BorrowedElement::new(Option::default()) }};
+}
