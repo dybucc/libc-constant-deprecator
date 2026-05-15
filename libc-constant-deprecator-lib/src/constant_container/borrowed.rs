@@ -162,11 +162,11 @@ impl<I: Into<usize> + Clone> Indexer<Range<I>> for &mut Range<I> {
 #[derive(Debug)]
 pub struct BorrowedSubset<'a> {
     source: &'a mut [BorrowedElement],
-    init_state: &'a [bool],
+    init_state: &'a mut [bool],
 }
 
 impl<'a> BorrowedSubset<'a> {
-    fn new(source: &'a mut [BorrowedElement], init_state: &'a [bool]) -> Self {
+    fn new(source: &'a mut [BorrowedElement], init_state: &'a mut [bool]) -> Self {
         Self { source, init_state }
     }
 }
@@ -497,14 +497,14 @@ macro_rules! deprecate_impl {
         // latter holds references into the former, and so you end up with further
         // indirection. This then makes the logic that follows not work for both types.
         let source: &mut [BorrowedElement] = $self.source.as_mut();
-        let init_state: &[bool] = $self.init_state.as_ref();
+        let init_state: &mut [bool] = $self.init_state.as_mut();
 
         if cfg!(debug_assertions) {
             let preemptive_span = info_span!("preemptive_info");
 
             source
                 .iter()
-                .zip(init_state)
+                .zip(&*init_state)
                 .for_each(|(elem, init_state)| {
                     elem.with_inner(|constant, _| {
                         info!(
@@ -531,6 +531,7 @@ macro_rules! deprecate_impl {
                     );
 
                     *modified = *init_state != constant.is_deprecated();
+                    *init_state = constant.is_deprecated();
 
                     info!(modified_constant = modified, deprecated = constant.is_deprecated());
                 });

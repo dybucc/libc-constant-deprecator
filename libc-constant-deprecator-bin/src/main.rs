@@ -376,7 +376,7 @@ impl Spinner {
         T: Send + 'static,
         F: AsyncFnOnce(UnboundedSender<String>) -> anyhow::Result<T>,
     >(
-        mut stdout: impl Write + Send + 'static,
+        mut writer: impl Write + Send + 'static,
         f: F,
     ) -> anyhow::Result<T>
     where
@@ -393,7 +393,7 @@ impl Spinner {
 
             task::block_in_place(|| {
                 crossterm::execute!(
-                    stdout,
+                    writer,
                     Hide,
                     RestorePosition,
                     Clear(ClearType::FromCursorDown),
@@ -413,7 +413,7 @@ impl Spinner {
 
                 task::block_in_place(|| {
                     crossterm::execute!(
-                        stdout,
+                        writer,
                         Clear(ClearType::CurrentLine),
                         Print(fmt::from_fn(|f| { write!(f, "{spinner} {current_msg}") })),
                         RestorePosition,

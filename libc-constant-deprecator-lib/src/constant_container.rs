@@ -4,6 +4,8 @@ use regex::bytes::{Regex, RegexBuilder};
 use syn::{Attribute, Item, ItemConst, spanned::Spanned};
 use tokio::{fs, task::JoinSet};
 use tracing::info;
+#[cfg(debug_assertions)]
+use tracing::info_span;
 
 use crate::{
     BorrowedContainer, ChangesKind, Const, FilterError, FilterErrorRepr, IoBoundChanges,
@@ -154,10 +156,10 @@ macro_rules! filter_impl {
 impl ConstContainer {
     pub(crate) const MAX_RE_POWER: u8 = 20;
 
-    pub(crate) const DEPRECATION_NOTICE: &str =
-        "This constant, among others often used in C for the purposes of\ndenoting the latest \
-         value or limit in a set of constants, has been deprecated. See\n#3131 for details and \
-         discussion.";
+    pub(crate) const DEPRECATION_NOTICE: &str = "This constant, among others often used in C for \
+                                                 the purposes of denoting the latest value or \
+                                                 limit in a set of constants, has been \
+                                                 deprecated. See #3131 for details and discussion.";
 
     pub(crate) fn new(inner: Vec<Const>) -> Self {
         Self {
@@ -242,16 +244,29 @@ impl ConstContainer {
                         )
                         .map_err(|_| MakeChangesErrorRepr::Parse(constant.path().clone().into()))?;
 
-                        // FIXME: while parsing the file anew, it seems like no constant is matching
-                        // the one with which this operation started. Keep experimenting with the
-                        // `B_MIN_ICON_TYPE` constant.
+                        // FIXME: the default parser will not traverse macro bodies so those
+                        // constants that got parsed from `cfg_if` don't get a deprecation mark.
+                        #[cfg(debug_assertions)]
+                        let preemptive_span = info_span!("info_during_filtering");
+
                         file.items
                             .iter_mut()
                             .filter_map(|item| {
+                                #[cfg(debug_assertions)]
+                                if let Item::Const(ItemConst { ident, .. }) = item
+                                    && let ident = ident.to_string()
+                                    && ident.contains("MINI")
+                                {
+                                    info!(
+                                        parent: &preemptive_span,
+                                        constant_ident = ident,
+                                        span = ?item.span().start(),
+                                    );
+                                }
+
                                 if item.span().start() == constant.span()
                                     && let Item::Const(ItemConst { attrs, ident, .. }) = item
                                     && ident == constant.ident()
-                                    && constant.is_deprecated()
                                 {
                                     Some(attrs)
                                 } else {

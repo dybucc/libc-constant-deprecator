@@ -1,6 +1,7 @@
 use std::{
     borrow::Cow,
     error::Error,
+    fmt::{self, Display, Formatter},
     io,
     path::{Path, PathBuf},
 };
@@ -157,6 +158,56 @@ pub(crate) enum FetchParseError {
     ParsingFailed(PathBuf),
     IoBound(io::Error),
     Other(Box<dyn Error + Send + Sync>),
+}
+
+#[derive(Debug, Error)]
+#[error("{repr}")]
+pub(crate) struct ParseError {
+    repr: ParseErrorRepr,
+}
+
+impl From<io::Error> for ParseError {
+    fn from(value: io::Error) -> Self {
+        Self {
+            repr: ParseErrorRepr::from_io(value),
+        }
+    }
+}
+
+impl From<syn::Error> for ParseError {
+    fn from(value: syn::Error) -> Self {
+        Self {
+            repr: ParseErrorRepr::from_syn(value),
+        }
+    }
+}
+
+// NOTE: it'd be great not to have this be a literal wrapper but rather provide
+// more granular information over the errors, but that's just not possible with
+// `syn`'s opaque `Error` type.
+#[derive(Debug)]
+enum ParseErrorRepr {
+    IoBound(io::Error),
+    ParseError(syn::Error),
+}
+
+impl ParseErrorRepr {
+    fn from_io(err: io::Error) -> Self {
+        Self::IoBound(err)
+    }
+
+    fn from_syn(err: syn::Error) -> Self {
+        Self::ParseError(err)
+    }
+}
+
+impl Display for ParseErrorRepr {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::IoBound(error) => write!(f, "failed due to io error: {error}"),
+            Self::ParseError(error) => write!(f, "failed due to parse parse error: {error}"),
+        }
+    }
 }
 
 /// Represents an error condition when filtering errors with a regex in
