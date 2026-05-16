@@ -8,7 +8,7 @@ use syn::{
 use crate::Const;
 
 #[derive(Debug)]
-pub(crate) struct MacroParser(Vec<ItemConst>);
+pub(super) struct MacroParser(Vec<ItemConst>);
 
 impl MacroParser {
     pub(crate) fn into_iter(self, source: PathBuf) -> impl Iterator<Item = Const> {

@@ -166,6 +166,24 @@ pub(crate) struct ParseError {
     repr: ParseErrorRepr,
 }
 
+#[expect(dead_code, reason = "A few methods here exist for symmetry's sake.")]
+impl ParseError {
+    pub(crate) fn with_consuming_io<T>(self, f: impl FnOnce(io::Error) -> T) -> Either<T, Self> {
+        let ParseError { repr } = self;
+
+        repr.with_io(f).map_right(|repr| Self { repr })
+    }
+
+    pub(crate) fn with_consuming_parse<T>(
+        self,
+        f: impl FnOnce(syn::Error) -> T,
+    ) -> Either<T, Self> {
+        let ParseError { repr } = self;
+
+        repr.with_parse(f).map_right(|repr| Self { repr })
+    }
+}
+
 impl From<io::Error> for ParseError {
     fn from(value: io::Error) -> Self {
         Self {
@@ -192,6 +210,20 @@ enum ParseErrorRepr {
 }
 
 impl ParseErrorRepr {
+    fn with_io<T>(self, f: impl FnOnce(io::Error) -> T) -> Either<T, Self> {
+        match self {
+            Self::IoBound(error) => Either::Left(f(error)),
+            Self::ParseError(_) => Either::Right(self),
+        }
+    }
+
+    fn with_parse<T>(self, f: impl FnOnce(syn::Error) -> T) -> Either<T, Self> {
+        match self {
+            Self::IoBound(_) => Either::Right(self),
+            Self::ParseError(error) => Either::Left(f(error)),
+        }
+    }
+
     fn from_io(err: io::Error) -> Self {
         Self::IoBound(err)
     }
@@ -205,7 +237,7 @@ impl Display for ParseErrorRepr {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::IoBound(error) => write!(f, "failed due to io error: {error}"),
-            Self::ParseError(error) => write!(f, "failed due to parse parse error: {error}"),
+            Self::ParseError(error) => write!(f, "failed due to parse error: {error}"),
         }
     }
 }

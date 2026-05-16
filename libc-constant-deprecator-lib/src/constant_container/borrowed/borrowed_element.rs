@@ -9,7 +9,7 @@ macro_rules! with_inner_impl {
     (@ref => $repr:expr, $f:expr) => {
         $repr.with_inner($f)
     };
-    (@body @$spec:tt => $self:expr, $f:expr) => {
+    (@body @ $spec:tt => $self:expr, $f:expr) => {
         let Self { repr } = $self;
 
         with_inner_impl! { @$spec => repr, $f }
@@ -40,7 +40,7 @@ impl BorrowedElement {
         }
     }
 
-    with_inner_impl! { }
+    with_inner_impl! {}
 }
 
 macro_rules! with_inner_repr_impl {
@@ -61,7 +61,9 @@ macro_rules! with_inner_repr_impl {
 
         if let Some(ptr) = inner
             && let Some((constant, state)) = ptr.upgrade().map(|ptr| {
-                let (constant, state) = unsafe { with_inner_repr_impl!(@$spec => Arc::as_ptr(&ptr)) };
+                let (constant, state) = unsafe {
+                    with_inner_repr_impl!(@$spec => Arc::as_ptr(&ptr))
+                };
 
                 (constant, with_inner_repr_impl! { @$spec @ret => state })
             })

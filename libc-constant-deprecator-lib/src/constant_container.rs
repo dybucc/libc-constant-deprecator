@@ -1,15 +1,13 @@
 use std::{collections::HashMap, sync::Arc};
 
 use regex::bytes::{Regex, RegexBuilder};
-use syn::{Attribute, Item, ItemConst, spanned::Spanned};
+use syn::{Attribute, ItemConst};
 use tokio::{fs, task::JoinSet};
 use tracing::info;
-#[cfg(debug_assertions)]
-use tracing::info_span;
 
 use crate::{
     BorrowedContainer, ChangesKind, Const, FilterError, FilterErrorRepr, IoBoundChanges,
-    MakeChangesError, MakeChangesErrorRepr, deprecate,
+    MakeChangesError, MakeChangesErrorRepr, deprecate, traverse_constants,
 };
 
 pub(crate) mod borrowed;
@@ -232,72 +230,39 @@ impl ConstContainer {
 
                     // NOTE: this is purposefully sandwiched between await points because it handles
                     // `File: !Send`.
-                    let modified_file = {
-                        let mut file = syn::parse_file(
-                            &fs::read_to_string(constant.path()).await.map_err(|inner| {
+                    let modified_file = prettyplease::unparse(
+                        &traverse_constants(constant.path(), |ItemConst { attrs, .. }| {
+                            // TODO: ensure the constant we are iterating through is, indeed, the
+                            // constant that we are iterating through in this inner closure.
+                            if constant.is_deprecated() {
+                                attrs.push(deprecate!(Self::DEPRECATION_NOTICE));
+                            } else {
+                                let Some(attr_to_remove) = attrs
+                                    .iter()
+                                    .map(Attribute::path)
+                                    .position(|attr_ident| attr_ident.is_ident("deprecated"))
+                                else {
+                                    return;
+                                };
+
+                                attrs.swap_remove(attr_to_remove);
+                            }
+                        })
+                        .await
+                        .map_err(|err| {
+                            err.with_consuming_io(|io_error| {
                                 MakeChangesErrorRepr::IoBound(IoBoundChanges::new(
                                     constant.path().clone(),
-                                    inner,
+                                    io_error,
                                     ChangesKind::fetch(),
                                 ))
-                            })?,
-                        )
-                        .map_err(|_| MakeChangesErrorRepr::Parse(constant.path().clone().into()))?;
-
-                        // FIXME: the default parser will not traverse macro bodies so those
-                        // constants that got parsed from `cfg_if` don't get a deprecation mark.
-                        #[cfg(debug_assertions)]
-                        let preemptive_span = info_span!("info_during_filtering");
-
-                        file.items
-                            .iter_mut()
-                            .filter_map(|item| {
-                                #[cfg(debug_assertions)]
-                                if let Item::Const(ItemConst { ident, .. }) = item
-                                    && let ident = ident.to_string()
-                                    && ident.contains("MINI")
-                                {
-                                    info!(
-                                        parent: &preemptive_span,
-                                        constant_ident = ident,
-                                        span = ?item.span().start(),
-                                    );
-                                }
-
-                                if item.span().start() == constant.span()
-                                    && let Item::Const(ItemConst { attrs, ident, .. }) = item
-                                    && ident == constant.ident()
-                                {
-                                    Some(attrs)
-                                } else {
-                                    None
-                                }
                             })
-                            .try_for_each(|attrs| {
-                                info!("entered filtered constant closure while saving to disk");
-
-                                if constant.is_deprecated() {
-                                    attrs.push(deprecate!(Self::DEPRECATION_NOTICE));
-                                } else {
-                                    let attr_to_remove = attrs
-                                        .iter()
-                                        .map(Attribute::path)
-                                        .position(|attr_ident| attr_ident.is_ident("deprecated"))
-                                        .ok_or({
-                                            "the `deprecated` attribute should have been found if \
-                                             the constant is marked as modified for undeprecation"
-                                        })
-                                        .map_err(Into::into)
-                                        .map_err(MakeChangesErrorRepr::Other)?;
-
-                                    attrs.swap_remove(attr_to_remove);
-                                }
-
-                                Ok::<_, MakeChangesError>(())
-                            })?;
-
-                        prettyplease::unparse(&file)
-                    };
+                            .either(
+                                |err| err,
+                                |_| MakeChangesErrorRepr::Parse(constant.path().clone().into()),
+                            )
+                        })?,
+                    );
 
                     fs::write(constant.path(), modified_file)
                         .await

@@ -1,14 +1,14 @@
 use std::{iter, path::PathBuf};
 
 use syn::{Item, ItemConst, ItemMacro, Macro};
-use tokio::fs;
 use tracing::info;
 
-use crate::{Const, ConstContainerBuilder, MacroParser, SourceFile};
+use self::macro_parser::MacroParser;
+use crate::{Const, ConstContainerBuilder, SourceFile};
 
 pub(crate) mod const_container_builder;
-pub(crate) mod internal_parser;
-pub(crate) mod macro_parser;
+mod macro_parser;
+pub(crate) mod traversal;
 
 #[cfg_attr(debug_assertions, tracing::instrument(skip_all))]
 pub(crate) fn parse_constants(file: &SourceFile) -> ConstContainerBuilder {

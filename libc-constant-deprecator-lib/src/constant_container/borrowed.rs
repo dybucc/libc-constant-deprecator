@@ -5,9 +5,11 @@ use std::{
 
 use tracing::{info, info_span};
 
-use crate::{BorrowedElement, Const, Sealed, borrowed};
+use crate::{Const, Sealed, borrowed};
 
-pub(crate) mod borrowed_element;
+mod borrowed_element;
+
+pub(crate) use borrowed_element::BorrowedElement;
 
 /// Represents a borrowed view into multiple segments of a [`ConstContainer`] as
 /// a single, contiguous container of its own.
@@ -359,14 +361,21 @@ macro_rules! declare_visit {
 
         /// Provided an index into the collection of symbols being traversed, this
         /// routine attempts to find it and perform some operation on it.
-        fn find_indexed<T>(&self, idx: impl Into<usize>, mut f: impl FnMut(&Const) -> T) -> Option<T> {
+        fn find_indexed<T>(
+            &self,
+            idx: impl Into<usize>,
+            mut f: impl FnMut(&Const) -> T
+        ) -> Option<T> {
             declare_visit! { @find_indexed @ref => self, idx, f }
         }
 
         /// Provided an identifier, this routine traverses the collection of symbols
         /// attempting to find some symbol that matches such identifier, and
         /// provides access to it.
-        fn find_named<T>(&self, sym: impl AsRef<str>, mut f: impl FnMut(&Const) -> T) -> Option<T> {
+        fn find_named<T>(&self,
+            sym: impl AsRef<str>,
+            mut f: impl FnMut(&Const) -> T
+        ) -> Option<T> {
             declare_visit! { @find_named @ref => self, sym, f }
         }
 
@@ -419,7 +428,7 @@ pub trait VisitMut: Sealed {
     /// closure that can capture callsite state.
     fn visit_mut<B>(&mut self, visitor: impl FnMut(&mut Const) -> ControlFlow<B>) -> Option<B>;
 
-    declare_visit!{ @mut }
+    declare_visit! { @mut }
 }
 
 impl Sealed for BorrowedContainer {}
@@ -434,18 +443,19 @@ macro_rules! visit_impl {
     (@body @$spec:tt => $self:expr, $visitor:expr) => {
         let Self { source, .. } = $self;
 
-        if let ControlFlow::Break(b) = visit_impl!(@body @iter @$spec => source)
-            .try_for_each(|elem| {
-                if let Some(res) = visit_impl!(
-                    @body @elem @$spec => elem, |constant, _| $visitor(constant)
-                ) && res.is_break()
-                {
-                    res
-                } else {
-                    ControlFlow::Continue(())
-                }
-            }
-        ) {
+        if let ControlFlow::Break(b) =
+            visit_impl!(@body @iter @$spec => source)
+                .try_for_each(|elem| {
+                    if let Some(res) =
+                        visit_impl!(@body @elem @$spec => elem, |constant, _| $visitor(constant))
+                            && res.is_break()
+                    {
+                        res
+                    } else {
+                        ControlFlow::Continue(())
+                    }
+                })
+        {
             b.into()
         } else {
             None
@@ -491,11 +501,12 @@ macro_rules! deprecate_impl {
     (@body $op:tt, $self:expr) => {
         use tracing::{info, info_span};
 
-        // NOTE: Yes, it's odd that type inference does not work here, but apparently it
-        // only works when destructuring the overaching `BorrowedContainer`, which
-        // doesn't work as well when destrucuring the `BorrowedSubset`, because the
-        // latter holds references into the former, and so you end up with further
-        // indirection. This then makes the logic that follows not work for both types.
+        // NOTE: Yes, it's odd that type inference does not work here, but
+        // apparently it only works when destructuring the overaching
+        // `BorrowedContainer`, which doesn't work as well when destrucuring the
+        // `BorrowedSubset`, because the latter holds references into the
+        // former, and so you end up with further indirection. This then makes
+        // the logic that follows not work for both types.
         let source: &mut [BorrowedElement] = $self.source.as_mut();
         let init_state: &mut [bool] = $self.init_state.as_mut();
 

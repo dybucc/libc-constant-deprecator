@@ -3,7 +3,7 @@
 //!
 //! It is most useful when paired with the accompanying binary.
 
-#![feature(bool_to_result, range_into_bounds, try_trait_v2)]
+#![feature(bool_to_result, range_into_bounds, try_trait_v2, lock_value_accessors)]
 
 mod constant;
 mod constant_container;
@@ -27,8 +27,8 @@ mod private {
 )]
 pub(crate) use crate::errors::*;
 pub(crate) use crate::{
-    constant_container::borrowed::borrowed_element::BorrowedElement,
-    parser::{const_container_builder::ConstContainerBuilder, macro_parser::MacroParser},
+    constant_container::borrowed::BorrowedElement,
+    parser::{const_container_builder::ConstContainerBuilder, traversal::traverse_constants},
     private::Sealed,
     source_file::SourceFile,
 };

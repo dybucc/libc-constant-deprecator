@@ -403,7 +403,7 @@ impl Spinner {
             loop {
                 match rx.try_recv() {
                     Ok(msg) => {
-                        info!(new_message = true, message = msg);
+                        info!("new message: {msg}");
 
                         current_msg = msg.into();
                     }
@@ -1231,6 +1231,9 @@ async fn print_changes(
 ) -> anyhow::Result<()> {
     let effecting_changes = ThreadedPtr::new(effecting_changes);
 
+    // FIXME: the spinner does not assume anything about the writer that it gets, so
+    // it does not flush it. This may be the reason why the spinner does not show up
+    // when effecting changes to disk until after we issue another input event.
     Spinner::run_while(stdout, async move |tx| {
         let effecting_changes = unsafe { effecting_changes.as_mut_unchecked() };
 
@@ -1983,9 +1986,9 @@ async fn draw_screen(
 ) -> anyhow::Result<()> {
     info!(redraw = true);
 
-    let stdout = StdBufWriter::new(std_io::stdout());
-
-    state.draw(stdout, effecting_changes).await
+    state
+        .draw(StdBufWriter::new(std_io::stdout()), effecting_changes)
+        .await
 }
 
 #[tracing::instrument(skip_all, ret, err(level = "info"))]
