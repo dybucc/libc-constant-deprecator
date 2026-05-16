@@ -1,18 +1,14 @@
 use std::sync::{Arc, Mutex};
 
-use quote::ToTokens;
+use quote::{ToTokens, TokenStreamExt};
 use syn::{
-    ItemConst,
+    Attribute, Block, Item, ItemConst, Stmt, Token,
     parse::{Parse, ParseStream},
 };
 
-use self::internal::MacroContainerRepr;
-
-mod internal;
-
 #[derive(Debug, Default)]
 pub(crate) struct MacroContainer {
-    repr: MacroContainerRepr,
+    repr: Vec<Arc<Mutex<ItemConst>>>,
 }
 
 impl MacroContainer {
@@ -21,13 +17,34 @@ impl MacroContainer {
 
         repr.get(index)
     }
+
+    pub(super) fn parse(&mut self, input: ParseStream) -> syn::Result<()> {
+        let MacroContainer { repr } = self;
+
+        input.parse::<Token![if]>()?;
+        input.call(Attribute::parse_outer)?;
+
+        extract_constants(repr, input)?;
+
+        if input.peek(Token![else]) {
+            input.parse::<Token![else]>()?;
+
+            if input.peek(Token![if]) {
+                self.parse(input)?;
+            } else {
+                extract_constants(repr, input)?;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl ToTokens for MacroContainer {
     fn to_tokens(&self, tokens: &mut proc_macro2::TokenStream) {
         let MacroContainer { repr } = self;
 
-        repr.to_tokens(tokens);
+        tokens.append_all(repr.iter().map(|item| item.get_cloned().unwrap()));
     }
 
     fn into_token_stream(self) -> proc_macro2::TokenStream
@@ -35,18 +52,49 @@ impl ToTokens for MacroContainer {
         Self: Sized,
     {
         let MacroContainer { repr } = self;
+        let mut out = proc_macro2::TokenStream::new();
 
-        repr.into_token_stream()
+        // NOTE: we trust here that the context in which this is used will always ensure
+        // the constants do not have a strong count greater than 1. This holds a few
+        // layers above this module because we iterate first with the types that build
+        // on this type, and only then do we consume the entire iterator (which contains
+        // `Self` here.)
+        out.append_all(repr.into_iter().map(|ptr| {
+            Arc::into_inner(ptr)
+                .map(Mutex::into_inner)
+                .map(Result::unwrap)
+                .unwrap()
+        }));
+
+        out
     }
 }
 
 impl Parse for MacroContainer {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let mut out = Self::default();
-        let MacroContainer { repr } = &mut out;
 
-        repr.parse(input)?;
+        out.parse(input)?;
 
         Ok(out)
     }
+}
+
+fn extract_constants(buf: &mut Vec<Arc<Mutex<ItemConst>>>, input: ParseStream) -> syn::Result<()> {
+    input.parse().map(|Block { stmts, .. }| {
+        stmts
+            .into_iter()
+            .filter_map(|stmt| {
+                if let Stmt::Item(item) = stmt
+                    && let Item::Const(constant) = item
+                {
+                    constant.into()
+                } else {
+                    None
+                }
+            })
+            .map(Mutex::new)
+            .map(Arc::new)
+            .for_each(|constant| buf.push(constant));
+    })
 }

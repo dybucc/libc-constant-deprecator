@@ -1,9 +1,11 @@
 use std::{collections::HashMap, sync::Arc};
 
 use regex::bytes::{Regex, RegexBuilder};
-use syn::{Attribute, ItemConst};
+use syn::{Attribute, ItemConst, spanned::Spanned};
 use tokio::{fs, task::JoinSet};
 use tracing::info;
+#[cfg(debug_assertions)]
+use tracing::info_span;
 
 use crate::{
     BorrowedContainer, ChangesKind, Const, FilterError, FilterErrorRepr, IoBoundChanges,
@@ -228,24 +230,44 @@ impl ConstContainer {
 
                     info!(constant_to_save = %constant.ident(), state = constant.is_deprecated());
 
-                    // NOTE: this is purposefully sandwiched between await points because it handles
-                    // `File: !Send`.
-                    let modified_file = prettyplease::unparse(
-                        &traverse_constants(constant.path(), |ItemConst { attrs, .. }| {
-                            // TODO: ensure the constant we are iterating through is, indeed, the
-                            // constant that we are iterating through in this inner closure.
-                            if constant.is_deprecated() {
-                                attrs.push(deprecate!(Self::DEPRECATION_NOTICE));
-                            } else {
-                                let Some(attr_to_remove) = attrs
-                                    .iter()
-                                    .map(Attribute::path)
-                                    .position(|attr_ident| attr_ident.is_ident("deprecated"))
-                                else {
-                                    return;
-                                };
+                    #[cfg(debug_assertions)]
+                    let undeprecation_span = info_span!("undeprecation");
 
-                                attrs.swap_remove(attr_to_remove);
+                    // FIXME: the span of the constant (`LineColumn`) we keep in memory is not in
+                    // sync anymore with the span of the constant on disk whenever it its that we
+                    // add the attribute (or remove) if it was not deprecated to begin with (or if
+                    // it was already deprecated.)
+                    let modified_file = prettyplease::unparse(
+                        &traverse_constants(constant.path(), |item| {
+                            if constant.span() == item.span().start()
+                                && let ItemConst { attrs, ident, .. } = item
+                                && constant.ident() == ident
+                            {
+                                info!("matched constant in traversal: {}", item.ident);
+
+                                if constant.is_deprecated() {
+                                    info!("constant was marked for deprecation");
+
+                                    attrs.push(deprecate!(Self::DEPRECATION_NOTICE));
+                                } else {
+                                    info!("constant was marked for undeprecation");
+
+                                    let Some(attr_to_remove) = attrs
+                                        .iter()
+                                        .map(Attribute::path)
+                                        .position(|attr_ident| attr_ident.is_ident("deprecated"))
+                                    else {
+                                        return;
+                                    };
+
+                                    #[cfg(debug_assertions)]
+                                    info!(
+                                        parent: &undeprecation_span,
+                                        "found `deprecated` attribute",
+                                    );
+
+                                    attrs.swap_remove(attr_to_remove);
+                                }
                             }
                         })
                         .await
@@ -257,10 +279,10 @@ impl ConstContainer {
                                     ChangesKind::fetch(),
                                 ))
                             })
-                            .either(
-                                |err| err,
-                                |_| MakeChangesErrorRepr::Parse(constant.path().clone().into()),
-                            )
+                            .map_right(|_| {
+                                MakeChangesErrorRepr::Parse(constant.path().clone().into())
+                            })
+                            .into_inner()
                         })?,
                     );
 
